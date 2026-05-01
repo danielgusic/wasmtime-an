@@ -264,6 +264,9 @@ wasmtime_option_group! {
         /// Whether to perform function inlining during compilation.
         pub inlining: Option<bool>,
 
+        /// Enable AN-encoding (prototype, i32.mul only)
+        pub an_encoding_prototype: Option<bool>,
+
         #[prefixed = "cranelift"]
         #[serde(default)]
         /// Set a cranelift-specific option. Use `wasmtime settings` to see
@@ -972,6 +975,9 @@ impl CommonOptions {
         }
         if let Some(enable) = self.codegen.inlining {
             config.compiler_inlining(enable);
+        }
+        if let Some(enable) = self.codegen.an_encoding_prototype {
+            config.an_encoding_prototype(enable);
         }
 
         // async_stack_size enabled by either async or stack-switching, so

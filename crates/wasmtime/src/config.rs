@@ -2269,6 +2269,12 @@ impl Config {
         self
     }
 
+    /// Enable prototype AN-encoding
+    pub fn an_encoding_prototype(&mut self, enable: bool) -> &mut Self {
+        self.tunables.an_prototype = Some(enable);
+        self
+    }
+
     /// Returns the set of features that the currently selected compiler backend
     /// does not support at all and may panic on.
     ///

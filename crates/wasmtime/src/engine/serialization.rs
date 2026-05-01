@@ -337,6 +337,8 @@ impl Metadata<'_> {
 
             // This doesn't affect compilation, it's just a runtime setting.
             gc_heap_reservation_for_growth: _,
+
+            an_prototype,
         } = self.tunables;
 
         Self::check_collector(collector, other.collector)?;
@@ -424,6 +426,7 @@ impl Metadata<'_> {
             "GC heap guard size",
         )?;
         Self::check_bool(gc_heap_may_move, other.gc_heap_may_move, "GC heap may move")?;
+        Self::check_bool(an_prototype, other.an_prototype, "AN-encoding prototype")?;
 
         Ok(())
     }

@@ -95,8 +95,8 @@ use std::collections::{HashMap, hash_map};
 use std::vec::Vec;
 use wasmparser::{FuncValidator, MemArg, Operator, WasmModuleResources};
 use wasmtime_environ::{
-    DataIndex, ElemIndex, FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TagIndex, TypeConvert,
-    TypeIndex, WasmHeapType, WasmRefType, WasmResult, WasmValType, wasm_unsupported,
+    AN_CONSTANT, DataIndex, ElemIndex, FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TagIndex,
+    TypeConvert, TypeIndex, WasmHeapType, WasmRefType, WasmResult, WasmValType, wasm_unsupported,
 };
 
 /// Given a `Reachability<T>`, unwrap the inner `T` or, when unreachable, set
@@ -1262,7 +1262,14 @@ pub fn translate_operator(
         }
         Operator::I32Mul | Operator::I64Mul => {
             let (arg1, arg2) = environ.stacks.pop2();
-            environ.stacks.push1(builder.ins().imul(arg1, arg2));
+            let mut result = builder.ins().imul(arg1, arg2);
+            // for the prototype, onyl i32, missing checks and corrected overflow behaviour
+            // Ax * Ay = A^2xy -> we need to divide by A
+            if environ.tunables().an_prototype && matches!(op, Operator::I32Mul) {
+                let an_const = builder.ins().iconst(ir::types::I32, i64::from(AN_CONSTANT));
+                result = builder.ins().udiv(result, an_const);
+            }
+            environ.stacks.push1(result);
         }
         Operator::F32Mul | Operator::F64Mul => {
             let (arg1, arg2) = environ.stacks.pop2();

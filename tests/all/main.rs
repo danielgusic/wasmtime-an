@@ -2,6 +2,7 @@
 
 use wasmtime::Result;
 
+mod an_encoding;
 mod arrays;
 mod async_functions;
 mod call_hook;

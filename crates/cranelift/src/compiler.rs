@@ -34,11 +34,12 @@ use wasmparser::{FuncValidatorAllocations, FunctionBody};
 use wasmtime_environ::error::{Context as _, Result};
 use wasmtime_environ::obj::{ELF_WASMTIME_EXCEPTIONS, ELF_WASMTIME_FRAMES};
 use wasmtime_environ::{
-    Abi, AddressMapSection, BuiltinFunctionIndex, CacheStore, CompileError, CompiledFunctionBody,
-    DefinedFuncIndex, FlagValue, FrameInstPos, FrameStackShape, FrameStateSlotBuilder,
-    FrameTableBuilder, FuncKey, FunctionBodyData, FunctionLoc, HostCall, InliningCompiler,
-    ModulePC, ModuleTranslation, ModuleTypesBuilder, PtrSize, StackMapSection, StaticModuleIndex,
-    TrapEncodingBuilder, TrapSentinel, TripleExt, Tunables, WasmFuncType, WasmValType, prelude::*,
+    AN_CONSTANT, Abi, AddressMapSection, BuiltinFunctionIndex, CacheStore, CompileError,
+    CompiledFunctionBody, DefinedFuncIndex, FlagValue, FrameInstPos, FrameStackShape,
+    FrameStateSlotBuilder, FrameTableBuilder, FuncKey, FunctionBodyData, FunctionLoc, HostCall,
+    InliningCompiler, ModulePC, ModuleTranslation, ModuleTypesBuilder, PtrSize, StackMapSection,
+    StaticModuleIndex, TrapEncodingBuilder, TrapSentinel, TripleExt, Tunables, WasmFuncType,
+    WasmValType, prelude::*,
 };
 use wasmtime_unwinder::ExceptionTableBuilder;
 
@@ -1344,6 +1345,17 @@ impl Compiler {
             values_vec_ptr,
             values_vec_len,
         );
+
+        // only encodes i32 args with AN-encoding for now
+        if self.tunables.an_prototype {
+            let an_const = builder.ins().iconst(ir::types::I32, i64::from(AN_CONSTANT));
+            for (i, ty) in callee_sig.params().iter().enumerate() {
+                if matches!(ty, WasmValType::I32) {
+                    args[i] = builder.ins().imul(args[i], an_const);
+                }
+            }
+        }
+
         args.insert(0, caller_vmctx);
         args.insert(0, vmctx);
 
@@ -1365,7 +1377,7 @@ impl Compiler {
         // `try_call` with an exception handler that's used to handle traps.
         let normal_return = builder.create_block();
         let exceptional_return = builder.create_block();
-        let normal_return_values = wasm_call_sig
+        let mut normal_return_values = wasm_call_sig
             .returns
             .iter()
             .map(|ty| {
@@ -1417,6 +1429,17 @@ impl Compiler {
         // On the normal return path store all the results in the array we were
         // provided and return "true" for "returned successfully".
         builder.switch_to_block(normal_return);
+
+        // decode again, same as above
+        if self.tunables.an_prototype {
+            let an_const = builder.ins().iconst(ir::types::I32, i64::from(AN_CONSTANT));
+            for (i, ty) in callee_sig.results().iter().enumerate() {
+                if matches!(ty, WasmValType::I32) {
+                    normal_return_values[i] = builder.ins().udiv(normal_return_values[i], an_const);
+                }
+            }
+        }
+
         self.store_values_to_array(
             &mut builder,
             callee_sig.results(),

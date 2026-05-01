@@ -6,6 +6,7 @@
 *~
 .*.rustfmt
 .mypy_cache
+.DS_Store
 \#*\#
 cranelift.dbg*
 docs/_build

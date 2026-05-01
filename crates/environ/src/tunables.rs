@@ -6,6 +6,9 @@ use serde_derive::{Deserialize, Serialize};
 use target_lexicon::{PointerWidth, Triple};
 use wasmparser::Operator;
 
+/// AN constant, 3 for now
+pub const AN_CONSTANT: u32 = 3;
+
 macro_rules! define_tunables {
     (
         $(#[$outer_attr:meta])*
@@ -183,6 +186,9 @@ define_tunables! {
         ///
         /// This is the same as `memory_may_move` but for GC heaps.
         pub gc_heap_may_move: bool,
+
+        /// Whether AN-encoding should be used
+        pub an_prototype: bool,
     }
 
     pub struct ConfigTunables {
@@ -267,6 +273,7 @@ impl Tunables {
             gc_heap_guard_size: 0,
             gc_heap_reservation_for_growth: 0,
             gc_heap_may_move: true,
+            an_prototype: false,
         }
     }
 
