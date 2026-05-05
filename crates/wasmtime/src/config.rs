@@ -2269,9 +2269,30 @@ impl Config {
         self
     }
 
-    /// Enable prototype AN-encoding
-    pub fn an_encoding_prototype(&mut self, enable: bool) -> &mut Self {
-        self.tunables.an_prototype = Some(enable);
+    /// Enable AN-encoding (widened i32 → i64 with `A*v` representation).
+    /// `A` defaults to `wasmtime_environ::DEFAULT_AN_CONSTANT`; override
+    /// with `Config::an_constant`.
+    pub fn an_encoding(&mut self, enable: bool) -> &mut Self {
+        self.tunables.an_encoding = Some(enable);
+        self
+    }
+
+    /// Set the AN-encoding constant `A`. See AN_ENCODING_CHANGELOG.md for further information.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `a == 0` (would break everything)
+    /// or if `a >= 1 << 31` (problems with sign).
+    pub fn an_constant(&mut self, a: u64) -> &mut Self {
+        assert!(
+            a >= 1,
+            "AN_CONSTANT must be ≥ 1 (A=0 destroys information and is un-decodable)"
+        );
+        assert!(
+            a < (1u64 << 31),
+            "AN_CONSTANT must be < 2^31 to avoid signed i64 overflows"
+        );
+        self.tunables.an_constant = Some(a);
         self
     }
 

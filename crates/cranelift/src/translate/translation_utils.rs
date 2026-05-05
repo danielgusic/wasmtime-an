@@ -48,10 +48,15 @@ pub fn block_with_params<PE: TargetEnvironment + ?Sized>(
     environ: &PE,
 ) -> WasmResult<ir::Block> {
     let block = builder.create_block();
+    let i32_ir_ty = if environ.tunables().an_encoding {
+        ir::types::I64
+    } else {
+        ir::types::I32
+    };
     for ty in params {
         match ty {
             wasmparser::ValType::I32 => {
-                builder.append_block_param(block, ir::types::I32);
+                builder.append_block_param(block, i32_ir_ty);
             }
             wasmparser::ValType::I64 => {
                 builder.append_block_param(block, ir::types::I64);

@@ -141,6 +141,21 @@ fn value_type(isa: &dyn TargetIsa, ty: WasmValType) -> ir::types::Type {
     }
 }
 
+/// Like `value_type` but applies AN-encoding widening: wasm `i32` becomes IR
+/// `I64` when `tunables.an_encoding` is on, so the encoded value `A*v` fits
+/// losslessly. Use this for wasm-internal contexts: function signatures,
+/// locals, block params — places where values flow on the operand stack.
+fn wasm_stack_value_type(
+    isa: &dyn TargetIsa,
+    tunables: &Tunables,
+    ty: WasmValType,
+) -> ir::types::Type {
+    match ty {
+        WasmValType::I32 if tunables.an_encoding => ir::types::I64,
+        _ => value_type(isa, ty),
+    }
+}
+
 /// Get the Cranelift signature for all array-call functions, that is:
 ///
 /// ```ignore
@@ -201,7 +216,7 @@ fn wasm_call_signature(
 ) -> ir::Signature {
     let call_conv = wasm_call_conv(isa, tunables);
     let mut sig = blank_sig(isa, call_conv);
-    let cvt = |ty: &WasmValType| ir::AbiParam::new(value_type(isa, *ty));
+    let cvt = |ty: &WasmValType| ir::AbiParam::new(wasm_stack_value_type(isa, tunables, *ty));
     sig.params.extend(wasm_func_ty.params().iter().map(&cvt));
     sig.returns.extend(wasm_func_ty.results().iter().map(&cvt));
     sig

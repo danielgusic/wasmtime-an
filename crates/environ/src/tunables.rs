@@ -6,8 +6,12 @@ use serde_derive::{Deserialize, Serialize};
 use target_lexicon::{PointerWidth, Triple};
 use wasmparser::Operator;
 
-/// AN constant, 3 for now
-pub const AN_CONSTANT: u32 = 3;
+/// Default AN-encoding constant `A` (a 16-bit prime, per
+/// Fetzer/Schiffel/Süßkraut 2009). Used when the embedder doesn't override
+/// `Tunables.an_constant`. The value lives in `tunables.an_constant` once a
+/// `Tunables` is constructed; reach for `tunables.an_constant`, not this
+/// constant, in codegen.
+pub const DEFAULT_AN_CONSTANT: u64 = 65521;
 
 macro_rules! define_tunables {
     (
@@ -187,8 +191,14 @@ define_tunables! {
         /// This is the same as `memory_may_move` but for GC heaps.
         pub gc_heap_may_move: bool,
 
-        /// Whether AN-encoding should be used
-        pub an_prototype: bool,
+        /// Whether AN-encoding should be used.
+        pub an_encoding: bool,
+
+        /// AN-encoding constant `A`. Encoded i32 values are stored as `A*v`
+        /// in widened i64 IR slots. Defaults to `DEFAULT_AN_CONSTANT`.
+        /// Constraints (caller-enforced via the `Config` setter): must be
+        /// ≥ 1 (A=0 would break everything)
+        pub an_constant: u64,
     }
 
     pub struct ConfigTunables {
@@ -273,7 +283,8 @@ impl Tunables {
             gc_heap_guard_size: 0,
             gc_heap_reservation_for_growth: 0,
             gc_heap_may_move: true,
-            an_prototype: false,
+            an_encoding: false,
+            an_constant: DEFAULT_AN_CONSTANT,
         }
     }
 

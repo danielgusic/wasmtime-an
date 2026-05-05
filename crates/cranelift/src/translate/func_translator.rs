@@ -173,12 +173,15 @@ fn declare_locals(
 ) -> WasmResult<()> {
     // All locals are initialized to 0.
     use wasmparser::ValType::*;
+    // Under AN-encoding, wasm i32 locals are widened to IR I64 so they can hold
+    // the encoded value `A*v` losslessly. Initial value 0 stays 0 (A*0 = 0).
+    let i32_ir_ty = if environ.tunables().an_encoding {
+        ir::types::I64
+    } else {
+        ir::types::I32
+    };
     let (ty, init, needs_stack_map) = match wasm_type {
-        I32 => (
-            ir::types::I32,
-            Some(builder.ins().iconst(ir::types::I32, 0)),
-            false,
-        ),
+        I32 => (i32_ir_ty, Some(builder.ins().iconst(i32_ir_ty, 0)), false),
         I64 => (
             ir::types::I64,
             Some(builder.ins().iconst(ir::types::I64, 0)),

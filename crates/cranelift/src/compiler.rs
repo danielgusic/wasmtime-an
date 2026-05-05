@@ -34,12 +34,11 @@ use wasmparser::{FuncValidatorAllocations, FunctionBody};
 use wasmtime_environ::error::{Context as _, Result};
 use wasmtime_environ::obj::{ELF_WASMTIME_EXCEPTIONS, ELF_WASMTIME_FRAMES};
 use wasmtime_environ::{
-    AN_CONSTANT, Abi, AddressMapSection, BuiltinFunctionIndex, CacheStore, CompileError,
-    CompiledFunctionBody, DefinedFuncIndex, FlagValue, FrameInstPos, FrameStackShape,
-    FrameStateSlotBuilder, FrameTableBuilder, FuncKey, FunctionBodyData, FunctionLoc, HostCall,
-    InliningCompiler, ModulePC, ModuleTranslation, ModuleTypesBuilder, PtrSize, StackMapSection,
-    StaticModuleIndex, TrapEncodingBuilder, TrapSentinel, TripleExt, Tunables, WasmFuncType,
-    WasmValType, prelude::*,
+    Abi, AddressMapSection, BuiltinFunctionIndex, CacheStore, CompileError, CompiledFunctionBody,
+    DefinedFuncIndex, FlagValue, FrameInstPos, FrameStackShape, FrameStateSlotBuilder,
+    FrameTableBuilder, FuncKey, FunctionBodyData, FunctionLoc, HostCall, InliningCompiler,
+    ModulePC, ModuleTranslation, ModuleTypesBuilder, PtrSize, StackMapSection, StaticModuleIndex,
+    TrapEncodingBuilder, TrapSentinel, TripleExt, Tunables, WasmFuncType, WasmValType, prelude::*,
 };
 use wasmtime_unwinder::ExceptionTableBuilder;
 
@@ -411,9 +410,25 @@ impl wasmtime_environ::Compiler for Compiler {
         );
         save_last_wasm_exit_fp_and_pc(&mut builder, pointer_type, &ptr, vm_store_context);
 
+        // AN-encoding boundary (wasm → host): wasm args arrive widened to I64
+        // (encoded `A*v`). Host expects raw I32 in the `ValRaw` slot. Decode
+        // each i32 arg before spilling.
+        let mut spill_args: Vec<Value> = args[2..].to_vec();
+        if self.tunables.an_encoding {
+            let an_const = builder
+                .ins()
+                .iconst(ir::types::I64, self.tunables.an_constant as i64);
+            for (i, ty) in wasm_func_ty.params().iter().enumerate() {
+                if matches!(ty, WasmValType::I32) {
+                    let decoded = builder.ins().udiv(spill_args[i], an_const);
+                    spill_args[i] = builder.ins().ireduce(ir::types::I32, decoded);
+                }
+            }
+        }
+
         // Spill all wasm arguments to the stack in `ValRaw` slots.
         let (args_base, args_len) =
-            self.allocate_stack_array_and_spill_args(wasm_func_ty, &mut builder, &args[2..]);
+            self.allocate_stack_array_and_spill_args(wasm_func_ty, &mut builder, &spill_args);
         let args_len = builder.ins().iconst(pointer_type, i64::from(args_len));
 
         // Load the actual callee out of the
@@ -465,8 +480,24 @@ impl wasmtime_environ::Compiler for Compiler {
         self.raise_if_host_trapped(&mut builder, caller_vmctx, succeeded);
 
         // Return results from the array as native return values.
-        let results =
+        let mut results =
             self.load_values_from_array(wasm_func_ty.results(), &mut builder, args_base, args_len);
+
+        // AN-encoding boundary (host → wasm): host returned raw I32 values
+        // into the `ValRaw` slots; wasm caller expects encoded I64. Zero-extend
+        // and multiply by `A` for each i32 result.
+        if self.tunables.an_encoding {
+            let an_const = builder
+                .ins()
+                .iconst(ir::types::I64, self.tunables.an_constant as i64);
+            for (i, ty) in wasm_func_ty.results().iter().enumerate() {
+                if matches!(ty, WasmValType::I32) {
+                    let zext = builder.ins().uextend(ir::types::I64, results[i]);
+                    results[i] = builder.ins().imul(zext, an_const);
+                }
+            }
+        }
+
         builder.ins().return_(&results);
         builder.finalize();
 
@@ -1346,12 +1377,17 @@ impl Compiler {
             values_vec_len,
         );
 
-        // only encodes i32 args with AN-encoding for now
-        if self.tunables.an_prototype {
-            let an_const = builder.ins().iconst(ir::types::I32, i64::from(AN_CONSTANT));
+        // AN-encoding boundary (host → wasm): each wasm `i32` arg arrives as a
+        // raw I32 from the host's `ValRaw` slot. The wasm function expects it
+        // widened to I64 holding `A*v`. Zero-extend then multiply by `A`.
+        if self.tunables.an_encoding {
+            let an_const = builder
+                .ins()
+                .iconst(ir::types::I64, self.tunables.an_constant as i64);
             for (i, ty) in callee_sig.params().iter().enumerate() {
                 if matches!(ty, WasmValType::I32) {
-                    args[i] = builder.ins().imul(args[i], an_const);
+                    let zext = builder.ins().uextend(ir::types::I64, args[i]);
+                    args[i] = builder.ins().imul(zext, an_const);
                 }
             }
         }
@@ -1377,7 +1413,7 @@ impl Compiler {
         // `try_call` with an exception handler that's used to handle traps.
         let normal_return = builder.create_block();
         let exceptional_return = builder.create_block();
-        let mut normal_return_values = wasm_call_sig
+        let normal_return_values = wasm_call_sig
             .returns
             .iter()
             .map(|ty| {
@@ -1430,12 +1466,18 @@ impl Compiler {
         // provided and return "true" for "returned successfully".
         builder.switch_to_block(normal_return);
 
-        // decode again, same as above
-        if self.tunables.an_prototype {
-            let an_const = builder.ins().iconst(ir::types::I32, i64::from(AN_CONSTANT));
+        // AN-decoding boundary (wasm → host): wasm returns each `i32` result as
+        // a widened I64 holding `A*v`. The host's `ValRaw` slot expects raw
+        // I32. Divide by `A`, then truncate.
+        let mut decoded_returns = normal_return_values.clone();
+        if self.tunables.an_encoding {
+            let an_const = builder
+                .ins()
+                .iconst(ir::types::I64, self.tunables.an_constant as i64);
             for (i, ty) in callee_sig.results().iter().enumerate() {
                 if matches!(ty, WasmValType::I32) {
-                    normal_return_values[i] = builder.ins().udiv(normal_return_values[i], an_const);
+                    let decoded = builder.ins().udiv(decoded_returns[i], an_const);
+                    decoded_returns[i] = builder.ins().ireduce(ir::types::I32, decoded);
                 }
             }
         }
@@ -1443,7 +1485,7 @@ impl Compiler {
         self.store_values_to_array(
             &mut builder,
             callee_sig.results(),
-            &normal_return_values,
+            &decoded_returns,
             values_vec_ptr,
             values_vec_len,
         );

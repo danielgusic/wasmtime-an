@@ -95,8 +95,8 @@ use std::collections::{HashMap, hash_map};
 use std::vec::Vec;
 use wasmparser::{FuncValidator, MemArg, Operator, WasmModuleResources};
 use wasmtime_environ::{
-    AN_CONSTANT, DataIndex, ElemIndex, FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TagIndex,
-    TypeConvert, TypeIndex, WasmHeapType, WasmRefType, WasmResult, WasmValType, wasm_unsupported,
+    DataIndex, ElemIndex, FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TagIndex, TypeConvert,
+    TypeIndex, WasmHeapType, WasmRefType, WasmResult, WasmValType, wasm_unsupported,
 };
 
 /// Given a `Reachability<T>`, unwrap the inner `T` or, when unreachable, set
@@ -977,29 +977,58 @@ pub fn translate_operator(
          * Wasm specifies an integer alignment flag but we drop it in Cranelift.
          * The memory base address is provided by the environment.
          ************************************************************************************/
-        Operator::I32Store { memarg }
-        | Operator::I64Store { memarg }
+        Operator::I32Store { memarg } => {
+            translate_store(memarg, ir::Opcode::Store, true, builder, environ)?;
+        }
+        Operator::I64Store { memarg }
         | Operator::F32Store { memarg }
         | Operator::F64Store { memarg } => {
-            translate_store(memarg, ir::Opcode::Store, builder, environ)?;
+            translate_store(memarg, ir::Opcode::Store, false, builder, environ)?;
         }
-        Operator::I32Store8 { memarg } | Operator::I64Store8 { memarg } => {
-            translate_store(memarg, ir::Opcode::Istore8, builder, environ)?;
+        Operator::I32Store8 { memarg } => {
+            translate_store(memarg, ir::Opcode::Istore8, true, builder, environ)?;
         }
-        Operator::I32Store16 { memarg } | Operator::I64Store16 { memarg } => {
-            translate_store(memarg, ir::Opcode::Istore16, builder, environ)?;
+        Operator::I64Store8 { memarg } => {
+            translate_store(memarg, ir::Opcode::Istore8, false, builder, environ)?;
+        }
+        Operator::I32Store16 { memarg } => {
+            translate_store(memarg, ir::Opcode::Istore16, true, builder, environ)?;
+        }
+        Operator::I64Store16 { memarg } => {
+            translate_store(memarg, ir::Opcode::Istore16, false, builder, environ)?;
         }
         Operator::I64Store32 { memarg } => {
-            translate_store(memarg, ir::Opcode::Istore32, builder, environ)?;
+            translate_store(memarg, ir::Opcode::Istore32, false, builder, environ)?;
         }
         Operator::V128Store { memarg } => {
-            translate_store(memarg, ir::Opcode::Store, builder, environ)?;
+            translate_store(memarg, ir::Opcode::Store, false, builder, environ)?;
         }
         /****************************** Nullary Operators ************************************/
         Operator::I32Const { value } => {
-            environ
-                .stacks
-                .push1(builder.ins().iconst(I32, i64::from(value.cast_unsigned())));
+            if environ.tunables().an_encoding {
+                // Emit the canonical encoded form `A*v` as an i64 immediate.
+                //
+                // We work in u64 here so the math operates on the wasm i32
+                // bit pattern, not on its signed interpretation. Reinterpret
+                // i32 → u32 (`cast_unsigned`), zero-extend u32 → u64
+                // (`u64::from`), then multiply by A.
+                //
+                // `wrapping_mul` is defensive: with the setter-enforced bound
+                // `A < 2^31` and a 32-bit input the product is always
+                // < 2^31 * 2^32 = 2^63, so it never actually wraps. The final
+                // `as i64` is a pure bit-pattern reinterpret for the
+                // `iconst` API (which takes its immediate as `i64`); no value
+                // change happens.
+                let raw = u64::from(value.cast_unsigned());
+                let encoded = raw.wrapping_mul(environ.tunables().an_constant);
+                environ
+                    .stacks
+                    .push1(builder.ins().iconst(I64, encoded as i64));
+            } else {
+                environ
+                    .stacks
+                    .push1(builder.ins().iconst(I32, i64::from(value.cast_unsigned())));
+            }
         }
         Operator::I64Const { value } => environ.stacks.push1(builder.ins().iconst(I64, *value)),
         Operator::F32Const { value } => {
@@ -1214,7 +1243,25 @@ pub fn translate_operator(
         /****************************** Binary Operators ************************************/
         Operator::I32Add | Operator::I64Add => {
             let (arg1, arg2) = environ.stacks.pop2();
-            environ.stacks.push1(builder.ins().iadd(arg1, arg2));
+            let sum = builder.ins().iadd(arg1, arg2);
+            if environ.tunables().an_encoding && matches!(op, Operator::I32Add) {
+                // Encoded operands are `A*n`, `A*m` with n,m ∈ [0, 2^32). Sum
+                // is `A*(n+m)` where `n+m` overflows the wasm-i32 range by at
+                // most one wrap (n+m < 2^33). So canonicalize by subtracting
+                // `A*2^32` iff the sum landed past the canonical band
+                // `[0, A*2^32)`
+                let threshold_i64 = (environ.tunables().an_constant as i64) << 32;
+                let threshold = builder.ins().iconst(I64, threshold_i64);
+                let zero = builder.ins().iconst(I64, 0);
+                let overflow =
+                    builder
+                        .ins()
+                        .icmp(IntCC::UnsignedGreaterThanOrEqual, sum, threshold);
+                let adj = builder.ins().select(overflow, threshold, zero);
+                environ.stacks.push1(builder.ins().isub(sum, adj));
+            } else {
+                environ.stacks.push1(sum);
+            }
         }
         Operator::I32And | Operator::I64And => {
             let (arg1, arg2) = environ.stacks.pop2();
@@ -1254,7 +1301,21 @@ pub fn translate_operator(
         }
         Operator::I32Sub | Operator::I64Sub => {
             let (arg1, arg2) = environ.stacks.pop2();
-            environ.stacks.push1(builder.ins().isub(arg1, arg2));
+            let diff = builder.ins().isub(arg1, arg2);
+            if environ.tunables().an_encoding && matches!(op, Operator::I32Sub) {
+                // diff = `A*(n-m)`. When `n ≥ m` the value is already in
+                // `[0, A*2^32)` (canonical). When `n < m` the i64 result is
+                // negative; lift back into the canonical band by adding
+                // `A*2^32` once.
+                let threshold_i64 = (environ.tunables().an_constant as i64) << 32;
+                let threshold = builder.ins().iconst(I64, threshold_i64);
+                let zero = builder.ins().iconst(I64, 0);
+                let underflow = builder.ins().icmp(IntCC::SignedLessThan, diff, zero);
+                let adj = builder.ins().select(underflow, threshold, zero);
+                environ.stacks.push1(builder.ins().iadd(diff, adj));
+            } else {
+                environ.stacks.push1(diff);
+            }
         }
         Operator::F32Sub | Operator::F64Sub => {
             let (arg1, arg2) = environ.stacks.pop2();
@@ -1262,14 +1323,25 @@ pub fn translate_operator(
         }
         Operator::I32Mul | Operator::I64Mul => {
             let (arg1, arg2) = environ.stacks.pop2();
-            let mut result = builder.ins().imul(arg1, arg2);
-            // for the prototype, onyl i32, missing checks and corrected overflow behaviour
-            // Ax * Ay = A^2xy -> we need to divide by A
-            if environ.tunables().an_prototype && matches!(op, Operator::I32Mul) {
-                let an_const = builder.ins().iconst(ir::types::I32, i64::from(AN_CONSTANT));
-                result = builder.ins().udiv(result, an_const);
+            // AN-encoding (i32 only): operands are widened I64 holding A*n, A*m.
+            // Stays-encoded mul would need an i128 product divided by A, but
+            // i128 udiv is not supported.
+            // decode-compute-encode: decode (/A), multiply (i64, wraps), mask
+            // to 32 bits to enforce wasm i32 semantics, re-encode (*A).
+            if environ.tunables().an_encoding && matches!(op, Operator::I32Mul) {
+                let an = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let mask32 = builder.ins().iconst(I64, 0xFFFF_FFFFu64 as i64);
+                let n = builder.ins().udiv(arg1, an);
+                let m = builder.ins().udiv(arg2, an);
+                let raw_prod = builder.ins().imul(n, m);
+                let truncated = builder.ins().band(raw_prod, mask32);
+                let encoded = builder.ins().imul(truncated, an);
+                environ.stacks.push1(encoded);
+            } else {
+                environ.stacks.push1(builder.ins().imul(arg1, arg2));
             }
-            environ.stacks.push1(result);
         }
         Operator::F32Mul | Operator::F64Mul => {
             let (arg1, arg2) = environ.stacks.pop2();
@@ -1286,7 +1358,16 @@ pub fn translate_operator(
         }
         Operator::I32DivU | Operator::I64DivU => {
             let (arg1, arg2) = environ.stacks.pop2();
-            let result = environ.translate_udiv(builder, arg1, arg2);
+            let mut result = environ.translate_udiv(builder, arg1, arg2);
+            if environ.tunables().an_encoding && matches!(op, Operator::I32DivU) {
+                // (A*n) / (A*m) = n/m (i64 udiv naturally cancels the A scale).
+                // Re-encode by multiplying the raw quotient by A. Quotient is
+                // bounded by max(n) < 2^32, so `quotient * A < A*2^32`, which is canonical.
+                let an = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                result = builder.ins().imul(result, an);
+            }
             environ.stacks.push1(result);
         }
         Operator::I32RemS | Operator::I64RemS => {
@@ -1313,37 +1394,49 @@ pub fn translate_operator(
         }
         /**************************** Comparison Operators **********************************/
         Operator::I32LtS | Operator::I64LtS => {
-            translate_icmp(IntCC::SignedLessThan, builder, environ)
+            translate_icmp_dispatch(IntCC::SignedLessThan, op, builder, environ)
         }
         Operator::I32LtU | Operator::I64LtU => {
-            translate_icmp(IntCC::UnsignedLessThan, builder, environ)
+            translate_icmp_dispatch(IntCC::UnsignedLessThan, op, builder, environ)
         }
         Operator::I32LeS | Operator::I64LeS => {
-            translate_icmp(IntCC::SignedLessThanOrEqual, builder, environ)
+            translate_icmp_dispatch(IntCC::SignedLessThanOrEqual, op, builder, environ)
         }
         Operator::I32LeU | Operator::I64LeU => {
-            translate_icmp(IntCC::UnsignedLessThanOrEqual, builder, environ)
+            translate_icmp_dispatch(IntCC::UnsignedLessThanOrEqual, op, builder, environ)
         }
         Operator::I32GtS | Operator::I64GtS => {
-            translate_icmp(IntCC::SignedGreaterThan, builder, environ)
+            translate_icmp_dispatch(IntCC::SignedGreaterThan, op, builder, environ)
         }
         Operator::I32GtU | Operator::I64GtU => {
-            translate_icmp(IntCC::UnsignedGreaterThan, builder, environ)
+            translate_icmp_dispatch(IntCC::UnsignedGreaterThan, op, builder, environ)
         }
         Operator::I32GeS | Operator::I64GeS => {
-            translate_icmp(IntCC::SignedGreaterThanOrEqual, builder, environ)
+            translate_icmp_dispatch(IntCC::SignedGreaterThanOrEqual, op, builder, environ)
         }
         Operator::I32GeU | Operator::I64GeU => {
-            translate_icmp(IntCC::UnsignedGreaterThanOrEqual, builder, environ)
+            translate_icmp_dispatch(IntCC::UnsignedGreaterThanOrEqual, op, builder, environ)
         }
         Operator::I32Eqz | Operator::I64Eqz => {
             let arg = environ.stacks.pop1();
             let val = builder.ins().icmp_imm(IntCC::Equal, arg, 0);
-            environ.stacks.push1(builder.ins().uextend(I32, val));
+            if environ.tunables().an_encoding && matches!(op, Operator::I32Eqz) {
+                let an = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let zero = builder.ins().iconst(I64, 0);
+                environ.stacks.push1(builder.ins().select(val, an, zero));
+            } else {
+                environ.stacks.push1(builder.ins().uextend(I32, val));
+            }
         }
-        Operator::I32Eq | Operator::I64Eq => translate_icmp(IntCC::Equal, builder, environ),
+        Operator::I32Eq | Operator::I64Eq => {
+            translate_icmp_dispatch(IntCC::Equal, op, builder, environ)
+        }
         Operator::F32Eq | Operator::F64Eq => translate_fcmp(FloatCC::Equal, builder, environ),
-        Operator::I32Ne | Operator::I64Ne => translate_icmp(IntCC::NotEqual, builder, environ),
+        Operator::I32Ne | Operator::I64Ne => {
+            translate_icmp_dispatch(IntCC::NotEqual, op, builder, environ)
+        }
         Operator::F32Ne | Operator::F64Ne => translate_fcmp(FloatCC::NotEqual, builder, environ),
         Operator::F32Gt | Operator::F64Gt => translate_fcmp(FloatCC::GreaterThan, builder, environ),
         Operator::F32Ge | Operator::F64Ge => {
@@ -1807,7 +1900,7 @@ pub fn translate_operator(
             environ
                 .stacks
                 .push1(builder.ins().extractlane(vector, *lane));
-            translate_store(memarg, ir::Opcode::Store, builder, environ)?;
+            translate_store(memarg, ir::Opcode::Store, false, builder, environ)?;
         }
         Operator::I8x16ExtractLaneS { lane } | Operator::I16x8ExtractLaneS { lane } => {
             let vector = pop1_with_bitcast(environ, type_of(op), builder);
@@ -3491,10 +3584,29 @@ fn prepare_addr(
     builder: &mut FunctionBuilder,
     environ: &mut FuncEnvironment<'_>,
 ) -> WasmResult<Reachability<(MemFlags, Value, Value)>> {
-    let index = environ.stacks.pop1();
+    let mut index = environ.stacks.pop1();
 
     let memory_index = MemoryIndex::from_u32(memarg.memory);
     let heap = environ.get_or_create_heap(builder.func, memory_index);
+
+    // AN-encoding boundary: a wasm i32 memory address arrives on the operand
+    // stack as an encoded I64 holding `A*v`. The bounds checker and load/store
+    // expect a raw I32 address. Decode it here so the rest of the pipeline
+    // sees normal wasm semantics. (Memory model is encode-in-registers — the
+    // linear memory itself stays raw bytes.)
+    //
+    // Discriminate by the memory's wasm index type, NOT the IR type of the
+    // popped value. Both encoded-i32 addresses and raw memory64 i64 addresses
+    // have IR type `I64`; only the former is encoded. memory64 indices are
+    // raw i64s and must pass through unchanged
+    let memory_index_ty = environ.heaps()[heap].index_type();
+    if environ.tunables().an_encoding && memory_index_ty == I32 {
+        let an = builder
+            .ins()
+            .iconst(I64, environ.tunables().an_constant as i64);
+        let decoded = builder.ins().udiv(index, an);
+        index = builder.ins().ireduce(I32, decoded);
+    }
 
     // How exactly the bounds check is performed here and what it's performed
     // on is a bit tricky. Generally we want to rely on access violations (e.g.
@@ -3718,18 +3830,44 @@ fn translate_load(
     let (load, dfg) = builder
         .ins()
         .Load(opcode, result_ty, flags, Offset32::new(0), base);
-    environ.stacks.push1(dfg.first_result(load));
+    let raw = dfg.first_result(load);
+
+    // AN-encoding: i32-family loads return a raw I32 from raw linear memory.
+    // The wasm operand stack expects an encoded I64 (`A*v`). Zero-extend then
+    // multiply by A. i64 / f32 / f64 / v128 loads are unaffected.
+    if environ.tunables().an_encoding && result_ty == I32 {
+        let zext = builder.ins().uextend(I64, raw);
+        let an = builder
+            .ins()
+            .iconst(I64, environ.tunables().an_constant as i64);
+        environ.stacks.push1(builder.ins().imul(zext, an));
+    } else {
+        environ.stacks.push1(raw);
+    }
     Ok(Reachability::Reachable(()))
 }
 
 /// Translate a store instruction.
+///
+/// `wasm_val_is_i32` is true for the i32.store / i32.store8 / i32.store16
+/// family, which under AN-encoding receive an encoded I64 value on the stack
+/// that must be decoded back to a raw I32 before writing to linear memory.
 fn translate_store(
     memarg: &MemArg,
     opcode: ir::Opcode,
+    wasm_val_is_i32: bool,
     builder: &mut FunctionBuilder,
     environ: &mut FuncEnvironment<'_>,
 ) -> WasmResult<()> {
-    let val = environ.stacks.pop1();
+    let mut val = environ.stacks.pop1();
+    if environ.tunables().an_encoding && wasm_val_is_i32 {
+        // val is encoded I64 = A*v with v ∈ [0, 2^32). Decode to raw I32.
+        let an = builder
+            .ins()
+            .iconst(I64, environ.tunables().an_constant as i64);
+        let decoded = builder.ins().udiv(val, an);
+        val = builder.ins().ireduce(I32, decoded);
+    }
     let val_ty = builder.func.dfg.value_type(val);
     let mem_op_size = mem_op_size(opcode, val_ty);
 
@@ -3760,6 +3898,63 @@ fn translate_icmp(cc: IntCC, builder: &mut FunctionBuilder, environ: &mut FuncEn
     let (arg0, arg1) = environ.stacks.pop2();
     let val = builder.ins().icmp(cc, arg0, arg1);
     environ.stacks.push1(builder.ins().uextend(I32, val));
+}
+
+/// Picks the AN-encoded i32 compare path or the regular path based on `op`
+/// and the AN-encoding tunable. Per-op cases call this so the `match` arms
+/// stay terse.
+fn translate_icmp_dispatch(
+    cc: IntCC,
+    op: &Operator<'_>,
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+) {
+    let is_i32 = matches!(
+        op,
+        Operator::I32LtS
+            | Operator::I32LtU
+            | Operator::I32LeS
+            | Operator::I32LeU
+            | Operator::I32GtS
+            | Operator::I32GtU
+            | Operator::I32GeS
+            | Operator::I32GeU
+            | Operator::I32Eq
+            | Operator::I32Ne
+    );
+    if environ.tunables().an_encoding && is_i32 {
+        translate_icmp_i32_an(cc, builder, environ);
+    } else {
+        translate_icmp(cc, builder, environ);
+    }
+}
+
+/// Compare encoded i64 operands and produce an encoded i64 boolean (0 or A).
+/// Use for wasm i32 compares when the AN-encoding prototype is on.
+///
+/// Operands are canonical encoded values `A*n` with `n ∈ [0, 2^32)`. For
+/// unsigned and equality compares this directly preserves wasm semantics
+/// (positive A preserves both ordering and zero-detection). Signed compares
+/// work on the raw encoded values too here, but only because both operands
+/// have the same scale `A` and the same canonical range; the actual ordering
+/// of `A*n` against `A*m` matches the ordering of `n` against `m` as
+/// non-negative i64 values. For wasm-signed semantics this is wrong when
+/// `n` or `m` represents a "negative i32" (`n ≥ 2³¹`); that is not yet implemented
+fn translate_icmp_i32_an(
+    cc: IntCC,
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+) {
+    let (arg0, arg1) = environ.stacks.pop2();
+    let val = builder.ins().icmp(cc, arg0, arg1);
+    // Encode boolean as 0 or A via `select` (csel on aarch64). Replaces
+    // uextend+imul — same outputs (false→0, true→A), one fewer op and no
+    // multiply.
+    let an = builder
+        .ins()
+        .iconst(I64, environ.tunables().an_constant as i64);
+    let zero = builder.ins().iconst(I64, 0);
+    environ.stacks.push1(builder.ins().select(val, an, zero));
 }
 
 fn translate_atomic_rmw(

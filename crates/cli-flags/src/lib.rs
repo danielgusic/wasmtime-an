@@ -264,8 +264,11 @@ wasmtime_option_group! {
         /// Whether to perform function inlining during compilation.
         pub inlining: Option<bool>,
 
-        /// Enable AN-encoding (prototype, i32.mul only)
-        pub an_encoding_prototype: Option<bool>,
+        /// Enable AN-encoding (widened i32 → i64, A·v representation).
+        pub an_encoding: Option<bool>,
+
+        /// AN-encoding constant `A` (default 65521). Must be in `1..2^31`.
+        pub an_constant: Option<u64>,
 
         #[prefixed = "cranelift"]
         #[serde(default)]
@@ -976,8 +979,11 @@ impl CommonOptions {
         if let Some(enable) = self.codegen.inlining {
             config.compiler_inlining(enable);
         }
-        if let Some(enable) = self.codegen.an_encoding_prototype {
-            config.an_encoding_prototype(enable);
+        if let Some(enable) = self.codegen.an_encoding {
+            config.an_encoding(enable);
+        }
+        if let Some(a) = self.codegen.an_constant {
+            config.an_constant(a);
         }
 
         // async_stack_size enabled by either async or stack-switching, so
