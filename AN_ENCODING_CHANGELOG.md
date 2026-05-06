@@ -18,7 +18,7 @@ The implementation is heavily based on the paper Fetzer, Schiffel, Süßkraut, *
 | CLI | `wasmtime ... -C an-encoding=y [-C an-constant=N] ...` |
 | `Tunables` fields | `an_encoding: bool`, `an_constant: u64` |
 ---
-## What is this constant A everyone is talking about?
+## What is AN-encoding?
 > The AN-code is one of the most widely known arithmetic codes. Encoding
 is done by multiplying the information part x_f of variable x with a constant A.
 Thereby, the encoded version x_c is obtained. Only multiples of A are valid code
@@ -120,15 +120,6 @@ needing per-use decode.
 | host → wasm entry call | encode i32 args, decode i32 returns at the `array_to_wasm` trampoline |
 
 
-### Why `i32.mul` decodes instead of staying encoded
-
-The natural stays-encoded mul is `imul.i128` of the two encoded operands then
-divide by A. CLIF defines `udiv.i128`, but **no Cranelift backend lowers it**
-(no `Udiv` libcall in `LibCall` either), emitting it makes codegen fail with
-"no rule matched". So mul falls back to decode-compute-encode at the cost of
-a brief AN-protection gap on the raw operands during the multiply. The two `udiv`s by the constant `A` are auto-lowered by Cranelift to reciprocal-multiply sequences, so they are not too slow.
-Could be optimized with reciprocal multiply in the future.
-
 
 ### Future work
 
@@ -166,6 +157,14 @@ point at the failing op.
 ```
 
 ### Compile + inspect (AN on vs off)
+
+```
+./target/debug/wasmtime compile -C an-encoding=y an_encoding/fib.wat -o /tmp/demo/fib.cwasm
+```
+
+```
+./target/debug/wasmtime objdump --funcs all /tmp/demo/fib.cwasm
+```
 
 ```
 ./target/debug/wasmtime compile -C an-encoding=y \

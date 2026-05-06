@@ -1,18 +1,3 @@
-;; fib.wat — reads a non-negative integer n from stdin (decimal ASCII,
-;; optionally trailing whitespace/newline) and writes fib(n) followed by
-;; a newline to stdout.
-;;
-;; Convention: fib(0) = 0, fib(1) = 1, fib(2) = 1, ...
-;;
-;; Memory layout (single 64KiB page):
-;;    0..  8 : read iovec   { buf=64, len=32 }
-;;    8.. 12 : nread scratch
-;;   16.. 24 : write iovec  { buf=ptr, len=len }
-;;   24.. 28 : nwritten scratch
-;;   64.. 96 : stdin buffer (32 bytes)
-;;  128..160 : stdout buffer (digits, written right-to-left)
-;;  160..161 : trailing newline byte
-
 (module
   (import "wasi_snapshot_preview1" "fd_read"
     (func $fd_read (param i32 i32 i32 i32) (result i32)))
@@ -59,8 +44,6 @@
         (br $l)))
     (local.get $a))
 
-  ;; Format n as decimal ASCII into [128..160], append '\n' at 160.
-  ;; Returns (ptr, len) covering digits + newline.
   (func $format (param $n i32) (result i32 i32)
     (local $p i32)
     (local $end i32)
