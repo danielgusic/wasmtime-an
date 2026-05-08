@@ -35,6 +35,16 @@
     (func (export "eqz") (param i32) (result i32)
         local.get 0 i32.eqz)
 
+    ;; signed comparisons (exercise the bias-remap path under AN)
+    (func (export "lt_s") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.lt_s)
+    (func (export "le_s") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.le_s)
+    (func (export "gt_s") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.gt_s)
+    (func (export "ge_s") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.ge_s)
+
     ;; if/else (exercises br_if-on-encoded-cond + block params)
     (func (export "max_u") (param i32 i32) (result i32)
         (if (result i32) (i32.gt_u (local.get 0) (local.get 1))

@@ -1329,7 +1329,7 @@ pub fn translate_operator(
             //   P = (A*n) * (A*m) = A^2*n*m, fits in <96 bits — held as a (P_hi, P_lo)
             //                                                    pair of i64s via imul + umulhi.
             //   Q = P / A      = A*n*m, fits in <96 bits — `udiv_u128_by_u64_const`.
-            //   r = Q mod A·2^32 = A·(n·m mod 2^32), fits in i64.
+            //   r = Q mod A*2^32 = A*(n*m mod 2^32), fits in i64.
             // Both divides use Möller-Granlund 2-by-1 (i64-only ops, no i128).
             if environ.tunables().an_encoding && matches!(op, Operator::I32Mul) {
                 let a = environ.tunables().an_constant;
@@ -3930,29 +3930,61 @@ fn translate_icmp_dispatch(
 }
 
 /// Compare encoded i64 operands and produce an encoded i64 boolean (0 or A).
-/// Use for wasm i32 compares when the AN-encoding prototype is on.
+/// Use for wasm i32 compares when the AN-encoding is on.
 ///
 /// Operands are canonical encoded values `A*n` with `n ∈ [0, 2^32)`. For
-/// unsigned and equality compares this directly preserves wasm semantics
-/// (positive A preserves both ordering and zero-detection). Signed compares
-/// work on the raw encoded values too here, but only because both operands
-/// have the same scale `A` and the same canonical range; the actual ordering
-/// of `A*n` against `A*m` matches the ordering of `n` against `m` as
-/// non-negative i64 values. For wasm-signed semantics this is wrong when
-/// `n` or `m` represents a "negative i32" (`n ≥ 2³¹`); that is not yet implemented
+/// unsigned and equality compares we icmp the encoded values directly, as the encoded versions
+/// preserve order.
+///
+/// For signed compares the encoded value is always a non-negative i64, so the
+/// wasm-negative half (`n ≥ 2^31`, i.e. `c ≥ A*2^31`) appears LARGER than the
+/// wasm-positive half, the opposite of the wasm-signed ordering. We fix
+/// this by remapping each operand to `c' = (c + A*2^31) mod (A*2^32)` before
+/// an unsigned compare. This sends the wasm-most-negative value (`v = 2^31`) to
+/// 0 and the wasm-most-positive (`v = 2^31 − 1`) to `A*(2^32 − 1)`, so unsigned
+/// ordering of `c'` matches wasm-signed ordering of `v`.
+///
+/// The `mod (A*2^32)` step is implemented as a select: if `c < A*2^31` then
+/// `c + A*2^31`, else `c − A*2^31`.
 fn translate_icmp_i32_an(
     cc: IntCC,
     builder: &mut FunctionBuilder,
     environ: &mut FuncEnvironment<'_>,
 ) {
     let (arg0, arg1) = environ.stacks.pop2();
-    let val = builder.ins().icmp(cc, arg0, arg1);
+    let a = environ.tunables().an_constant;
+
+    let (cmp_lhs, cmp_rhs, cmp_cc) = match cc {
+        IntCC::SignedLessThan
+        | IntCC::SignedLessThanOrEqual
+        | IntCC::SignedGreaterThan
+        | IntCC::SignedGreaterThanOrEqual => {
+            let bias = builder.ins().iconst(I64, (a << 31) as i64);
+            let biased = |b: &mut FunctionBuilder, c: Value| {
+                let lt = b.ins().icmp(IntCC::UnsignedLessThan, c, bias);
+                let plus = b.ins().iadd(c, bias);
+                let minus = b.ins().isub(c, bias);
+                b.ins().select(lt, plus, minus)
+            };
+            let lhs = biased(builder, arg0);
+            let rhs = biased(builder, arg1);
+            let unsigned_cc = match cc {
+                IntCC::SignedLessThan => IntCC::UnsignedLessThan,
+                IntCC::SignedLessThanOrEqual => IntCC::UnsignedLessThanOrEqual,
+                IntCC::SignedGreaterThan => IntCC::UnsignedGreaterThan,
+                IntCC::SignedGreaterThanOrEqual => IntCC::UnsignedGreaterThanOrEqual,
+                _ => unreachable!(),
+            };
+            (lhs, rhs, unsigned_cc)
+        }
+        _ => (arg0, arg1, cc),
+    };
+
+    let val = builder.ins().icmp(cmp_cc, cmp_lhs, cmp_rhs);
     // Encode boolean as 0 or A via `select` (csel on aarch64). Replaces
     // uextend+imul — same outputs (false→0, true→A), one fewer op and no
     // multiply.
-    let an = builder
-        .ins()
-        .iconst(I64, environ.tunables().an_constant as i64);
+    let an = builder.ins().iconst(I64, a as i64);
     let zero = builder.ins().iconst(I64, 0);
     environ.stacks.push1(builder.ins().select(val, an, zero));
 }

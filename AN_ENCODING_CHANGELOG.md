@@ -115,7 +115,7 @@ needing per-use decode.
 | `i32.div_s`, `i32.rem_s` | not yet implemented |
 | `i32.eqz` | `icmp_imm Equal arg 0` produces an i8 boolean, then `select(bool, A, 0)` to encode as `0`/`A` |
 | `i32.lt_u`, `le_u`, `gt_u`, `ge_u`, `eq`, `ne` | compare encoded operands directly (A preserves order + zero), then `select(bool, A, 0)` to encode the boolean result |
-| `i32.lt_s`, `le_s`, `gt_s`, `ge_s` with negative operands | not yet implemented; broken atm |
+| `i32.lt_s`, `le_s`, `gt_s`, `ge_s` | remap each operand to `c' = (c + A·2³¹) mod (A·2³²)`, then unsigned compare |
 | `i32.load{,8_u,16_u}` | for memory32 (i32 indices): decode addr (÷A → trunc.i32) → wasm load (raw) → `uextend.i64` → ·A. For memory64 the popped i64 address is raw and passes through (not yet supported), the loaded value is still encoded if the result type is i32. |
 | `i32.store{,8,16}` | for memory32: decode addr, decode value (÷A → trunc.i32); wasm store raw. For memory64: address passes through raw (not yet supported), value still decoded since wasm-level type is i32. |
 | `local.{get,set,tee}`, `global.{get,set}` (i32) | type widened to I64 by the sig/locals widening |
@@ -143,7 +143,6 @@ For this, several helper functions have been implemented.
 |---|---|---|
 | linear memory | wasm uses it for a lot of things, especially interaction with other things at runtime (e.g. wasi syscalls) | have an encoded and unencoded version at the same time? |
 | i64 support | encoded version of i64 values would need 128 bit (and even more with operations like mul), but 128 bit support is non-existent | - |
-| signed comparison | when widening to i64, we do not extend the sign, which breaks signed comparisons | - |
 | bitwise logical operations | using look up tables like the paper could cause issues with a user-settable `A` | not make `A` settable anymore lol |
 
 
@@ -159,18 +158,17 @@ codeword-validity checks (`mod A == 0` assertions).
 
 ## Tests
 
-`cargo test -p wasmtime-cli --test all an_encoding::` — 12 tests, runs each
+```cargo test -p wasmtime-cli --test all an_encoding::``` 
 group with AN off and on:
 
 | Test | Coverage |
 |---|---|
 | `mul_{without_an,with_an}{,_native}` | `i32.mul` on Pulley + Native |
 | `fib_{without_an,with_an}` | `an_encoding/fib.wat` end-to-end via WASI preview1 (`MemoryInputPipe` / `MemoryOutputPipe`) |
-| `ops_{without_an,with_an}` | one wat module exporting one function per touched operator: add, sub, mul, divu, remu, addconst, lt_u, ge_u, gt_u, eq, ne, eqz, max_u (if/else), loop_count (br_if + accumulator), digits (div loop), store_load_i32, store_load_byte, sum_bytes (write 0..n then sum back through encoded loads) |
+| `ops_{without_an,with_an}` | one wat module exporting one function per touched operator: add, sub, mul, divu, remu, addconst, lt_u, ge_u, gt_u, eq, ne, eqz, lt_s/le_s/gt_s/ge_s (covered against a boundary-pair table including `i32::MIN`/`i32::MAX`/`-1`/`0`), max_u (if/else), loop_count (br_if + accumulator), digits (div loop), store_load_i32, store_load_byte, sum_bytes (write 0..n then sum back through encoded loads) |
 | `ops_with_an_custom_constants` | re-runs the `ops_*` assertions with several non-default values of `A` (1, 7, 1009, 16 777 213) to verify the codegen reads `A` from `Tunables` rather than baking the default in |
 
-Both AN modes are required to produce identical results; assertion labels
-point at the failing op.
+Both AN modes are required to produce identical results.
 
 ---
 

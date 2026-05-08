@@ -186,6 +186,39 @@ fn ops_assertions(o: &mut OpsInstance) -> wasmtime::Result<()> {
     assert_eq!(call1(o, "eqz", 0)?, 1, "eqz true");
     assert_eq!(call1(o, "eqz", 7)?, 0, "eqz false");
 
+    // signed comparisons — cover both halves of the i32 sign domain plus
+    // the boundary values that exercise the encoded bias-remap.
+    let signed_pairs: &[(i32, i32)] = &[
+        (3, 5),
+        (5, 3),
+        (5, 5),
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-5, -3),
+        (-3, -5),
+        (i32::MIN, 0),
+        (0, i32::MIN),
+        (i32::MIN, i32::MAX),
+        (i32::MAX, i32::MIN),
+        (i32::MIN, i32::MIN),
+        (i32::MAX, i32::MAX),
+        (i32::MAX, -1),
+        (-1, i32::MAX),
+        (i32::MIN, i32::MIN + 1),
+        (i32::MAX - 1, i32::MAX),
+    ];
+    for &(a, b) in signed_pairs {
+        let lt = (a < b) as i32;
+        let le = (a <= b) as i32;
+        let gt = (a > b) as i32;
+        let ge = (a >= b) as i32;
+        assert_eq!(call2(o, "lt_s", a, b)?, lt, "lt_s({a},{b})");
+        assert_eq!(call2(o, "le_s", a, b)?, le, "le_s({a},{b})");
+        assert_eq!(call2(o, "gt_s", a, b)?, gt, "gt_s({a},{b})");
+        assert_eq!(call2(o, "ge_s", a, b)?, ge, "ge_s({a},{b})");
+    }
+
     // br_if + if/else exercise (encoded condition fed into branch)
     assert_eq!(call2(o, "max_u", 3, 7)?, 7, "max_u");
     assert_eq!(call2(o, "max_u", 9, 4)?, 9, "max_u");
