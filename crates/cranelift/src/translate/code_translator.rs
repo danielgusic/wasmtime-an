@@ -75,6 +75,7 @@ use crate::Reachability;
 use crate::bounds_checks::{BoundsCheck, bounds_check_and_compute_addr};
 use crate::func_environ::{Extension, FuncEnvironment};
 use crate::translate::TargetEnvironment;
+use crate::translate::an_helpers::{udiv_u128_by_u64_const, umod_u128_by_u64_const_to_i64};
 use crate::translate::environ::StructFieldsVec;
 use crate::translate::stack::{ControlStackFrame, ElseData};
 use crate::translate::translation_utils::{
@@ -1323,22 +1324,21 @@ pub fn translate_operator(
         }
         Operator::I32Mul | Operator::I64Mul => {
             let (arg1, arg2) = environ.stacks.pop2();
-            // AN-encoding (i32 only): operands are widened I64 holding A*n, A*m.
-            // Stays-encoded mul would need an i128 product divided by A, but
-            // i128 udiv is not supported.
-            // decode-compute-encode: decode (/A), multiply (i64, wraps), mask
-            // to 32 bits to enforce wasm i32 semantics, re-encode (*A).
+            // AN-encoding (i32 only): operands are widened I64 holding A*n, A*m,
+            // each in [0, A*2^32) ⊂ [0, 2^48). Stays-encoded mul:
+            //   P = (A*n) * (A*m) = A^2*n*m, fits in <96 bits — held as a (P_hi, P_lo)
+            //                                                    pair of i64s via imul + umulhi.
+            //   Q = P / A      = A*n*m, fits in <96 bits — `udiv_u128_by_u64_const`.
+            //   r = Q mod A·2^32 = A·(n·m mod 2^32), fits in i64.
+            // Both divides use Möller-Granlund 2-by-1 (i64-only ops, no i128).
             if environ.tunables().an_encoding && matches!(op, Operator::I32Mul) {
-                let an = builder
-                    .ins()
-                    .iconst(I64, environ.tunables().an_constant as i64);
-                let mask32 = builder.ins().iconst(I64, 0xFFFF_FFFFu64 as i64);
-                let n = builder.ins().udiv(arg1, an);
-                let m = builder.ins().udiv(arg2, an);
-                let raw_prod = builder.ins().imul(n, m);
-                let truncated = builder.ins().band(raw_prod, mask32);
-                let encoded = builder.ins().imul(truncated, an);
-                environ.stacks.push1(encoded);
+                let a = environ.tunables().an_constant;
+                let aw = a << 32;
+                let p_lo = builder.ins().imul(arg1, arg2);
+                let p_hi = builder.ins().umulhi(arg1, arg2);
+                let (q_hi, q_lo) = udiv_u128_by_u64_const(builder, p_hi, p_lo, a);
+                let result = umod_u128_by_u64_const_to_i64(builder, q_hi, q_lo, aw);
+                environ.stacks.push1(result);
             } else {
                 environ.stacks.push1(builder.ins().imul(arg1, arg2));
             }

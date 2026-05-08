@@ -10,6 +10,7 @@
 //! it's in a transitionary period of being slurped up into
 //! `wasmtime-cranelift`.
 
+mod an_helpers;
 mod code_translator;
 mod environ;
 mod func_translator;

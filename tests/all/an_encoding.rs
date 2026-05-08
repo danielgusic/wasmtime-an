@@ -1,14 +1,7 @@
 use wasmtime::{Config, Engine, Linker, Module, Store};
 use wasmtime_environ::TripleExt;
 
-const MUL_WAT: &str = r#"
-    (module
-        (func (export "mul") (param i32 i32) (result i32)
-            local.get 0
-            local.get 1
-            i32.mul)
-    )
-"#;
+const MUL_WAT: &str = include_str!("../../an_encoding/mul.wat");
 
 #[derive(Copy, Clone, Debug)]
 enum Backend {
@@ -39,6 +32,11 @@ fn check(backend: Backend, an_enabled: bool) -> wasmtime::Result<()> {
     assert_eq!(run_mul(backend, an_enabled, 7, 6)?, 42);
     assert_eq!(run_mul(backend, an_enabled, 0, 123)?, 0);
     assert_eq!(run_mul(backend, an_enabled, -3, 4)?, -12);
+    assert_eq!(run_mul(backend, an_enabled, 1 << 29, 3)?, 1_610_612_736);
+    assert_eq!(run_mul(backend, an_enabled, i32::MAX, 4)?, -4);
+    assert_eq!(run_mul(backend, an_enabled, 1 << 29, -3)?, -1_610_612_736);
+    assert_eq!(run_mul(backend, an_enabled, i32::MAX, -4)?, 4);
+    assert_eq!(run_mul(backend, an_enabled, i32::MAX, i32::MAX)?, 1);
     Ok(())
 }
 
@@ -113,104 +111,9 @@ fn fib_with_an() -> wasmtime::Result<()> {
 // Per-operator regression suite. One wat module covers every i32 operator that
 // the AN-encoding prototype touches; each `ops_*` test runs the same module
 // with AN off and on and asserts the same expected results from both. The wat
-// is intentionally simple so failures point straight at a specific operator.
-const OPS_WAT: &str = r#"
-    (module
-        (memory (export "memory") 1)
-
-        ;; arithmetic
-        (func (export "add") (param i32 i32) (result i32)
-            local.get 0 local.get 1 i32.add)
-        (func (export "sub") (param i32 i32) (result i32)
-            local.get 0 local.get 1 i32.sub)
-        (func (export "mul") (param i32 i32) (result i32)
-            local.get 0 local.get 1 i32.mul)
-        (func (export "divu") (param i32 i32) (result i32)
-            local.get 0 local.get 1 i32.div_u)
-        (func (export "remu") (param i32 i32) (result i32)
-            local.get 0 local.get 1 i32.rem_u)
-
-        ;; const-mixing (exercises i32.const encoding alongside add)
-        (func (export "addconst") (param i32) (result i32)
-            local.get 0 i32.const 100 i32.add)
-
-        ;; comparisons + eqz
-        (func (export "lt_u") (param i32 i32) (result i32)
-            local.get 0 local.get 1 i32.lt_u)
-        (func (export "ge_u") (param i32 i32) (result i32)
-            local.get 0 local.get 1 i32.ge_u)
-        (func (export "gt_u") (param i32 i32) (result i32)
-            local.get 0 local.get 1 i32.gt_u)
-        (func (export "eq") (param i32 i32) (result i32)
-            local.get 0 local.get 1 i32.eq)
-        (func (export "ne") (param i32 i32) (result i32)
-            local.get 0 local.get 1 i32.ne)
-        (func (export "eqz") (param i32) (result i32)
-            local.get 0 i32.eqz)
-
-        ;; if/else (exercises br_if-on-encoded-cond + block params)
-        (func (export "max_u") (param i32 i32) (result i32)
-            (if (result i32) (i32.gt_u (local.get 0) (local.get 1))
-                (then local.get 0)
-                (else local.get 1)))
-
-        ;; loop with br_if (encoded counter, accumulator, const)
-        (func (export "loop_count") (param i32) (result i32)
-            (local $i i32)
-            (local $sum i32)
-            (block $break
-                (loop $l
-                    (br_if $break (i32.ge_u (local.get $i) (local.get 0)))
-                    (local.set $sum (i32.add (local.get $sum) (local.get $i)))
-                    (local.set $i (i32.add (local.get $i) (i32.const 1)))
-                    (br $l)))
-            (local.get $sum))
-
-        ;; loop using div_u (from fib's $format)
-        (func (export "digits") (param i32) (result i32)
-            (local $n i32)
-            (local $c i32)
-            (local.set $n (local.get 0))
-            (block $break
-                (loop $l
-                    (br_if $break (i32.eqz (local.get $n)))
-                    (local.set $n (i32.div_u (local.get $n) (i32.const 10)))
-                    (local.set $c (i32.add (local.get $c) (i32.const 1)))
-                    (br $l)))
-            (local.get $c))
-
-        ;; memory: i32.store / i32.load round-trip
-        (func (export "store_load_i32") (param i32 i32) (result i32)
-            local.get 0 local.get 1 i32.store
-            local.get 0 i32.load)
-
-        ;; memory: i32.store8 / i32.load8_u round-trip
-        (func (export "store_load_byte") (param i32 i32) (result i32)
-            local.get 0 local.get 1 i32.store8
-            local.get 0 i32.load8_u)
-
-        ;; mixed: write 0..n into memory[100..], sum back via load8_u
-        (func (export "sum_bytes") (param i32) (result i32)
-            (local $i i32)
-            (local $sum i32)
-            (block $w
-                (loop $lw
-                    (br_if $w (i32.ge_u (local.get $i) (local.get 0)))
-                    (i32.store8 (i32.add (i32.const 100) (local.get $i)) (local.get $i))
-                    (local.set $i (i32.add (local.get $i) (i32.const 1)))
-                    (br $lw)))
-            (local.set $i (i32.const 0))
-            (block $r
-                (loop $lr
-                    (br_if $r (i32.ge_u (local.get $i) (local.get 0)))
-                    (local.set $sum
-                        (i32.add (local.get $sum)
-                            (i32.load8_u (i32.add (i32.const 100) (local.get $i)))))
-                    (local.set $i (i32.add (local.get $i) (i32.const 1)))
-                    (br $lr)))
-            (local.get $sum))
-    )
-"#;
+// itself lives in `an_encoding/ops.wat` so it can be inspected independently
+// of the test harness.
+const OPS_WAT: &str = include_str!("../../an_encoding/ops.wat");
 
 struct OpsInstance {
     store: Store<()>,
@@ -249,7 +152,6 @@ fn call1(ops: &mut OpsInstance, name: &str, a: i32) -> wasmtime::Result<i32> {
 }
 
 fn ops_assertions(o: &mut OpsInstance) -> wasmtime::Result<()> {
-
     // S2 — i32.add / i32.sub
     assert_eq!(call2(o, "add", 7, 5)?, 12, "add small");
     assert_eq!(call2(o, "add", 1_000_000, 2_000_000)?, 3_000_000, "add big");
@@ -299,9 +201,21 @@ fn ops_assertions(o: &mut OpsInstance) -> wasmtime::Result<()> {
     assert_eq!(call1(o, "digits", 12345)?, 5, "digits 12345");
 
     // S7 / S8 — load/store
-    assert_eq!(call2(o, "store_load_i32", 64, 12345)?, 12345, "i32 store/load");
-    assert_eq!(call2(o, "store_load_i32", 256, -42)?, -42, "i32 store/load neg");
-    assert_eq!(call2(o, "store_load_byte", 64, 200)?, 200, "byte store/load");
+    assert_eq!(
+        call2(o, "store_load_i32", 64, 12345)?,
+        12345,
+        "i32 store/load"
+    );
+    assert_eq!(
+        call2(o, "store_load_i32", 256, -42)?,
+        -42,
+        "i32 store/load neg"
+    );
+    assert_eq!(
+        call2(o, "store_load_byte", 64, 200)?,
+        200,
+        "byte store/load"
+    );
     assert_eq!(call1(o, "sum_bytes", 10)?, 45, "sum 0..10 via memory");
     assert_eq!(call1(o, "sum_bytes", 20)?, 190, "sum 0..20 via memory");
 
@@ -330,9 +244,8 @@ fn ops_with_an() -> wasmtime::Result<()> {
 fn ops_with_an_custom_constants() -> wasmtime::Result<()> {
     for &a in &[1u64, 7, 1009, 16_777_213] {
         let mut o = make_ops_with(true, Some(a))?;
-        ops_assertions(&mut o).map_err(|e| {
-            wasmtime::Error::msg(format!("ops_assertions failed with A={a}: {e}"))
-        })?;
+        ops_assertions(&mut o)
+            .map_err(|e| wasmtime::Error::msg(format!("ops_assertions failed with A={a}: {e}")))?;
     }
     Ok(())
 }

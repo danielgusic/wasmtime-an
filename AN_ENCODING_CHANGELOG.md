@@ -52,10 +52,14 @@ Pick a large odd value (preferably prime), powers of two weaken detection.
   - `block_with_params` widens i32 block-param IR type when AN on.
 - **`crates/cranelift/src/translate/code_translator.rs`** 
   - per-op AN paths for I32Const, I32Add, I32Sub, I32Mul, I32DivU (RemU unchanged), I32Eqz, I32{Lt,Le,Gt,Ge}{S,U} + I32Eq/I32Ne via dispatch helper, plus address decode in `prepare_addr` and value encode/decode in `translate_load`/`translate_store` (the latter gained a `wasm_val_is_i32: bool` parameter; all call sites updated).
+- **`crates/cranelift/src/translate/an_helpers.rs`** *(new)*
+  - `udiv_u128_by_u64_const` and `umod_u128_by_u64_const_to_i64`, both built on top of a Möller-Granlund 2-by-1 division (`div2by1_mg`). Used by `Operator::I32Mul` for the stays-encoded multiply path. Pure i64 arithmetic — no i128 ops, no `mulhi_u128`, no 128×128 product.
+- **`an_encoding/ops.wat`** *(new)*
+  - regression module exporting one function per touched i32 operator (add, sub, mul, divu, remu, addconst, lt_u, ge_u, gt_u, eq, ne, eqz, max_u, loop_count, digits, store_load_*, sum_bytes). Loaded by `tests/all/an_encoding.rs` via `include_str!`.
 - **`crates/cranelift/src/compiler.rs`** 
   - added respective encode/decode passes around the respective `ValRaw` boundaries to `array_to_wasm_trampoline` and `compile_wasm_to_array_trampoline` 
-- **`an_encoding/fib.wat`** *(new)* 
-  - small WASI preview program that reads `n` from stdin and writes `fib(n)` to stdout. Hand-written wat. Memory layout documented in the header comment.
+- **`an_encoding/`** *(new directory)* 
+  - contains small wasm modules to test several things
 - **`tests/all/an_encoding.rs`** *(new)* 
   - AN-encoding tests (see *Tests* below).
 - **`tests/all/main.rs`** 
@@ -105,7 +109,7 @@ needing per-use decode.
 | `i32.const k` | emit `iconst.i64 (A·k)` |
 | `i32.add` | `iadd` then canonicalize via overflow-check: `sum >= A·2³² ? sum - A·2³² : sum` |
 | `i32.sub` | `isub` then canonicalize via underflow-check: `diff < 0 ? diff + A·2³² : diff` |
-| `i32.mul` | **decode-compute-encode**: `n = arg1 udiv A; m = arg2 udiv A; ((n imul m) & 0xFFFF_FFFF) · A`, See *i128 div* note below |
+| `i32.mul` | `(P_hi, P_lo) = (umulhi, imul)(A·n, A·m) → udiv_u128_by_u64_const(·, A) → umod_u128_by_u64_const(·, A·2³²)`. See *i32.mul* note below |
 | `i32.div_u` | `(arg1 udiv arg2) · A` (one A naturally cancels) |
 | `i32.rem_u` | unchanged: `A·n urem A·m = A·(n urem m)`  |
 | `i32.div_s`, `i32.rem_s` | not yet implemented |
@@ -121,6 +125,28 @@ needing per-use decode.
 
 
 
+### `i32.mul` note
+
+To implement `i32.mul` so that it stays encoded, the division uses algorithm 4 proposed in the paper "Improved Division by Invariant Integers", Möller & Granlund, 2010.
+High level overview (see `crates/cranelift/src/translate/an_helpers.rs` for more details):
+1. Calculate the raw product P  = (A·n) · (A·m) = A²·n·m
+2. Calculate the quotient Q  = P / A = A·n·m
+3. Canonicalize the result R = Q mod (A·2³²) = A·(n·m mod 2³²)
+
+For this, several helper functions have been implemented.
+
+
+### (Yet) Unsolved Problems
+
+
+| Problem | Description | Idea how to solve |
+|---|---|---|
+| linear memory | wasm uses it for a lot of things, especially interaction with other things at runtime (e.g. wasi syscalls) | have an encoded and unencoded version at the same time? |
+| i64 support | encoded version of i64 values would need 128 bit (and even more with operations like mul), but 128 bit support is non-existent | - |
+| signed comparison | when widening to i64, we do not extend the sign, which breaks signed comparisons | - |
+| bitwise logical operations | using look up tables like the paper could cause issues with a user-settable `A` | not make `A` settable anymore lol |
+
+
 ### Future work
 
 Signed div/rem, shifts, bitwise logical ops (and/or/xor/not), 64-bit wasm
@@ -133,7 +159,7 @@ codeword-validity checks (`mod A == 0` assertions).
 
 ## Tests
 
-`cargo test -p wasmtime-cli --test all an_encoding::` — 8 tests, runs each
+`cargo test -p wasmtime-cli --test all an_encoding::` — 12 tests, runs each
 group with AN off and on:
 
 | Test | Coverage |
