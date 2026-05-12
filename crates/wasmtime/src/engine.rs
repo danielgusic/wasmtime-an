@@ -20,6 +20,15 @@ use wasmtime_environ::{FlagValue, ObjectKind, TripleExt, Tunables};
 
 mod serialization;
 
+/// Selector for the per-op AN-encoding bitwise LUTs held by an `Engine`.
+#[cfg(feature = "runtime")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AnLutBinOp {
+    And,
+    Or,
+    Xor,
+}
+
 /// An `Engine` which is a global context for compilation and management of wasm
 /// modules.
 ///
@@ -51,6 +60,14 @@ struct EngineInner {
     config: Config,
     features: WasmFeatures,
     tunables: Tunables,
+    /// AN-encoding bitwise lookup tables for `i32.{and,or,xor}`. Populated
+    /// when `tunables.an_encoding == true`; `None` otherwise. Owned here so
+    /// the table addresses are stable for the engine's lifetime; instance
+    /// init copies the addresses into VMContext slots so JIT code can load
+    /// them via `vmctx + offset`. Generation is done by
+    /// `crate::runtime::an_lut::generate`.
+    #[cfg(feature = "runtime")]
+    an_luts: Option<crate::runtime::an_lut::AnLuts>,
     #[cfg(any(feature = "cranelift", feature = "winch"))]
     compiler: Option<Box<dyn wasmtime_environ::Compiler>>,
     #[cfg(feature = "runtime")]
@@ -138,8 +155,20 @@ impl Engine {
             wasmtime_environ::Module::new(wasmtime_environ::StaticModuleIndex::from_u32(0)),
         )?)?;
 
+        #[cfg(feature = "runtime")]
+        let an_luts = if tunables.an_encoding {
+            Some(
+                crate::runtime::an_lut::generate(tunables.an_constant)
+                    .map_err(|e| crate::Error::msg(format!("AN-encoding LUT build failed: {e}")))?,
+            )
+        } else {
+            None
+        };
+
         Ok(Engine {
             inner: try_new::<Arc<_>>(EngineInner {
+                #[cfg(feature = "runtime")]
+                an_luts,
                 #[cfg(any(feature = "cranelift", feature = "winch"))]
                 compiler,
                 #[cfg(feature = "runtime")]
@@ -817,6 +846,20 @@ impl Engine {
     #[cfg(target_has_atomic = "64")]
     pub(crate) fn epoch_counter(&self) -> &AtomicU64 {
         &self.inner.epoch
+    }
+
+    /// Address of the AN-encoding LUT for the given binary bitwise op, or
+    /// `None` when AN-encoding is off. Stable for the engine's lifetime —
+    /// `EngineInner.an_luts` owns the boxed table and never moves.
+    #[cfg(feature = "runtime")]
+    pub(crate) fn an_lut_addr(&self, op: AnLutBinOp) -> Option<*const i64> {
+        let luts = self.inner.an_luts.as_ref()?;
+        let table: &[i64; crate::runtime::an_lut::TABLE_LEN] = match op {
+            AnLutBinOp::And => &luts.and,
+            AnLutBinOp::Or => &luts.or,
+            AnLutBinOp::Xor => &luts.xor,
+        };
+        Some(table.as_ptr())
     }
 
     #[cfg(target_has_atomic = "64")]

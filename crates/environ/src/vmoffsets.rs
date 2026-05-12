@@ -486,12 +486,37 @@ pub trait PtrSize {
         self.vmctx_gc_heap_data() + self.size()
     }
 
+    /// AN-encoding bitwise lookup-table base pointers.
+    ///
+    /// Three fixed pointer slots, one per binary bitwise op. When AN-encoding
+    /// is enabled on the engine, instance init writes the address of the
+    /// engine's per-A `wasmtime_an_lut::Table` into each slot. JIT code for
+    /// `i32.{and,or,xor}` reads its base from `vmctx + offset` and indexes
+    /// into the table without any further indirection. When AN-encoding is
+    /// off these slots are left null.
+
+    /// Offset of the AN-encoding `i32.and` LUT base pointer.
+    #[inline]
+    fn vmctx_an_and_table(&self) -> u8 {
+        self.vmctx_type_ids_array() + self.size()
+    }
+    /// Offset of the AN-encoding `i32.or` LUT base pointer.
+    #[inline]
+    fn vmctx_an_or_table(&self) -> u8 {
+        self.vmctx_an_and_table() + self.size()
+    }
+    /// Offset of the AN-encoding `i32.xor` LUT base pointer.
+    #[inline]
+    fn vmctx_an_xor_table(&self) -> u8 {
+        self.vmctx_an_or_table() + self.size()
+    }
+
     /// The end of statically known offsets in `VMContext`.
     ///
     /// Data after this is dynamically sized.
     #[inline]
     fn vmctx_dynamic_data_start(&self) -> u8 {
-        self.vmctx_type_ids_array() + self.size()
+        self.vmctx_an_xor_table() + self.size()
     }
 }
 

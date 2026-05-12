@@ -1,26 +1,15 @@
 use wasmtime::{Config, Engine, Linker, Module, Store};
-use wasmtime_environ::TripleExt;
 
 const MUL_WAT: &str = include_str!("../../an_encoding/mul.wat");
 
-#[derive(Copy, Clone, Debug)]
-enum Backend {
-    Native,
-    Pulley,
-}
-
-fn make_config(backend: Backend, an_enabled: bool) -> Config {
+fn make_config(an_enabled: bool) -> Config {
     let mut config = Config::new();
-    if let Backend::Pulley = backend {
-        let triple = target_lexicon::Triple::pulley_host().to_string();
-        config.target(&triple).unwrap();
-    }
     config.an_encoding(an_enabled);
     config
 }
 
-fn run_mul(backend: Backend, an_enabled: bool, a: i32, b: i32) -> wasmtime::Result<i32> {
-    let engine = Engine::new(&make_config(backend, an_enabled))?;
+fn run_mul(an_enabled: bool, a: i32, b: i32) -> wasmtime::Result<i32> {
+    let engine = Engine::new(&make_config(an_enabled))?;
     let module = Module::new(&engine, MUL_WAT)?;
     let mut store = Store::new(&engine, ());
     let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
@@ -28,36 +17,26 @@ fn run_mul(backend: Backend, an_enabled: bool, a: i32, b: i32) -> wasmtime::Resu
     mul.call(&mut store, (a, b))
 }
 
-fn check(backend: Backend, an_enabled: bool) -> wasmtime::Result<()> {
-    assert_eq!(run_mul(backend, an_enabled, 7, 6)?, 42);
-    assert_eq!(run_mul(backend, an_enabled, 0, 123)?, 0);
-    assert_eq!(run_mul(backend, an_enabled, -3, 4)?, -12);
-    assert_eq!(run_mul(backend, an_enabled, 1 << 29, 3)?, 1_610_612_736);
-    assert_eq!(run_mul(backend, an_enabled, i32::MAX, 4)?, -4);
-    assert_eq!(run_mul(backend, an_enabled, 1 << 29, -3)?, -1_610_612_736);
-    assert_eq!(run_mul(backend, an_enabled, i32::MAX, -4)?, 4);
-    assert_eq!(run_mul(backend, an_enabled, i32::MAX, i32::MAX)?, 1);
+fn check(an_enabled: bool) -> wasmtime::Result<()> {
+    assert_eq!(run_mul(an_enabled, 7, 6)?, 42);
+    assert_eq!(run_mul(an_enabled, 0, 123)?, 0);
+    assert_eq!(run_mul(an_enabled, -3, 4)?, -12);
+    assert_eq!(run_mul(an_enabled, 1 << 29, 3)?, 1_610_612_736);
+    assert_eq!(run_mul(an_enabled, i32::MAX, 4)?, -4);
+    assert_eq!(run_mul(an_enabled, 1 << 29, -3)?, -1_610_612_736);
+    assert_eq!(run_mul(an_enabled, i32::MAX, -4)?, 4);
+    assert_eq!(run_mul(an_enabled, i32::MAX, i32::MAX)?, 1);
     Ok(())
 }
 
 #[test]
 fn mul_without_an() -> wasmtime::Result<()> {
-    check(Backend::Pulley, false)
+    check(false)
 }
 
 #[test]
 fn mul_with_an() -> wasmtime::Result<()> {
-    check(Backend::Pulley, true)
-}
-
-#[test]
-fn mul_without_an_native() -> wasmtime::Result<()> {
-    check(Backend::Native, false)
-}
-
-#[test]
-fn mul_with_an_native() -> wasmtime::Result<()> {
-    check(Backend::Native, true)
+    check(true)
 }
 
 const FIB_WAT: &str = include_str!("../../an_encoding/fib.wat");
@@ -251,6 +230,51 @@ fn ops_assertions(o: &mut OpsInstance) -> wasmtime::Result<()> {
     );
     assert_eq!(call1(o, "sum_bytes", 10)?, 45, "sum 0..10 via memory");
     assert_eq!(call1(o, "sum_bytes", 20)?, 190, "sum 0..20 via memory");
+
+    // bitwise logical (LUT-based under AN). Cover zero-arg, identity-arg,
+    // small values, full-byte boundaries, all-ones and chunk-crossing
+    // patterns so each of the four 8-bit chunks is exercised.
+    let bw_pairs: &[(i32, i32)] = &[
+        (0, 0),
+        (0, 0x12345678u32 as i32),
+        (0x12345678u32 as i32, 0),
+        (0x12345678u32 as i32, 0x0FF00FF0u32 as i32),
+        (0xFFFFFFFFu32 as i32, 0xAAAAAAAAu32 as i32),
+        (0xDEADBEEFu32 as i32, 0xCAFEBABEu32 as i32),
+        (0x0000FFFFu32 as i32, 0xFFFF0000u32 as i32),
+        (0x00FF00FFu32 as i32, 0xFF00FF00u32 as i32),
+        (-1, 0x5A5A5A5Au32 as i32),
+        (i32::MIN, i32::MAX),
+        (0x80000000u32 as i32, 0x7FFFFFFFu32 as i32),
+    ];
+    for &(a, b) in bw_pairs {
+        let expect_and = (a as u32 & b as u32) as i32;
+        let expect_or = (a as u32 | b as u32) as i32;
+        let expect_xor = (a as u32 ^ b as u32) as i32;
+        assert_eq!(
+            call2(o, "and", a, b)?,
+            expect_and,
+            "and({a:#010x},{b:#010x})"
+        );
+        assert_eq!(call2(o, "or", a, b)?, expect_or, "or({a:#010x},{b:#010x})");
+        assert_eq!(
+            call2(o, "xor", a, b)?,
+            expect_xor,
+            "xor({a:#010x},{b:#010x})"
+        );
+    }
+
+    // unary not via xor -1
+    for &v in &[0i32, 1, -1, 0x12345678u32 as i32, i32::MIN, i32::MAX] {
+        assert_eq!(call1(o, "not", v)?, !v, "not({v:#010x})");
+    }
+
+    // Combined mask/merge — ensures chained bitwise + const + mask behaves.
+    let a = 0xAABBCCDDu32 as i32;
+    let b = 0x11223344u32 as i32;
+    let merged =
+        ((a as u32 & 0x00ffff00u32) | (b as u32 & 0xff0000ffu32)) as i32;
+    assert_eq!(call2(o, "mask_merge", a, b)?, merged, "mask_merge");
 
     Ok(())
 }

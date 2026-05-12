@@ -541,6 +541,27 @@ impl Instance {
         unsafe { self.vmctx_plus_offset_mut(offset) }
     }
 
+    /// Return a mutable reference to the AN-encoding `i32.and` LUT base
+    /// pointer slot in this instance's `VMContext`.
+    pub fn an_and_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<i64>> {
+        let offset = self.offsets().ptr.vmctx_an_and_table();
+        unsafe { self.vmctx_plus_offset_mut(offset) }
+    }
+
+    /// Return a mutable reference to the AN-encoding `i32.or` LUT base
+    /// pointer slot in this instance's `VMContext`.
+    pub fn an_or_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<i64>> {
+        let offset = self.offsets().ptr.vmctx_an_or_table();
+        unsafe { self.vmctx_plus_offset_mut(offset) }
+    }
+
+    /// Return a mutable reference to the AN-encoding `i32.xor` LUT base
+    /// pointer slot in this instance's `VMContext`.
+    pub fn an_xor_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<i64>> {
+        let offset = self.offsets().ptr.vmctx_an_xor_table();
+        unsafe { self.vmctx_plus_offset_mut(offset) }
+    }
+
     pub(crate) unsafe fn set_store(mut self: Pin<&mut Self>, store: &StoreOpaque) {
         // FIXME: should be more targeted ideally with the `unsafe` than just
         // throwing this entire function in a large `unsafe` block.
@@ -559,7 +580,25 @@ impl Instance {
             } else {
                 self.as_mut().set_gc_heap(None);
             }
+
+            self.as_mut().set_an_lut_pointers(store);
         }
+    }
+
+    /// Populate the three AN-encoding LUT base-pointer slots in this
+    /// instance's `VMContext` from the engine's per-A tables. When AN-encoding
+    /// is off the slots stay `None`.
+    fn set_an_lut_pointers(mut self: Pin<&mut Self>, store: &StoreOpaque) {
+        use crate::engine::AnLutBinOp;
+        let engine = store.engine();
+        let to_vmptr = |op| {
+            engine
+                .an_lut_addr(op)
+                .map(|p| VmPtr::from(NonNull::new(p as *mut i64).expect("LUT address non-null")))
+        };
+        *self.as_mut().an_and_table() = to_vmptr(AnLutBinOp::And);
+        *self.as_mut().an_or_table() = to_vmptr(AnLutBinOp::Or);
+        *self.as_mut().an_xor_table() = to_vmptr(AnLutBinOp::Xor);
     }
 
     unsafe fn set_gc_heap(self: Pin<&mut Self>, gc_store: Option<&GcStore>) {

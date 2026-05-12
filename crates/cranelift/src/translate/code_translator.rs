@@ -75,7 +75,9 @@ use crate::Reachability;
 use crate::bounds_checks::{BoundsCheck, bounds_check_and_compute_addr};
 use crate::func_environ::{Extension, FuncEnvironment};
 use crate::translate::TargetEnvironment;
-use crate::translate::an_helpers::{udiv_u128_by_u64_const, umod_u128_by_u64_const_to_i64};
+use crate::translate::an_helpers::{
+    AnBitwiseOp, emit_an_bitwise_i32, udiv_u128_by_u64_const, umod_u128_by_u64_const_to_i64,
+};
 use crate::translate::environ::StructFieldsVec;
 use crate::translate::stack::{ControlStackFrame, ElseData};
 use crate::translate::translation_utils::{
@@ -1266,15 +1268,30 @@ pub fn translate_operator(
         }
         Operator::I32And | Operator::I64And => {
             let (arg1, arg2) = environ.stacks.pop2();
-            environ.stacks.push1(builder.ins().band(arg1, arg2));
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32And) {
+                emit_an_bitwise_i32(builder, environ, AnBitwiseOp::And, arg1, arg2)
+            } else {
+                builder.ins().band(arg1, arg2)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I32Or | Operator::I64Or => {
             let (arg1, arg2) = environ.stacks.pop2();
-            environ.stacks.push1(builder.ins().bor(arg1, arg2));
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32Or) {
+                emit_an_bitwise_i32(builder, environ, AnBitwiseOp::Or, arg1, arg2)
+            } else {
+                builder.ins().bor(arg1, arg2)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I32Xor | Operator::I64Xor => {
             let (arg1, arg2) = environ.stacks.pop2();
-            environ.stacks.push1(builder.ins().bxor(arg1, arg2));
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32Xor) {
+                emit_an_bitwise_i32(builder, environ, AnBitwiseOp::Xor, arg1, arg2)
+            } else {
+                builder.ins().bxor(arg1, arg2)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I32Shl | Operator::I64Shl => {
             let (arg1, arg2) = environ.stacks.pop2();

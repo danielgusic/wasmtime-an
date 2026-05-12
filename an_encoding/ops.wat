@@ -45,6 +45,24 @@
     (func (export "ge_s") (param i32 i32) (result i32)
         local.get 0 local.get 1 i32.ge_s)
 
+    ;; bitwise logical (LUT-based under AN)
+    (func (export "and") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.and)
+    (func (export "or") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.or)
+    (func (export "xor") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.xor)
+
+    ;; bitwise NOT via xor with -1 (no native i32.not in wasm)
+    (func (export "not") (param i32) (result i32)
+        local.get 0 i32.const -1 i32.xor)
+
+    ;; combined bitwise expression: (a & 0x00ff_ff00) | (b & 0xff00_00ff)
+    (func (export "mask_merge") (param i32 i32) (result i32)
+        local.get 0 i32.const 0x00ffff00 i32.and
+        local.get 1 i32.const 0xff0000ff i32.and
+        i32.or)
+
     ;; if/else (exercises br_if-on-encoded-cond + block params)
     (func (export "max_u") (param i32 i32) (result i32)
         (if (result i32) (i32.gt_u (local.get 0) (local.get 1))

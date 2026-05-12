@@ -37,6 +37,7 @@ mod bug;
 #[macro_use]
 pub(crate) mod func;
 
+pub(crate) mod an_lut;
 pub(crate) mod code;
 pub(crate) mod code_memory;
 #[cfg(feature = "debug")]
