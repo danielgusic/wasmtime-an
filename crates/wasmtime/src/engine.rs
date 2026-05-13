@@ -852,9 +852,9 @@ impl Engine {
     /// `None` when AN-encoding is off. Stable for the engine's lifetime —
     /// `EngineInner.an_luts` owns the boxed table and never moves.
     #[cfg(feature = "runtime")]
-    pub(crate) fn an_lut_addr(&self, op: AnLutBinOp) -> Option<*const i64> {
+    pub(crate) fn an_lut_addr(&self, op: AnLutBinOp) -> Option<*const i32> {
         let luts = self.inner.an_luts.as_ref()?;
-        let table: &[i64; crate::runtime::an_lut::TABLE_LEN] = match op {
+        let table: &[i32; crate::runtime::an_lut::TABLE_LEN] = match op {
             AnLutBinOp::And => &luts.and,
             AnLutBinOp::Or => &luts.or,
             AnLutBinOp::Xor => &luts.xor,

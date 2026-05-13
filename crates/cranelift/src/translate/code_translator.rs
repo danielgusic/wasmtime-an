@@ -76,7 +76,8 @@ use crate::bounds_checks::{BoundsCheck, bounds_check_and_compute_addr};
 use crate::func_environ::{Extension, FuncEnvironment};
 use crate::translate::TargetEnvironment;
 use crate::translate::an_helpers::{
-    AnBitwiseOp, emit_an_bitwise_i32, udiv_u128_by_u64_const, umod_u128_by_u64_const_to_i64,
+    AnBitwiseOp, emit_an_bitwise_i32, emit_an_shl_i32, emit_an_shr_u_i32, udiv_u128_by_u64_const,
+    umod_u128_by_u64_const_to_i64,
 };
 use crate::translate::environ::StructFieldsVec;
 use crate::translate::stack::{ControlStackFrame, ElseData};
@@ -188,7 +189,23 @@ pub fn translate_operator(
          ***********************************************************************************/
         Operator::GlobalGet { global_index } => {
             let global_index = GlobalIndex::from_u32(*global_index);
-            let val = environ.translate_global_get(builder, global_index)?;
+            let mut val = environ.translate_global_get(builder, global_index)?;
+            // AN-encoding: i32 globals stay raw `I32` in storage (matches the
+            // linear-memory model — host-side `Global::get`/`set` keep working
+            // unchanged). Encode on the way out so the operand stack sees
+            // canonical `A*v` in `I64`.
+            if environ.tunables().an_encoding
+                && matches!(
+                    environ.module.globals[global_index].wasm_ty,
+                    WasmValType::I32
+                )
+            {
+                let a_const = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let widened = builder.ins().uextend(I64, val);
+                val = builder.ins().imul(widened, a_const);
+            }
             environ.stacks.push1(val);
         }
         Operator::GlobalSet { global_index } => {
@@ -197,6 +214,20 @@ pub fn translate_operator(
             // Ensure SIMD values are cast to their default Cranelift type, I8x16.
             if builder.func.dfg.value_type(val).is_vector() {
                 val = optionally_bitcast_vector(val, I8X16, builder);
+            }
+            // AN-encoding: decode the encoded `I64` value (`A*v` -> `v`) and
+            // narrow to `I32` before handing off to the raw-storage write.
+            if environ.tunables().an_encoding
+                && matches!(
+                    environ.module.globals[global_index].wasm_ty,
+                    WasmValType::I32
+                )
+            {
+                let a_const = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let decoded = builder.ins().udiv(val, a_const);
+                val = builder.ins().ireduce(I32, decoded);
             }
             environ.translate_global_set(builder, global_index, val)?;
         }
@@ -1047,15 +1078,54 @@ pub fn translate_operator(
         /******************************* Unary Operators *************************************/
         Operator::I32Clz | Operator::I64Clz => {
             let arg = environ.stacks.pop1();
-            environ.stacks.push1(builder.ins().clz(arg));
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32Clz) {
+                // Bit-counting requires actual bits. Decode once, run the
+                // native i32 op, re-encode. `clz`/`ctz`/`popcnt` results live
+                // in `[0, 32]` so the encoded result fits well below `A*2^32`.
+                let a_const = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let v = builder.ins().udiv(arg, a_const);
+                let v32 = builder.ins().ireduce(I32, v);
+                let c32 = builder.ins().clz(v32);
+                let c64 = builder.ins().uextend(I64, c32);
+                builder.ins().imul(c64, a_const)
+            } else {
+                builder.ins().clz(arg)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I32Ctz | Operator::I64Ctz => {
             let arg = environ.stacks.pop1();
-            environ.stacks.push1(builder.ins().ctz(arg));
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32Ctz) {
+                let a_const = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let v = builder.ins().udiv(arg, a_const);
+                let v32 = builder.ins().ireduce(I32, v);
+                let c32 = builder.ins().ctz(v32);
+                let c64 = builder.ins().uextend(I64, c32);
+                builder.ins().imul(c64, a_const)
+            } else {
+                builder.ins().ctz(arg)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I32Popcnt | Operator::I64Popcnt => {
             let arg = environ.stacks.pop1();
-            environ.stacks.push1(builder.ins().popcnt(arg));
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32Popcnt) {
+                let a_const = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let v = builder.ins().udiv(arg, a_const);
+                let v32 = builder.ins().ireduce(I32, v);
+                let p32 = builder.ins().popcnt(v32);
+                let p64 = builder.ins().uextend(I64, p32);
+                builder.ins().imul(p64, a_const)
+            } else {
+                builder.ins().popcnt(arg)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I64ExtendI32S => {
             let val = environ.stacks.pop1();
@@ -1295,23 +1365,113 @@ pub fn translate_operator(
         }
         Operator::I32Shl | Operator::I64Shl => {
             let (arg1, arg2) = environ.stacks.pop2();
-            environ.stacks.push1(builder.ins().ishl(arg1, arg2));
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32Shl) {
+                // Decode the count (one udiv by A), mask to wasm's `k mod 32`.
+                // The value itself stays encoded — the shl helper multiplies it
+                // by an unencoded `2^k` and canonicalizes mod `A*2^32`.
+                let a_const = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let k_dec = builder.ins().udiv(arg2, a_const);
+                let k_mod = builder.ins().band_imm(k_dec, 31);
+                emit_an_shl_i32(builder, environ, arg1, k_mod)
+            } else {
+                builder.ins().ishl(arg1, arg2)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I32ShrS | Operator::I64ShrS => {
             let (arg1, arg2) = environ.stacks.pop2();
-            environ.stacks.push1(builder.ins().sshr(arg1, arg2));
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32ShrS) {
+                // shr_s = shr_u + sign-extension mask if value is negative.
+                // Negative ↔ enc >= A*2^31. The encoded sign-extension mask
+                // `A * mask` (where mask = ((1<<k)-1) << (32-k)) equals
+                // `aw - (aw >> k_mod)`, since
+                //   A*mask = A*(2^32 - 2^(32-k)) = aw - aw>>k_mod.
+                // Adding (rather than OR-ing) is exact because the logical
+                // shift result already has top `k_mod` bits clear, so the
+                // mask's set bits land on zero bits.
+                let a = environ.tunables().an_constant as i64;
+                let a_const = builder.ins().iconst(I64, a);
+                let aw = builder.ins().iconst(I64, a << 32);
+                let half = builder.ins().iconst(I64, a << 31);
+
+                let k_dec = builder.ins().udiv(arg2, a_const);
+                let k_mod = builder.ins().band_imm(k_dec, 31);
+
+                let logical = emit_an_shr_u_i32(builder, environ, arg1, k_mod);
+
+                let is_neg = builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, arg1, half);
+                let aw_shifted = builder.ins().ushr(aw, k_mod);
+                let mask_enc = builder.ins().isub(aw, aw_shifted);
+                let zero = builder.ins().iconst(I64, 0);
+                let adjust = builder.ins().select(is_neg, mask_enc, zero);
+                builder.ins().iadd(logical, adjust)
+            } else {
+                builder.ins().sshr(arg1, arg2)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I32ShrU | Operator::I64ShrU => {
             let (arg1, arg2) = environ.stacks.pop2();
-            environ.stacks.push1(builder.ins().ushr(arg1, arg2));
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32ShrU) {
+                let a_const = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let k_dec = builder.ins().udiv(arg2, a_const);
+                let k_mod = builder.ins().band_imm(k_dec, 31);
+                emit_an_shr_u_i32(builder, environ, arg1, k_mod)
+            } else {
+                builder.ins().ushr(arg1, arg2)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I32Rotl | Operator::I64Rotl => {
             let (arg1, arg2) = environ.stacks.pop2();
-            environ.stacks.push1(builder.ins().rotl(arg1, arg2));
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32Rotl) {
+                // rotl(v, k) = (v << k_mod) | (v >> (32 - k_mod)). The two
+                // shifted results have disjoint bit positions, so OR = ADD on
+                // the encoded sums. At `k_mod = 0`, the `shr_u` helper with
+                // shift 32 returns 0, and the `shl` helper with shift 0
+                // returns `enc_v`, so the sum is `enc_v` — identity rotation,
+                // no special-case needed.
+                let a_const = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let k_dec = builder.ins().udiv(arg2, a_const);
+                let k_mod = builder.ins().band_imm(k_dec, 31);
+                let thirty_two = builder.ins().iconst(I64, 32);
+                let inv = builder.ins().isub(thirty_two, k_mod);
+                let left = emit_an_shl_i32(builder, environ, arg1, k_mod);
+                let right = emit_an_shr_u_i32(builder, environ, arg1, inv);
+                builder.ins().iadd(left, right)
+            } else {
+                builder.ins().rotl(arg1, arg2)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I32Rotr | Operator::I64Rotr => {
             let (arg1, arg2) = environ.stacks.pop2();
-            environ.stacks.push1(builder.ins().rotr(arg1, arg2));
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32Rotr) {
+                // rotr(v, k) = (v >> k_mod) | (v << (32 - k_mod)). Same
+                // disjoint-bits trick. At `k_mod = 0`, `shr_u(0)` returns
+                // `enc_v` and `shl(32)` returns 0 — sum is `enc_v`.
+                let a_const = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let k_dec = builder.ins().udiv(arg2, a_const);
+                let k_mod = builder.ins().band_imm(k_dec, 31);
+                let thirty_two = builder.ins().iconst(I64, 32);
+                let inv = builder.ins().isub(thirty_two, k_mod);
+                let right = emit_an_shr_u_i32(builder, environ, arg1, k_mod);
+                let left = emit_an_shl_i32(builder, environ, arg1, inv);
+                builder.ins().iadd(left, right)
+            } else {
+                builder.ins().rotr(arg1, arg2)
+            };
+            environ.stacks.push1(result);
         }
         Operator::F32Add | Operator::F64Add => {
             let (arg1, arg2) = environ.stacks.pop2();
@@ -1370,7 +1530,57 @@ pub fn translate_operator(
         }
         Operator::I32DivS | Operator::I64DivS => {
             let (arg1, arg2) = environ.stacks.pop2();
-            let result = environ.translate_sdiv(builder, arg1, arg2);
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32DivS) {
+                // Stays-encoded signed divide. Operands `enc = A*v` with
+                // `v in [0, 2^32)` (u32 bit-pattern of the i32 value); negative
+                // values live in `enc >= A*2^31`. Strategy: detect sign without
+                // decoding, negate-to-absolute in encoded form, do unsigned
+                // divide (`A` cancels), re-encode by `*A`, then re-apply sign.
+                let a = environ.tunables().an_constant as i64;
+                let aw = builder.ins().iconst(I64, a << 32);           // A * 2^32
+                let half = builder.ins().iconst(I64, a << 31);         // A * 2^31
+                let neg_one_enc = builder.ins().iconst(I64, (a << 32) - a); // A*(2^32-1)
+
+                // INT_MIN/-1 trap: wasm requires INTEGER_OVERFLOW here.
+                let is_min = builder.ins().icmp(IntCC::Equal, arg1, half);
+                let is_neg_one = builder.ins().icmp(IntCC::Equal, arg2, neg_one_enc);
+                let overflow = builder.ins().band(is_min, is_neg_one);
+                environ.trapnz(builder, overflow, ir::TrapCode::INTEGER_OVERFLOW);
+
+                // Signs (enc >= A*2^31).
+                let s1 = builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, arg1, half);
+                let s2 = builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, arg2, half);
+
+                // abs(enc) = select(sign, aw - enc, enc). Fixed-point at
+                // INT_MIN (`aw - A*2^31 = A*2^31`), zero at 0 (sign=false).
+                let neg1 = builder.ins().isub(aw, arg1);
+                let neg2 = builder.ins().isub(aw, arg2);
+                let abs1 = builder.ins().select(s1, neg1, arg1);
+                let abs2 = builder.ins().select(s2, neg2, arg2);
+
+                // udiv on encoded absolutes: A cancels. Traps if abs2 = 0,
+                // which iff arg2 = 0 (`enc < aw` invariant => only zero
+                // negates to zero). `q_raw` in [0, 2^31].
+                let q_raw = environ.translate_udiv(builder, abs1, abs2);
+
+                let a_const = builder.ins().iconst(I64, a);
+                let q_enc = builder.ins().imul(q_raw, a_const);
+
+                // Re-apply sign. Skip negate when q_enc = 0 (would produce
+                // `aw`, breaking canonical form).
+                let result_neg = builder.ins().bxor(s1, s2);
+                let zero = builder.ins().iconst(I64, 0);
+                let q_is_zero = builder.ins().icmp(IntCC::Equal, q_enc, zero);
+                let q_neg_raw = builder.ins().isub(aw, q_enc);
+                let q_neg = builder.ins().select(q_is_zero, zero, q_neg_raw);
+                builder.ins().select(result_neg, q_neg, q_enc)
+            } else {
+                environ.translate_sdiv(builder, arg1, arg2)
+            };
             environ.stacks.push1(result);
         }
         Operator::I32DivU | Operator::I64DivU => {
@@ -1389,7 +1599,40 @@ pub fn translate_operator(
         }
         Operator::I32RemS | Operator::I64RemS => {
             let (arg1, arg2) = environ.stacks.pop2();
-            let result = environ.translate_srem(builder, arg1, arg2);
+            let result = if environ.tunables().an_encoding && matches!(op, Operator::I32RemS) {
+                // Stays-encoded signed remainder. Same sign-detect + abs trick
+                // as I32DivS, but uses `urem` which preserves the `A` factor:
+                // `urem(A*|n|, A*|m|) = A*(|n| % |m|)`. Result takes sign of
+                // dividend (wasm semantics). INT_MIN/-1 falls out as 0
+                // (urem(A*2^31, A) = 0), no trap required.
+                let a = environ.tunables().an_constant as i64;
+                let aw = builder.ins().iconst(I64, a << 32);
+                let half = builder.ins().iconst(I64, a << 31);
+
+                let s1 = builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, arg1, half);
+                let s2 = builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, arg2, half);
+
+                let neg1 = builder.ins().isub(aw, arg1);
+                let neg2 = builder.ins().isub(aw, arg2);
+                let abs1 = builder.ins().select(s1, neg1, arg1);
+                let abs2 = builder.ins().select(s2, neg2, arg2);
+
+                // urem traps if abs2 = 0, iff arg2 = 0.
+                let r_enc = environ.translate_urem(builder, abs1, abs2);
+
+                // Apply dividend sign; skip when r_enc = 0 to stay canonical.
+                let zero = builder.ins().iconst(I64, 0);
+                let r_is_zero = builder.ins().icmp(IntCC::Equal, r_enc, zero);
+                let r_neg_raw = builder.ins().isub(aw, r_enc);
+                let r_neg = builder.ins().select(r_is_zero, zero, r_neg_raw);
+                builder.ins().select(s1, r_neg, r_enc)
+            } else {
+                environ.translate_srem(builder, arg1, arg2)
+            };
             environ.stacks.push1(result);
         }
         Operator::I32RemU | Operator::I64RemU => {

@@ -543,21 +543,21 @@ impl Instance {
 
     /// Return a mutable reference to the AN-encoding `i32.and` LUT base
     /// pointer slot in this instance's `VMContext`.
-    pub fn an_and_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<i64>> {
+    pub fn an_and_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<i32>> {
         let offset = self.offsets().ptr.vmctx_an_and_table();
         unsafe { self.vmctx_plus_offset_mut(offset) }
     }
 
     /// Return a mutable reference to the AN-encoding `i32.or` LUT base
     /// pointer slot in this instance's `VMContext`.
-    pub fn an_or_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<i64>> {
+    pub fn an_or_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<i32>> {
         let offset = self.offsets().ptr.vmctx_an_or_table();
         unsafe { self.vmctx_plus_offset_mut(offset) }
     }
 
     /// Return a mutable reference to the AN-encoding `i32.xor` LUT base
     /// pointer slot in this instance's `VMContext`.
-    pub fn an_xor_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<i64>> {
+    pub fn an_xor_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<i32>> {
         let offset = self.offsets().ptr.vmctx_an_xor_table();
         unsafe { self.vmctx_plus_offset_mut(offset) }
     }
@@ -594,7 +594,7 @@ impl Instance {
         let to_vmptr = |op| {
             engine
                 .an_lut_addr(op)
-                .map(|p| VmPtr::from(NonNull::new(p as *mut i64).expect("LUT address non-null")))
+                .map(|p| VmPtr::from(NonNull::new(p as *mut i32).expect("LUT address non-null")))
         };
         *self.as_mut().an_and_table() = to_vmptr(AnLutBinOp::And);
         *self.as_mut().an_or_table() = to_vmptr(AnLutBinOp::Or);

@@ -2282,15 +2282,15 @@ impl Config {
     /// # Panics
     ///
     /// Panics if `a == 0` (would break everything)
-    /// or if `a >= 1 << 31` (problems with sign).
+    /// or if `a >= 1 << 23` (LUT entries would overflow `i32`).
     pub fn an_constant(&mut self, a: u64) -> &mut Self {
         assert!(
             a >= 1,
             "AN_CONSTANT must be ≥ 1 (A=0 destroys information and is un-decodable)"
         );
         assert!(
-            a < (1u64 << 31),
-            "AN_CONSTANT must be < 2^31 to avoid signed i64 overflows"
+            a < (1u64 << 23),
+            "AN_CONSTANT must be < 2^23 so LUT entries A * 0xFF fit in signed i32"
         );
         self.tunables.an_constant = Some(a);
         self

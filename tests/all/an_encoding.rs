@@ -130,6 +130,32 @@ fn call1(ops: &mut OpsInstance, name: &str, a: i32) -> wasmtime::Result<i32> {
     f.call(&mut ops.store, a)
 }
 
+fn call0_r(ops: &mut OpsInstance, name: &str) -> wasmtime::Result<i32> {
+    let f = ops
+        .instance
+        .get_typed_func::<(), i32>(&mut ops.store, name)?;
+    f.call(&mut ops.store, ())
+}
+
+fn call1_v(ops: &mut OpsInstance, name: &str, a: i32) -> wasmtime::Result<()> {
+    let f = ops
+        .instance
+        .get_typed_func::<i32, ()>(&mut ops.store, name)?;
+    f.call(&mut ops.store, a)
+}
+
+fn assert_trap(
+    res: wasmtime::Result<i32>,
+    expected: wasmtime::Trap,
+    label: &str,
+) {
+    let err = res.expect_err(&format!("{label}: expected trap, got Ok"));
+    let trap = err
+        .downcast_ref::<wasmtime::Trap>()
+        .unwrap_or_else(|| panic!("{label}: not a Trap: {err:?}"));
+    assert_eq!(*trap, expected, "{label}: trap code mismatch");
+}
+
 fn ops_assertions(o: &mut OpsInstance) -> wasmtime::Result<()> {
     // S2 — i32.add / i32.sub
     assert_eq!(call2(o, "add", 7, 5)?, 12, "add small");
@@ -148,6 +174,129 @@ fn ops_assertions(o: &mut OpsInstance) -> wasmtime::Result<()> {
     assert_eq!(call2(o, "divu", 100, 7)?, 14, "divu");
     assert_eq!(call2(o, "remu", 20, 3)?, 2, "remu");
     assert_eq!(call2(o, "remu", 100, 7)?, 2, "remu");
+
+    // signed div / rem — cover all 4 sign combinations, INT_MIN, INT_MAX,
+    // /0 trap (both), INT_MIN/-1 trap (div_s only), INT_MIN%-1 == 0 (no trap).
+    let signed_div_pairs: &[(i32, i32)] = &[
+        (7, 2),
+        (-7, 2),
+        (7, -2),
+        (-7, -2),
+        (0, 5),
+        (0, -5),
+        (i32::MIN, 1),
+        (i32::MIN, 2),
+        (i32::MIN, 3),
+        (i32::MAX, 1),
+        (i32::MAX, -1),
+        (-1, 1),
+        (1, -1),
+        (-1, -1),
+        (-1, i32::MIN),
+        (1, i32::MIN),
+        (i32::MIN, i32::MIN),
+        (i32::MIN, i32::MAX),
+        (i32::MAX, i32::MAX),
+    ];
+    for &(a, b) in signed_div_pairs {
+        assert_eq!(call2(o, "divs", a, b)?, a.wrapping_div(b), "divs({a},{b})");
+        assert_eq!(call2(o, "rems", a, b)?, a.wrapping_rem(b), "rems({a},{b})");
+    }
+    // INT_MIN/-1 traps with INTEGER_OVERFLOW under div_s; rem_s returns 0.
+    assert_trap(
+        call2(o, "divs", i32::MIN, -1),
+        wasmtime::Trap::IntegerOverflow,
+        "divs INT_MIN/-1",
+    );
+    assert_eq!(
+        call2(o, "rems", i32::MIN, -1)?,
+        0,
+        "rems INT_MIN/-1 returns 0"
+    );
+    // /0 traps with INTEGER_DIVISION_BY_ZERO for both signed and unsigned.
+    for &lhs in &[0i32, 1, -1, 42, i32::MIN, i32::MAX] {
+        assert_trap(
+            call2(o, "divs", lhs, 0),
+            wasmtime::Trap::IntegerDivisionByZero,
+            &format!("divs {lhs}/0"),
+        );
+        assert_trap(
+            call2(o, "rems", lhs, 0),
+            wasmtime::Trap::IntegerDivisionByZero,
+            &format!("rems {lhs}%0"),
+        );
+    }
+
+    // shifts — value-domain × shift-count-domain coverage.
+    let shift_vals: &[i32] = &[
+        0,
+        1,
+        -1,
+        2,
+        42,
+        -42,
+        0x12345678u32 as i32,
+        0xDEADBEEFu32 as i32,
+        i32::MIN,
+        i32::MAX,
+        0x80000001u32 as i32,
+        0x7FFFFFFE,
+    ];
+    // counts span the in-range [0..32) plus wraparound (>= 32) — wasm uses
+    // `k mod 32`.
+    let shift_counts: &[i32] = &[0, 1, 2, 7, 15, 16, 17, 30, 31, 32, 33, 63, 64, 65];
+    for &v in shift_vals {
+        for &k in shift_counts {
+            let kmod = (k as u32) & 31;
+            let expect_shl = ((v as u32).wrapping_shl(kmod)) as i32;
+            let expect_shr_u = ((v as u32) >> kmod) as i32;
+            let expect_shr_s = v.wrapping_shr(kmod);
+            let expect_rotl = (v as u32).rotate_left(kmod) as i32;
+            let expect_rotr = (v as u32).rotate_right(kmod) as i32;
+            assert_eq!(call2(o, "shl", v, k)?, expect_shl, "shl({v:#010x},{k})");
+            assert_eq!(call2(o, "shr_u", v, k)?, expect_shr_u, "shr_u({v:#010x},{k})");
+            assert_eq!(call2(o, "shr_s", v, k)?, expect_shr_s, "shr_s({v:#010x},{k})");
+            assert_eq!(call2(o, "rotl", v, k)?, expect_rotl, "rotl({v:#010x},{k})");
+            assert_eq!(call2(o, "rotr", v, k)?, expect_rotr, "rotr({v:#010x},{k})");
+        }
+    }
+
+    // clz / ctz / popcnt — boundary plus mixed bit patterns.
+    let unary_vals: &[i32] = &[
+        0,
+        1,
+        -1,
+        2,
+        0x80000000u32 as i32,
+        0x7FFFFFFF,
+        0x0000FFFFu32 as i32,
+        0xFFFF0000u32 as i32,
+        0x12345678u32 as i32,
+        0xDEADBEEFu32 as i32,
+        i32::MIN,
+        i32::MAX,
+    ];
+    for &v in unary_vals {
+        let expect_clz = (v as u32).leading_zeros() as i32;
+        let expect_ctz = (v as u32).trailing_zeros() as i32;
+        let expect_pop = (v as u32).count_ones() as i32;
+        assert_eq!(call1(o, "clz", v)?, expect_clz, "clz({v:#010x})");
+        assert_eq!(call1(o, "ctz", v)?, expect_ctz, "ctz({v:#010x})");
+        assert_eq!(call1(o, "popcnt", v)?, expect_pop, "popcnt({v:#010x})");
+    }
+
+    // i32 globals — round-trip including negatives and boundary values.
+    assert_eq!(call0_r(o, "g_get")?, 42, "g initial");
+    assert_eq!(call0_r(o, "g_neg_get")?, -7, "g_neg initial");
+    for &v in &[0i32, 1, -1, 42, -42, i32::MIN, i32::MAX] {
+        call1_v(o, "g_set", v)?;
+        assert_eq!(call0_r(o, "g_get")?, v, "g round-trip({v})");
+    }
+    // g_inc combines global.get + add + global.set + global.get in one call.
+    call1_v(o, "g_set", 10)?;
+    assert_eq!(call1(o, "g_inc", 5)?, 15, "g_inc 10+5");
+    assert_eq!(call1(o, "g_inc", -20)?, -5, "g_inc 15-20");
+    assert_eq!(call0_r(o, "g_get")?, -5, "g after g_inc");
 
     // S1 — i32.const (mixed with add)
     assert_eq!(call1(o, "addconst", 50)?, 150, "i32.const + add");
@@ -296,10 +445,11 @@ fn ops_with_an() -> wasmtime::Result<()> {
 
 // Ops still produce identical results across several non-default values of
 // the AN constant `A`. Picks: 1 (degenerate identity encoding), 7 (small
-// odd), 1009 (small prime), 16777213 (largest 24-bit prime).
+// odd), 1009 (small prime), 8_388_607 (= 2^23 − 1, largest legal A under
+// the i32-LUT bound).
 #[test]
 fn ops_with_an_custom_constants() -> wasmtime::Result<()> {
-    for &a in &[1u64, 7, 1009, 16_777_213] {
+    for &a in &[1u64, 7, 1009, 8_388_607] {
         let mut o = make_ops_with(true, Some(a))?;
         ops_assertions(&mut o)
             .map_err(|e| wasmtime::Error::msg(format!("ops_assertions failed with A={a}: {e}")))?;

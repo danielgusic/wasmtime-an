@@ -28,8 +28,8 @@ property. Code checking is done by computing the modulus with A, which is zero f
 Fetzer, Schiffel, Süßkraut, *AN-Encoding Compiler*, 2009.
 
 `A` defaults to `wasmtime_environ::DEFAULT_AN_CONSTANT` (`65521`, a 16-bit
-prime recommended by the paper). The setter validates `1 ≤ A < 2³¹` (A=0 would
-be impossible to decode and cause further issues [don't even think about it!]; A ≥ 2³¹ would cause problems with the sign).
+prime recommended by the paper). The setter validates `1 ≤ A < 2²³` (A=0 would
+be impossible to decode and cause further issues [don't even think about it!]; A ≥ 2²³ would let LUT entries `A · 0xFF` overflow `i32`).
 Pick a large odd value (preferably prime), powers of two weaken detection.
 
 ---
@@ -39,27 +39,25 @@ Pick a large odd value (preferably prime), powers of two weaken detection.
 - **`crates/wasmtime/src/runtime/an_lut.rs`** *(new)*
   - Generator for AN-encoded bitwise-logical lookup tables,
 inspired by Fetzer et al. 2009
-  - Layout per op: 256×256 array of `i64`, indexed by `(c1 << 8) | c2` for
-`c1, c2 ∈ [0, 256)`. Entries store `A · (c1 OP c2)`, 512 KB per op.
-`A` validated `1 ≤ A < 2³¹`, matching the `Config::an_constant` rule.
-  - Tests included
+  - Layout per op: 256×256 array of `i32`, indexed by `(c1 << 8) | c2` for
+`c1, c2 ∈ [0, 256)`. Entries store `A · (c1 OP c2)`, 256 KiB per op
 - **`crates/wasmtime/src/engine.rs`**
   - added `an_luts: Option<crate::runtime::an_lut::AnLuts>` to `EngineInner`,
 populated in `Engine::new` when `tunables.an_encoding == true` via
 `runtime::an_lut::generate(A)`
-  - added accessor `Engine::an_lut_addr(op) -> Option<*const i64>` returning the address of
-the engine's per-A `Box<[i64; 65536]>`
+  - added accessor `Engine::an_lut_addr(op) -> Option<*const i32>` returning the address of
+the engine's per-A `Box<[i32; 65536]>`
 - **`crates/environ/src/vmoffsets.rs`**
   - VMContext layout extended with three fixed pointer slots after `type_ids`: `vmctx_an_and_table`, `vmctx_an_or_table`, `vmctx_an_xor_table`. `vmctx_dynamic_data_start` advanced past them
 - **`crates/wasmtime/src/runtime.rs`**
   - included `an_lut` module
 - **`crates/wasmtime/src/runtime/vm/instance.rs`**
-    - added `Instance::an_{and,or,xor}_table(self) -> &mut Option<VmPtr<i64>>`
+    - added `Instance::an_{and,or,xor}_table(self) -> &mut Option<VmPtr<i32>>`
   accessors, plus `set_an_lut_pointers` invoked from `set_store` to copy
   the engine's LUT addresses into the VMContext slots when AN-encoding is
   on (slots stay `None` otherwise)
 - **`crates/wasmtime/src/config.rs`** 
-  - added `Config::an_encoding(bool)` and `Config::an_constant(u64)` (latter validates `1 ≤ A < 2³¹`)
+  - added `Config::an_encoding(bool)` and `Config::an_constant(u64)` (latter validates `1 ≤ A < 2²³`)
 - **`crates/wasmtime/src/engine/serialization.rs`** 
   - added `an_encoding` + `an_constant` checks during cwasm compatibility validation
 - **`crates/cli-flags/src/lib.rs`** 
@@ -71,7 +69,7 @@ the engine's per-A `Box<[i64; 65536]>`
 - **`crates/cranelift/src/translate/func_translator.rs`** 
   - `declare_locals` widens i32 local IR type when AN on
 - **`crates/cranelift/src/translate/an_helpers.rs`**
-  - implemented several helper function for bitwise operations and multiplication
+  - implemented several helper function for bitwise operations, multiplication, and shifts (`emit_an_shl_i32`, `emit_an_shr_u_i32`)
 - **`crates/cranelift/src/translate/code_translator.rs`**
   - implemented several operations to use AN-encoding, see *Per-op behaviour* below
 - **`crates/cranelift/src/translate/translation_utils.rs`** 
@@ -132,15 +130,23 @@ needing per-use decode.
 | `i32.mul` | `(P_hi, P_lo) = (umulhi, imul)(A·n, A·m) → udiv_u128_by_u64_const(·, A) → umod_u128_by_u64_const(·, A·2³²)`. See *i32.mul* note below |
 | `i32.div_u` | `(arg1 udiv arg2) · A` (one A naturally cancels) |
 | `i32.rem_u` | unchanged: `A·n urem A·m = A·(n urem m)`  |
-| `i32.div_s`, `i32.rem_s` | not yet implemented |
+| `i32.div_s` | sign detected via `enc ≥ A·2³¹`, encoded absolute via `aw − enc` (with `aw = A·2³²`), `udiv` on absolutes (A cancels), re-encode `· A`, re-apply result sign (`s1 ⊕ s2`). Explicit `INT_MIN/-1 → INTEGER_OVERFLOW` trap on encoded operands before the abs step. `/0` trap via `translate_udiv` on `abs2` (`abs2 = 0` iff `arg2 = 0`). Zero-quotient negation special-cased to preserve canonical form. |
+| `i32.rem_s` | same sign-detect + abs trick, but uses `urem`, which preserves the `A` factor (`urem(A·\|n\|, A·\|m\|) = A·(\|n\| urem \|m\|)`), so no re-encode needed. Result takes the dividend's sign. `INT_MIN%-1` falls out as `urem(A·2³¹, A) = 0` (no trap, matches wasm). |
 | `i32.eqz` | `icmp_imm Equal arg 0` produces an i8 boolean, then `select(bool, A, 0)` to encode as `0`/`A` |
 | `i32.lt_u`, `le_u`, `gt_u`, `ge_u`, `eq`, `ne` | compare encoded operands directly (A preserves order + zero), then `select(bool, A, 0)` to encode the boolean result |
 | `i32.lt_s`, `le_s`, `gt_s`, `ge_s` | remap each operand to `c' = (c + A·2³¹) mod (A·2³²)`, then unsigned compare |
-| `i32.and`, `i32.or`, `i32.xor` | tabulated on functional 8-bit chunks via `emit_an_bitwise_i32` (like the paper). One `udiv` per operand decodes; four `(c1<<8)\|c2` indexes load `A·(c1 OP c2)` from a 256×256 `i64` table, then `acc += entry << (8·i)` recombines to `A·(n OP m)`. Tables live on the `Engine` (per-A, generated by `wasmtime-an-lut`), their address is loaded from a fixed `VMContext` slot at op-site (`load.i64 [vmctx + offset]`), so the same machine code is portable across processes. |
+| `i32.and`, `i32.or`, `i32.xor` | tabulated on functional 8-bit chunks via `emit_an_bitwise_i32` (like the paper). One `udiv` per operand decodes; four `(c1<<8)\|c2` indexes load `A·(c1 OP c2)` from a 256×256 `i32` table (zero-extended to `i64`), then `acc += entry << (8·i)` recombines to `A·(n OP m)`. Tables live on the `Engine` (per-A, generated by `crates/wasmtime/src/runtime/an_lut.rs`); their address is loaded from a fixed `VMContext` slot at op-site (`load.i64 [vmctx + offset]`), so the same machine code is portable across processes. |
 | `i32.not` | wasm has no native `i32.not`; written as `i32.const -1; i32.xor` and follows the `i32.xor` LUT path. |
+| `i32.shl` | decode count (`udiv enc_k, A`), mask `& 31`. Value stays encoded: helper `emit_an_shl_i32` computes `enc_v · 2^k`, then canonicalizes via the existing 128/64 `umod_u128_by_u64_const_to_i64` against `A·2³²`. |
+| `i32.shr_u` | decode count, mask `& 31`. `udiv(enc_v, A·2^k)` cancels `A` out of the dividend naturally, giving raw `v >> k`; re-encode with `· A`. Helper `emit_an_shr_u_i32`. |
+| `i32.shr_s` | reuse `emit_an_shr_u_i32` for the logical part, then `iadd` an encoded sign-extension mask if `enc_v ≥ A·2³¹` (negative). Mask is `A·((1<<k)−1)·2^(32−k) = aw − (aw >> k_mod)` -> two instr., unlike paper's `signExt[]` table. Addition is exact because the logical shift result has top `k` bits clear. |
+| `i32.rotl`, `i32.rotr` | `(v << k_mod) \| (v >> (32−k_mod))`,  bit ranges disjoint, so OR ≡ ADD on encoded sums. Implemented as `iadd(emit_an_shl_i32, emit_an_shr_u_i32)` with appropriate shift amounts. Both helpers support shift `[0, 32]`; at `k_mod = 0` the "complement" shift naturally returns 0 (shl(_, 32) ≡ 0 mod `aw`; shr_u(_, 32) ≡ 0 since `enc_v < aw`), so identity rotation falls out without special-case. |
+| `i32.clz`, `i32.ctz`, `i32.popcnt` | bit-level inspection — no way to avoid decoding. Decode once (`udiv enc, A`), `ireduce.i32`, native op, `uextend.i64`, re-encode by `· A`. Results live in `[0, 32]`, well within canonical band. |
 | `i32.load{,8_u,16_u}` | for memory32 (i32 indices): decode addr (÷A → trunc.i32) → wasm load (raw) → `uextend.i64` → ·A. For memory64 the popped i64 address is raw and passes through (not yet supported), the loaded value is still encoded if the result type is i32. |
 | `i32.store{,8,16}` | for memory32: decode addr, decode value (÷A → trunc.i32); wasm store raw. For memory64: address passes through raw (not yet supported), value still decoded since wasm-level type is i32. |
-| `local.{get,set,tee}`, `global.{get,set}` (i32) | type widened to I64 by the sig/locals widening |
+| `local.{get,set,tee}` (i32) | type widened to I64 by the sig/locals widening |
+| `global.get` (i32) | i32 globals stay raw `I32` in `VMGlobalDefinition` storage (matches the linear-memory deviation — host-side `Global::get`/`set` keep working). Encode on the way out: `uextend.i64 → · A`. Imports, defined globals, and constant-folded immutable globals all go through the same encode step. |
+| `global.set` (i32) | decode at storage boundary: `udiv A → ireduce.i32`, then raw `I32` store. Non-i32 globals pass through unchanged. |
 | `br_if` / `if` / `select` cond | unchanged |
 | host-import call (wasm → host) | decode i32 args, encode i32 returns at the `wasm_to_array` trampoline |
 | host → wasm entry call | encode i32 args, decode i32 returns at the `array_to_wasm` trampoline |
@@ -171,10 +177,12 @@ For this, several helper functions have been implemented.
 
 ### Future work
 
-Signed div/rem, shifts (paper's `power-of-two` table → mul/div), 64-bit
-wasm ops, floats, SIMD, multi-memory, GC types, in-memory AN encoding,
-codeword-validity checks (`mod A == 0` assertions at trampoline
-boundaries, opt-in via tunable).
+Cross-type conversions (`i32.wrap_i64`, `i64.extend_i32_s/u`,
+`i32.extend8_s/16_s`, `i32.trunc_f*_s/u`, `i32.reinterpret_f32`,
+`f*.convert_i32_s/u`, `f32.reinterpret_i32`), 64-bit wasm ops, floats,
+SIMD, multi-memory, GC types, in-memory AN encoding, codeword-validity
+checks (`mod A == 0` assertions at trampoline boundaries, opt-in via
+tunable).
 
 
 
@@ -189,8 +197,8 @@ group with AN off and on:
 |---|---|
 | `mul_{without_an,with_an}` | `i32.mul` end-to-end. Tests run on the native backend (default since the Pulley/Native split was dropped — both behave identically under the AN paths). |
 | `fib_{without_an,with_an}` | `an_encoding/fib.wat` end-to-end via WASI preview1 (`MemoryInputPipe` / `MemoryOutputPipe`) |
-| `ops_{without_an,with_an}` | one wat module exporting one function per touched operator: add, sub, mul, divu, remu, addconst, lt_u, ge_u, gt_u, eq, ne, eqz, lt_s/le_s/gt_s/ge_s  |
-| `ops_with_an_custom_constants` | re-runs the `ops_*` assertions with several non-default values of `A` (1, 7, 1009, 16 777 213) to verify the codegen reads `A` from `Tunables` rather than baking the default in |
+| `ops_{without_an,with_an}` | one wat module exporting one function per touched operator: add, sub, mul, divu, remu, divs, rems, addconst, lt_u, ge_u, gt_u, eq, ne, eqz, lt_s/le_s/gt_s/ge_s, and/or/xor/not/mask_merge, shl/shr_u/shr_s/rotl/rotr, clz/ctz/popcnt, max_u, loop_count, digits, memory load/store, mutable i32 global (g_get/g_set/g_inc) plus negative immutable initializer. Shifts/rotations cover 12 value patterns × 14 shift counts (including wraparound > 32). Includes trap assertions for `div_s` (`/0`, `INT_MIN/-1`) and `rem_s` (`/0`, `INT_MIN%-1 → 0`). |
+| `ops_with_an_custom_constants` | re-runs the `ops_*` assertions with several non-default values of `A` (1, 7, 1009, 8.388.607) to verify the codegen reads `A` from `Tunables` rather than baking the default in |
 
 Both AN modes are required to produce identical results.
 

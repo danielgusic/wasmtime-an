@@ -5,6 +5,11 @@
 (module
     (memory (export "memory") 1)
 
+    ;; mutable i32 global (exercises global.get / global.set under AN)
+    (global $g (mut i32) (i32.const 42))
+    ;; immutable i32 global with negative initializer (covers sign domain)
+    (global $g_neg i32 (i32.const -7))
+
     ;; arithmetic
     (func (export "add") (param i32 i32) (result i32)
         local.get 0 local.get 1 i32.add)
@@ -16,6 +21,19 @@
         local.get 0 local.get 1 i32.div_u)
     (func (export "remu") (param i32 i32) (result i32)
         local.get 0 local.get 1 i32.rem_u)
+    (func (export "divs") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.div_s)
+    (func (export "rems") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.rem_s)
+
+    ;; global accessors
+    (func (export "g_get") (result i32) global.get $g)
+    (func (export "g_set") (param i32) local.get 0 global.set $g)
+    (func (export "g_inc") (param i32) (result i32)
+        global.get $g local.get 0 i32.add
+        global.set $g
+        global.get $g)
+    (func (export "g_neg_get") (result i32) global.get $g_neg)
 
     ;; const-mixing (exercises i32.const encoding alongside add)
     (func (export "addconst") (param i32) (result i32)
@@ -56,6 +74,26 @@
     ;; bitwise NOT via xor with -1 (no native i32.not in wasm)
     (func (export "not") (param i32) (result i32)
         local.get 0 i32.const -1 i32.xor)
+
+    ;; shifts and rotations
+    (func (export "shl") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.shl)
+    (func (export "shr_u") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.shr_u)
+    (func (export "shr_s") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.shr_s)
+    (func (export "rotl") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.rotl)
+    (func (export "rotr") (param i32 i32) (result i32)
+        local.get 0 local.get 1 i32.rotr)
+
+    ;; bit-counting unary ops
+    (func (export "clz") (param i32) (result i32)
+        local.get 0 i32.clz)
+    (func (export "ctz") (param i32) (result i32)
+        local.get 0 i32.ctz)
+    (func (export "popcnt") (param i32) (result i32)
+        local.get 0 i32.popcnt)
 
     ;; combined bitwise expression: (a & 0x00ff_ff00) | (b & 0xff00_00ff)
     (func (export "mask_merge") (param i32 i32) (result i32)
