@@ -13,6 +13,39 @@ use wasmparser::Operator;
 /// constant, in codegen.
 pub const DEFAULT_AN_CONSTANT: u64 = 65521;
 
+/// Size multiplier between a wasm linear memory's raw byte length and its
+/// AN-encoded shadow.
+///
+/// # AN-encoded memory layout
+///
+/// When `Tunables.an_encoding` is true, every defined wasm linear memory gets
+/// a parallel "encoded shadow" allocation alongside the regular raw buffer.
+/// The raw buffer is bytewise-identical to a normal wasm memory (so host /
+/// WASI code can read and write it directly). The shadow encodes the same
+/// content in `A * u32` form at 4-byte granularity:
+///
+/// ```text
+///   raw[4i .. 4i+4]  <->  enc[8i .. 8i+8]
+///   enc_slot_i = A * u32_le(raw[4i .. 4i+4])
+/// ```
+///
+/// Each 4-byte raw slot becomes one 8-byte encoded slot, hence the factor 2.
+///
+/// Wasm code stores update both copies in lockstep. Wasm code loads pull from
+/// the shadow only (raw is a passive copy at that point). At host-call
+/// boundaries the wasm runtime cross-checks the two copies slot-by-slot; if
+/// any mismatch is found a fresh `AN_MEMORY_MISMATCH` trap is raised. After
+/// the host call returns the shadow is re-encoded from raw (since the host
+/// may have written raw directly).
+///
+/// `memory.size` continues to report raw page counts (wasm-visible size).
+/// `memory.grow` grows both. Bounds checks always apply to the raw size; the
+/// shadow address is derived as `raw_addr << 1` after the bounds check.
+///
+/// This applies only to AN-encoding's defined, non-shared, non-imported
+/// memories.
+pub const ENC_MEM_GROWTH_FACTOR: u64 = 2;
+
 macro_rules! define_tunables {
     (
         $(#[$outer_attr:meta])*
@@ -199,6 +232,46 @@ define_tunables! {
         /// Constraints (caller-enforced via the `Config` setter): must be
         /// ≥ 1 (A=0 would break everything)
         pub an_constant: u64,
+
+        /// AN-encoding opt-in: emit a per-load shadow-validity check.
+        ///
+        /// When `an_encoding` and this tunable are both `true`, every i32
+        /// load family op (`i32.load{,8_u,16_u,8_s,16_s}`) emits an extra
+        /// shadow read of every slot it touches and asserts
+        /// `slot % A == 0 && slot / A == u32_le(raw_slot)`. Any divergence
+        /// raises `Trap::AnMemoryMismatch` *at the load*, immediately,
+        /// rather than waiting for the next host-call cross-check.
+        ///
+        /// Cost: ~3 extra instructions (`udiv`, `iconst`, `icmp`, `trapnz`)
+        /// per touched slot per i32 load. Real-world programs are load-heavy,
+        /// so this can multiply the cost of memory accesses; gate it on a
+        /// per-deployment safety/perf tradeoff. Default `false`.
+        pub an_load_validity_check: bool,
+
+        /// AN-encoding test-only fault injection at trampoline boundaries.
+        ///
+        /// When non-zero AND `an_encoding` is on, the wasm/host trampolines
+        /// add this offset (as `u64`) to the first encoded i32 arg/result
+        /// crossing the boundary BEFORE the modulo-`A` codeword check. With
+        /// any offset in `(0, A)` the check is guaranteed to fail, raising
+        /// `Trap::AnCodewordInvalid`. Used by the AN integration tests to
+        /// exercise the trap-fires path; no production code path sets a
+        /// non-zero value. Default `0` (no injection).
+        pub an_inject_codeword_fault: u64,
+
+        /// AN-encoding test-only fault injection at cross-type conversion
+        /// op decode sites (`i64.extend_i32_s/u`, `f*.convert_i32_s/u`,
+        /// `f32.reinterpret_i32`).
+        ///
+        /// When non-zero AND `an_encoding` is on, each conversion op that
+        /// decodes an encoded i32 adds this offset (as `u64`) to the
+        /// operand BEFORE the modulo-`A` codeword check fires. With any
+        /// offset in `(0, A)` the check is guaranteed to trap with
+        /// `Trap::AnCodewordInvalid`. Used by the conversion integration
+        /// tests to exercise the trap-fires path at the conversion-op
+        /// boundary (distinct from the trampoline-side
+        /// `an_inject_codeword_fault`). Default `0` (no injection).
+        pub an_inject_conversion_fault: u64,
     }
 
     pub struct ConfigTunables {
@@ -285,6 +358,9 @@ impl Tunables {
             gc_heap_may_move: true,
             an_encoding: false,
             an_constant: DEFAULT_AN_CONSTANT,
+            an_load_validity_check: false,
+            an_inject_codeword_fault: 0,
+            an_inject_conversion_fault: 0,
         }
     }
 

@@ -933,6 +933,24 @@ pub async fn initialize_instance(
 
     initialize_memories(store, &mut context, &mut const_evaluator, &module)?;
 
+    // AN-encoding: every defined memory's encoded shadow is currently zeros
+    // (just allocated in `Instance::set_an_enc_shadows`). After raw memory
+    // initialization above the raw bytes hold their final initial content
+    // (data segments, CoW image, etc.), so encode the whole memory now so the
+    // shadow agrees with raw before any wasm code runs. Single pass per
+    // memory; handles both `MemoryInitialization::Static` (CoW skips the
+    // explicit `write` callback) and `Segmented` uniformly.
+    if store.engine().tunables().an_encoding {
+        let a = store.engine().tunables().an_constant;
+        let num_defined_memories = module.num_defined_memories();
+        for i in 0..num_defined_memories {
+            let def_idx = wasmtime_environ::DefinedMemoryIndex::new(i);
+            store
+                .instance_mut(context.instance)
+                .an_encode_full_memory_from_raw(def_idx, a);
+        }
+    }
+
     if is_bulk_memory {
         initialize_passive_elements(store, limiter, &mut context, &mut const_evaluator, &module)
             .await?;

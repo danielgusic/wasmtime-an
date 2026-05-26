@@ -2,7 +2,9 @@
 
 use crate::func_environ::BuiltinFunctions;
 use crate::trap::TranslateTrap;
-use crate::{TRAP_CANNOT_LEAVE_COMPONENT, TRAP_INTERNAL_ASSERT, compiler::Compiler};
+use crate::{
+    BuiltinFunctionSignatures, TRAP_CANNOT_LEAVE_COMPONENT, TRAP_INTERNAL_ASSERT, compiler::Compiler,
+};
 use cranelift_codegen::cursor::FuncCursor;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{self, InstBuilder, MemFlags, Value};
@@ -922,7 +924,52 @@ impl<'a> TrampolineCompiler<'a> {
         // `VMComponentContext` will be the first.
         let params = self.abi_load_params();
         let vmctx = params[0];
-        let wasm_params = &params[2..];
+
+        // AN-encoding boundary (wasm → host, component path): each wasm `i32`
+        // param arrives widened to `I64` holding `A*v`. The host (whether
+        // a canon-lowered import or a wasmtime libcall) expects raw `i32`.
+        // For each i32 param: assert the codeword is valid
+        // (`val % A == 0`) and then decode via `udiv` + `ireduce`. Mirrors
+        // the core-wasm `compile_wasm_to_array_trampoline` decode hook.
+        //
+        // Test-only fault injection (`an_inject_codeword_fault`) bumps the
+        // first encoded i32 wasm param by the configured offset right
+        // before the check fires. Gated on `HostCallee::Lowering` so the
+        // component-runtime libcalls (resource bookkeeping, async task
+        // plumbing, etc.) don't false-trap during normal component flow.
+        let mut wasm_params_owned: Vec<ir::Value> = params[2..].to_vec();
+        if self.compiler.tunables().an_encoding {
+            let a = self.compiler.tunables().an_constant;
+            let an_const = self
+                .builder
+                .ins()
+                .iconst(ir::types::I64, a as i64);
+            let inject_fault = matches!(host_callee, HostCallee::Lowering(_))
+                && self.compiler.tunables().an_inject_codeword_fault != 0;
+            let fault_offset = self.compiler.tunables().an_inject_codeword_fault;
+            let mut first_i32_corrupted = false;
+            for (i, ty) in self.signature.params().iter().enumerate() {
+                if matches!(ty, WasmValType::I32) {
+                    if inject_fault && !first_i32_corrupted {
+                        wasm_params_owned[i] = self
+                            .builder
+                            .ins()
+                            .iadd_imm(wasm_params_owned[i], fault_offset as i64);
+                        first_i32_corrupted = true;
+                    }
+                    crate::translate::emit_an_codeword_validity_check(
+                        &mut self.builder,
+                        a,
+                        wasm_params_owned[i],
+                    );
+                    let decoded =
+                        self.builder.ins().udiv(wasm_params_owned[i], an_const);
+                    wasm_params_owned[i] =
+                        self.builder.ins().ireduce(ir::types::I32, decoded);
+                }
+            }
+        }
+        let wasm_params: &[ir::Value] = &wasm_params_owned;
 
         // Start building up arguments to the host. The first is always the
         // vmctx. After is whatever `extra_host_args` appends, and then finally
@@ -960,6 +1007,44 @@ impl<'a> TrampolineCompiler<'a> {
             }
         }
 
+        // AN-encoding host-boundary cross-check (component path).
+        //
+        // When wasm-in-a-component calls a host import the dispatch flows
+        // through this hostcall trampoline rather than the core
+        // `compile_wasm_to_array_trampoline` path. Without an explicit hook
+        // here the existing AN cross-check / resync libcalls (which are
+        // wired into the core path) would never fire for components, and
+        // a wasm-side store followed by a host import could let raw/shadow
+        // diverge undetected.
+        //
+        // Only the `HostCallee::Lowering` arm corresponds to a wasm→host
+        // boundary at user-defined imports; the other `HostCallee::Libcall`
+        // arms are component-runtime helpers (resource bookkeeping, async
+        // task plumbing, transcoders, …) which don't escape to embedder-
+        // supplied host code and so do not need the cross-check.
+        //
+        // The libcalls take a *core wasm* `VMContext`. `caller_vmctx`
+        // (`params[1]`) is exactly that — the core module instance that
+        // emitted the call.
+        let an_lowering = matches!(host_callee, HostCallee::Lowering(_))
+            && self.compiler.tunables().an_encoding;
+        if an_lowering {
+            let caller_vmctx = self.caller_vmctx();
+            let sigs = BuiltinFunctionSignatures::new(self.compiler);
+            let check_idx = BuiltinFunctionIndex::an_check_host_boundary();
+            let check_sig = sigs.host_signature(check_idx);
+            let check_call = self.compiler.call_builtin(
+                &mut self.builder,
+                caller_vmctx,
+                &[caller_vmctx],
+                check_idx,
+                check_sig,
+            );
+            let check_ok = self.builder.func.dfg.inst_results(check_call)[0];
+            self.compiler
+                .raise_if_host_trapped(&mut self.builder, caller_vmctx, check_ok);
+        }
+
         // Next perform the actual invocation of the host with `host_args`.
         let call = match host_callee {
             HostCallee::Libcall(get_libcall) => self.call_libcall(vmctx, get_libcall, &host_args),
@@ -993,14 +1078,16 @@ impl<'a> TrampolineCompiler<'a> {
         };
 
         // Acquire the result of this function (if any) and interpret it
-        // according to `host_result`.
-        //
-        // Note that all match arms here end with `abi_store_results` which
-        // accounts for the ABI of this function when storing results.
+        // according to `host_result`. Each branch computes the values it
+        // will hand to `abi_store_results`. The AN-encoding resync (when
+        // applicable) is emitted *between* result computation and
+        // `abi_store_results` so we never try to append instructions to a
+        // block that's already been filled by `return_` inside
+        // `abi_store_results`.
         let result = self.builder.func.dfg.inst_results(call).get(0).copied();
         let result_ty = result.map(|v| self.builder.func.dfg.value_type(v));
         let expected = self.signature.results();
-        match host_result.into() {
+        let mut to_store: Vec<ir::Value> = match host_result.into() {
             HostResult::Sentinel(TrapSentinel::NegativeOne) => {
                 assert_eq!(expected.len(), 1);
                 let (result, result_ty) = (result.unwrap(), result_ty.unwrap());
@@ -1013,12 +1100,12 @@ impl<'a> TrampolineCompiler<'a> {
                     }
                     other => panic!("unsupported NegativeOne combo {other:?}"),
                 };
-                self.abi_store_results(&[result]);
+                vec![result]
             }
             HostResult::Sentinel(TrapSentinel::Falsy) => {
                 assert_eq!(expected.len(), 0);
                 self.raise_if_host_trapped(result.unwrap());
-                self.abi_store_results(&[]);
+                vec![]
             }
             HostResult::Sentinel(_) => todo!("support additional return types if/when necessary"),
 
@@ -1026,15 +1113,60 @@ impl<'a> TrampolineCompiler<'a> {
                 let ptr = ptr.or(val_raw_ptr).unwrap();
                 let len = len.or(val_raw_len).unwrap();
                 self.raise_if_host_trapped(result.unwrap());
-                let results = self.compiler.load_values_from_array(
+                self.compiler.load_values_from_array(
                     self.signature.results(),
                     &mut self.builder,
                     ptr,
                     len,
-                );
-                self.abi_store_results(&results);
+                )
+            }
+        };
+
+        // AN-encoding boundary (host → wasm, component path): each `i32`
+        // result from the host (raw `I32`) needs to be re-encoded as
+        // widened `I64` holding `A*v` before being returned to the wasm
+        // caller (whose signature is widened by `wasm_call_signature`
+        // under AN). Mirrors the core-wasm `compile_wasm_to_array_trampoline`
+        // result-encode hook.
+        if self.compiler.tunables().an_encoding {
+            let a = self.compiler.tunables().an_constant;
+            let an_const = self.builder.ins().iconst(ir::types::I64, a as i64);
+            for (i, ty) in expected.iter().enumerate() {
+                if matches!(ty, WasmValType::I32) {
+                    let widened = self.builder.ins().uextend(ir::types::I64, to_store[i]);
+                    to_store[i] = self.builder.ins().imul(widened, an_const);
+                }
             }
         }
+
+        // AN-encoding host-boundary resync (component path). After
+        // the host returns, re-encode raw bytes into the shadow so any
+        // direct host writes (the embedder reaching into a core memory via
+        // `Memory::data_mut`, WASI surfaces wired into component imports,
+        // etc.) are reflected before wasm resumes.
+        //
+        // Emitted symmetrically with the cross-check above; same gating on
+        // `HostCallee::Lowering` and the AN tunable. MUST run before
+        // `abi_store_results` because that helper emits the terminating
+        // `return_`, after which no further instructions can be added.
+        if an_lowering {
+            let caller_vmctx = self.caller_vmctx();
+            let sigs = BuiltinFunctionSignatures::new(self.compiler);
+            let resync_idx = BuiltinFunctionIndex::an_resync_host_boundary();
+            let resync_sig = sigs.host_signature(resync_idx);
+            let resync_call = self.compiler.call_builtin(
+                &mut self.builder,
+                caller_vmctx,
+                &[caller_vmctx],
+                resync_idx,
+                resync_sig,
+            );
+            let resync_ok = self.builder.func.dfg.inst_results(resync_call)[0];
+            self.compiler
+                .raise_if_host_trapped(&mut self.builder, caller_vmctx, resync_ok);
+        }
+
+        self.abi_store_results(&to_store);
     }
 
     fn index_value(&mut self, index: impl EntityRef) -> ir::Value {

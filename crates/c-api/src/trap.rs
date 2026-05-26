@@ -54,6 +54,8 @@ const _: () = {
     assert!(Trap::ConcurrentFutureStreamOp as u8 == 45);
     assert!(Trap::ReferenceCountOverflow as u8 == 46);
     assert!(Trap::StreamOpTooBig as u8 == 47);
+    assert!(Trap::AnMemoryMismatch as u8 == 48);
+    assert!(Trap::AnCodewordInvalid as u8 == 49);
 };
 
 #[repr(C)]

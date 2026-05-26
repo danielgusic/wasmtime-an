@@ -117,6 +117,19 @@ pub struct Instance {
     /// memory.
     memories: TryPrimaryMap<DefinedMemoryIndex, (MemoryAllocationIndex, Memory)>,
 
+    /// AN-encoding shadow buffers, parallel to [`Self::memories`].
+    ///
+    /// Each entry is either `None` (no shadow allocated for this memory; this
+    /// is the case when AN-encoding is disabled, when the memory is shared,
+    /// or before [`Self::set_an_enc_shadows`] has run) or a `Box<[u8]>` of
+    /// size `ENC_MEM_GROWTH_FACTOR * raw_byte_size`. JIT code reads the base
+    /// pointer of each shadow from the corresponding `VMContext` slot at
+    /// `VMOffsets::vmctx_an_enc_memory_base(idx)`; this map is the Rust-side
+    /// owner that keeps those buffers alive for the lifetime of the
+    /// instance. See `wasmtime_environ::ENC_MEM_GROWTH_FACTOR` for the layout
+    /// invariant.
+    an_enc_shadows: TryPrimaryMap<DefinedMemoryIndex, Option<Box<[u8]>>>,
+
     /// WebAssembly table data.
     ///
     /// Like memories, this is only for defined tables in the module and
@@ -176,6 +189,15 @@ impl Instance {
         let memory_tys = &module.memories;
         let passive_elements = TryVec::with_capacity(module.passive_elements.len())?;
         let dropped_data = TryEntitySet::with_capacity(module.passive_data_map.len())?;
+        // Pre-size the AN-encoding shadow map with `None` entries so that
+        // `Self::set_an_enc_shadows` (called later from `set_store`) can index
+        // by `DefinedMemoryIndex` and replace the entries in place. When
+        // AN-encoding is disabled on the engine, the entries stay `None` and
+        // no shadow is allocated.
+        let mut an_enc_shadows = TryPrimaryMap::with_capacity(module.num_defined_memories())?;
+        for _ in 0..module.num_defined_memories() {
+            an_enc_shadows.push(None)?;
+        }
 
         #[cfg(feature = "wmemcheck")]
         let wmemcheck_state = if req.store.engine().config().wmemcheck {
@@ -197,6 +219,7 @@ impl Instance {
             id: req.id,
             runtime_info: req.runtime_info.clone(),
             memories,
+            an_enc_shadows,
             tables,
             passive_elements,
             dropped_data,
@@ -562,6 +585,20 @@ impl Instance {
         unsafe { self.vmctx_plus_offset_mut(offset) }
     }
 
+    /// Raw `(base, len)` of the AN-encoding shadow buffer for one defined
+    /// memory. Returns `None` when no shadow is allocated (AN off, shared,
+    /// or imported). The returned pointer is valid until the next
+    /// `an_grow_shadow` call on this memory or instance drop. Test-only:
+    /// embedders should not depend on the shadow layout.
+    pub fn an_shadow_raw_parts_for_test(
+        &self,
+        memory_index: DefinedMemoryIndex,
+    ) -> Option<(*mut u8, usize)> {
+        let shadow = self.an_enc_shadows[memory_index].as_deref()?;
+        let len = shadow.len();
+        Some((shadow.as_ptr() as *mut u8, len))
+    }
+
     pub(crate) unsafe fn set_store(mut self: Pin<&mut Self>, store: &StoreOpaque) {
         // FIXME: should be more targeted ideally with the `unsafe` than just
         // throwing this entire function in a large `unsafe` block.
@@ -582,6 +619,7 @@ impl Instance {
             }
 
             self.as_mut().set_an_lut_pointers(store);
+            self.as_mut().set_an_enc_shadows(store);
         }
     }
 
@@ -599,6 +637,330 @@ impl Instance {
         *self.as_mut().an_and_table() = to_vmptr(AnLutBinOp::And);
         *self.as_mut().an_or_table() = to_vmptr(AnLutBinOp::Or);
         *self.as_mut().an_xor_table() = to_vmptr(AnLutBinOp::Xor);
+    }
+
+    /// Re-encode a *byte range* of one defined memory's raw buffer into its
+    /// AN-encoding shadow. Every 4-byte slot that is partially or fully
+    /// contained in `[start, start + len)` is rebuilt as
+    /// `A * u32_le(raw[4i..4i+4])` from current raw bytes.
+    ///
+    /// Used by the bulk-memory libcalls (`memory.copy`, `memory.fill`,
+    /// `memory.init`): after the raw-side `ptr::copy` / `ptr::write_bytes`,
+    /// this brings every touched shadow slot back into sync so the
+    /// invariant `decode(enc_slot) == u32_le(raw_slot)` holds before wasm
+    /// resumes.
+    ///
+    /// No-op if `len == 0`, if the memory has no shadow allocated (AN off,
+    /// shared, or imported), or if `start >= raw_len`.
+    pub(crate) fn an_encode_range_from_raw(
+        mut self: Pin<&mut Self>,
+        memory_index: DefinedMemoryIndex,
+        start: usize,
+        len: usize,
+        a: u64,
+    ) {
+        if len == 0 {
+            return;
+        }
+        let mem_def = self.memories[memory_index].1.vmmemory();
+        let raw_base: *const u8 = mem_def.base.as_ptr();
+        let raw_len = mem_def.current_length();
+        if start >= raw_len {
+            return;
+        }
+        let end = start.saturating_add(len).min(raw_len);
+
+        let shadow = match self.as_mut().an_enc_shadows_mut()[memory_index].as_deref_mut() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let first_slot = start / 4;
+        let last_slot_exclusive = (end + 3) / 4;
+
+        for slot in first_slot..last_slot_exclusive {
+            let raw_off = slot * 4;
+            let mut bytes = [0u8; 4];
+            // Copy whatever raw bytes are in-bounds for this slot. The tail
+            // bytes are zero-padded; this matches the layout invariant
+            // because `raw_len` is normally a multiple of 4 (wasm pages are
+            // 64 KiB) and the only way the loop reaches a partial-tail
+            // slot is on a custom page-size memory64.
+            let to_copy = core::cmp::min(4, raw_len - raw_off);
+            // SAFETY: `raw_off + to_copy <= raw_len`. `raw_base` is valid
+            // for `raw_len` bytes.
+            unsafe {
+                ptr::copy_nonoverlapping(raw_base.add(raw_off), bytes.as_mut_ptr(), to_copy);
+            }
+            let encoded = a.wrapping_mul(u64::from(u32::from_le_bytes(bytes)));
+            let enc_off = slot * 8;
+            shadow[enc_off..enc_off + 8].copy_from_slice(&encoded.to_le_bytes());
+        }
+    }
+
+    /// Re-allocate the AN-encoding shadow for a defined memory whose raw
+    /// buffer has grown via `memory.grow`. Allocates a fresh
+    /// `2 * new_raw_size` `Box<[u8]>`, swaps it in, updates the
+    /// `vmctx_an_enc_memory_base` slot, and re-encodes the whole memory
+    /// from raw.
+    ///
+    /// No-op when the memory has no shadow allocated (AN off, shared, or
+    /// imported).
+    pub(crate) fn an_grow_shadow(
+        mut self: Pin<&mut Self>,
+        memory_index: DefinedMemoryIndex,
+        a: u64,
+    ) {
+        if self.an_enc_shadows[memory_index].is_none() {
+            return;
+        }
+        let raw_len = self.memories[memory_index].1.byte_size();
+        let new_size = raw_len
+            .checked_mul(usize::try_from(wasmtime_environ::ENC_MEM_GROWTH_FACTOR).unwrap())
+            .expect("AN shadow size overflowed usize on memory.grow");
+        let new_shadow: Box<[u8]> = vec![0u8; new_size].into_boxed_slice();
+        let base_ptr = NonNull::new(new_shadow.as_ptr() as *mut u8)
+            .expect("AN shadow grow allocation produced a null pointer");
+        self.as_mut().an_enc_shadows_mut()[memory_index] = Some(new_shadow);
+
+        // Update the `VMContext` slot so JIT-emitted stores see the new
+        // base pointer.
+        let offsets = *self.runtime_info.offsets();
+        // SAFETY: slot is sized + addressable via `vmctx_an_enc_memory_base`,
+        // and `NonNull::write` initializes without reading the prior value
+        // (defensive — the slot already holds a valid value here).
+        unsafe {
+            let slot: NonNull<Option<VmPtr<u8>>> = self
+                .as_mut()
+                .vmctx_plus_offset_raw(offsets.vmctx_an_enc_memory_base(memory_index));
+            slot.write(Some(VmPtr::from(base_ptr)));
+        }
+
+        // Re-encode the whole memory from raw. The newly grown pages on the
+        // raw side are zero, and `A * 0 == 0`, so the corresponding shadow
+        // slots are already zero from the fresh allocation; this call only
+        // matters because the *pre-existing* shadow contents lived in the
+        // now-freed buffer.
+        self.as_mut().an_encode_full_memory_from_raw(memory_index, a);
+    }
+
+    /// AN-encoding cross-check for a single defined memory.
+    ///
+    /// Walks the memory slot-by-slot, decoding each 8-byte shadow slot by
+    /// `decoded = shadow_u64 / A` and comparing against
+    /// `u32_le(raw[4i..4i+4])`. Returns `false` on the first mismatch,
+    /// `true` if every slot agrees (including any tail bytes shorter than a
+    /// full slot, which are zero-padded on the raw side before comparison).
+    ///
+    /// Skips the check (returning `true`) if the memory has no shadow
+    /// allocated — that happens when AN-encoding is off or the memory is
+    /// shared/imported, both of which the surrounding plumbing guarantees
+    /// before invoking this method.
+    ///
+    /// Used by the `an_check_host_boundary` libcall, which is emitted by
+    /// the wasm-to-host trampoline immediately before a host call. Any
+    /// returned `false` becomes a `Trap::AnMemoryMismatch` at the
+    /// trampoline.
+    pub(crate) fn an_cross_check_memory(&self, memory_index: DefinedMemoryIndex, a: u64) -> bool {
+        // `a == 0` is rejected by the config setter; the surrounding plumbing
+        // guarantees a non-zero `a` here.
+        debug_assert!(a != 0, "AN constant A=0 reached an_cross_check_memory");
+
+        let mem_def = self.memories[memory_index].1.vmmemory();
+        let raw_base: *const u8 = mem_def.base.as_ptr();
+        let raw_len = mem_def.current_length();
+
+        let shadow = match self.an_enc_shadows[memory_index].as_deref() {
+            Some(s) => s,
+            None => return true,
+        };
+        debug_assert_eq!(
+            shadow.len(),
+            raw_len * usize::try_from(wasmtime_environ::ENC_MEM_GROWTH_FACTOR).unwrap(),
+            "AN-encoding shadow has wrong size during cross-check"
+        );
+
+        let num_full_slots = raw_len / 4;
+        for slot in 0..num_full_slots {
+            let raw_off = slot * 4;
+            // SAFETY: `raw_off + 4 <= raw_len`, and `raw_base` points to a
+            // valid `raw_len`-byte allocation for the duration of this call
+            // (we hold `&self`).
+            let raw_u32 = unsafe {
+                let mut bytes = [0u8; 4];
+                ptr::copy_nonoverlapping(raw_base.add(raw_off), bytes.as_mut_ptr(), 4);
+                u32::from_le_bytes(bytes)
+            };
+            let enc_off = slot * 8;
+            let enc_slot = u64::from_le_bytes(
+                shadow[enc_off..enc_off + 8]
+                    .try_into()
+                    .expect("8 bytes from shadow"),
+            );
+            // Both bands of the encoded form are strictly multiples of A;
+            // any other slot value is a corruption signature.
+            if enc_slot % a != 0 || enc_slot / a != u64::from(raw_u32) {
+                return false;
+            }
+        }
+
+        let tail = raw_len % 4;
+        if tail != 0 {
+            let slot = num_full_slots;
+            let raw_off = slot * 4;
+            let mut bytes = [0u8; 4];
+            // SAFETY: copy `tail < 4` bytes starting at `raw_off`; range
+            // ends at `raw_off + tail = raw_len`.
+            unsafe {
+                ptr::copy_nonoverlapping(raw_base.add(raw_off), bytes.as_mut_ptr(), tail);
+            }
+            let raw_u32 = u32::from_le_bytes(bytes);
+            let enc_off = slot * 8;
+            let enc_slot = u64::from_le_bytes(
+                shadow[enc_off..enc_off + 8]
+                    .try_into()
+                    .expect("8 bytes from shadow"),
+            );
+            if enc_slot % a != 0 || enc_slot / a != u64::from(raw_u32) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Re-encode every 4-byte slot of one defined memory's raw buffer into
+    /// its AN-encoding shadow. For each slot `i`, writes
+    /// `A * u32_le(raw[4i..4i+4])` as a little-endian `u64` into
+    /// `shadow[8i..8i+8]`.
+    ///
+    /// Tail bytes that don't fill a 4-byte raw slot are padded with zeros
+    /// before encoding (this matters for memory64 modules using a custom
+    /// page size; default 64 KiB pages are always a multiple of 4).
+    ///
+    /// No-op when AN-encoding is off (the shadow slot is `None`). Idempotent.
+    ///
+    /// Used at the end of initial memory initialization and at host-call exit
+    /// to make the shadow reflect the current raw bytes after a host might
+    /// have written through `Memory::data_mut`.
+    pub(crate) fn an_encode_full_memory_from_raw(
+        mut self: Pin<&mut Self>,
+        memory_index: DefinedMemoryIndex,
+        a: u64,
+    ) {
+        // Snapshot the raw base + length. We hold a pin-projected `&mut self`
+        // but only need the raw bytes immutably for the read side.
+        let mem_def = self.memories[memory_index].1.vmmemory();
+        let raw_base: *const u8 = mem_def.base.as_ptr();
+        let raw_len = mem_def.current_length();
+
+        let shadow = match self.as_mut().an_enc_shadows_mut()[memory_index].as_deref_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        let expected_shadow_len = raw_len
+            .checked_mul(usize::try_from(wasmtime_environ::ENC_MEM_GROWTH_FACTOR).unwrap())
+            .expect("shadow size overflow");
+        debug_assert_eq!(
+            shadow.len(),
+            expected_shadow_len,
+            "AN-encoding shadow has wrong size for memory {:?}: raw={} shadow={}",
+            memory_index,
+            raw_len,
+            shadow.len()
+        );
+
+        let num_full_slots = raw_len / 4;
+        for slot in 0..num_full_slots {
+            let raw_off = slot * 4;
+            // SAFETY: `raw_off + 4 <= num_full_slots * 4 <= raw_len`, and
+            // `raw_base` points to `raw_len` valid bytes for the duration of
+            // this method (we hold `&mut self`, which transitively keeps the
+            // backing allocation alive).
+            let raw_u32 = unsafe {
+                let mut bytes = [0u8; 4];
+                ptr::copy_nonoverlapping(raw_base.add(raw_off), bytes.as_mut_ptr(), 4);
+                u32::from_le_bytes(bytes)
+            };
+            let encoded = a.wrapping_mul(raw_u32 as u64);
+            let enc_off = slot * 8;
+            shadow[enc_off..enc_off + 8].copy_from_slice(&encoded.to_le_bytes());
+        }
+
+        let tail = raw_len % 4;
+        if tail != 0 {
+            let slot = num_full_slots;
+            let raw_off = slot * 4;
+            let mut bytes = [0u8; 4];
+            // SAFETY: copy at most `tail < 4` bytes starting at `raw_off`,
+            // and `raw_off + tail = raw_len` (within the raw allocation).
+            unsafe {
+                ptr::copy_nonoverlapping(raw_base.add(raw_off), bytes.as_mut_ptr(), tail);
+            }
+            let encoded = a.wrapping_mul(u32::from_le_bytes(bytes) as u64);
+            let enc_off = slot * 8;
+            shadow[enc_off..enc_off + 8].copy_from_slice(&encoded.to_le_bytes());
+        }
+    }
+
+    /// Allocate the AN-encoding shadow buffers for each defined memory and
+    /// write the base pointers into the matching `VMContext` slots.
+    ///
+    /// Each shadow is sized at `ENC_MEM_GROWTH_FACTOR * raw_byte_size` and
+    /// owns its storage as a `Box<[u8]>` held in `self.an_enc_shadows`. The
+    /// raw pointer to that storage is mirrored into
+    /// `vmctx_an_enc_memory_base(idx)` so JIT-emitted load/store paths can
+    /// read it via a single `load.i64` from the vmctx.
+    ///
+    /// Skips allocation for shared memories (they cannot be cross-checked
+    /// against a private shadow without a per-slot lock; refused at compile
+    /// time in v1) and is a no-op when AN-encoding is disabled.
+    fn set_an_enc_shadows(mut self: Pin<&mut Self>, store: &StoreOpaque) {
+        if !store.engine().tunables().an_encoding {
+            return;
+        }
+        let module = self.runtime_info.env_module().clone();
+        let offsets = *self.runtime_info.offsets();
+        let num_defined_memories = module.num_defined_memories();
+        for i in 0..num_defined_memories {
+            let defined_memory_index = DefinedMemoryIndex::new(i);
+            let memory_index = module.memory_index(defined_memory_index);
+            if module.memories[memory_index].shared {
+                // Shared memories are refused at compile time when AN-encoding
+                // is enabled. Defensive bail-out so this code stays correct if
+                // the refusal is ever relaxed without first adding atomic-safe
+                // shadow support.
+                continue;
+            }
+            let raw_byte_size = self.memories[defined_memory_index].1.byte_size();
+            let shadow_bytes = raw_byte_size
+                .checked_mul(usize::try_from(wasmtime_environ::ENC_MEM_GROWTH_FACTOR).unwrap())
+                .expect("shadow size overflowed usize");
+            // Allocate zero-filled. Zero decodes to zero under the AN encoding
+            // (`A * 0 == 0`), so a freshly created memory's shadow is already
+            // consistent with the raw side without any extra work.
+            let shadow: Box<[u8]> = vec![0u8; shadow_bytes].into_boxed_slice();
+            let base_ptr = NonNull::new(shadow.as_ptr() as *mut u8)
+                .expect("shadow allocation produced a null pointer");
+            self.as_mut().an_enc_shadows_mut()[defined_memory_index] = Some(shadow);
+            // SAFETY: the slot lives in this instance's `VMContext`, sized by
+            // `VMOffsets::defined_memories_enc_bases`. We must use a raw
+            // `NonNull::write` here (not `&mut *slot = ...`) because
+            // `set_an_enc_shadows` runs from inside `set_store`, which is
+            // itself called by `initialize_vmctx` *before* the explicit
+            // `defined_memories_enc_bases` zero-fill loop further down in
+            // `initialize_vmctx`. Forming a `&mut Option<VmPtr<u8>>` to
+            // uninitialized memory would be UB; `NonNull::write` instead
+            // initializes the slot without reading the prior value. The
+            // pointer remains valid for as long as `self.an_enc_shadows`
+            // owns the `Box`, which is for the rest of the instance's
+            // lifetime.
+            unsafe {
+                let slot: NonNull<Option<VmPtr<u8>>> = self
+                    .as_mut()
+                    .vmctx_plus_offset_raw(offsets.vmctx_an_enc_memory_base(defined_memory_index));
+                slot.write(Some(VmPtr::from(base_ptr)));
+            }
+        }
     }
 
     unsafe fn set_gc_heap(self: Pin<&mut Self>, gc_store: Option<&GcStore>) {
@@ -1488,6 +1850,14 @@ impl Instance {
             }
         }
 
+        // AN-encoding shadow base pointer slots are populated by
+        // `Instance::set_an_enc_shadows` (invoked from `set_store` higher up
+        // in this function). When AN-encoding is off the slots stay
+        // uninitialized and JIT code never reads them, so no explicit
+        // zero-fill is required here. See `set_an_enc_shadows` for the
+        // (deliberately raw-pointer) write that initializes each slot
+        // without first forming a reference to uninitialized memory.
+
         // Zero-initialize the globals so that nothing is uninitialized memory
         // after this function returns. The globals are actually initialized
         // with their const expression initializers after the instance is fully
@@ -1631,6 +2001,13 @@ impl Instance {
     ) -> &mut TryPrimaryMap<DefinedMemoryIndex, (MemoryAllocationIndex, Memory)> {
         // SAFETY: see `store_mut` above.
         unsafe { &mut self.get_unchecked_mut().memories }
+    }
+
+    fn an_enc_shadows_mut(
+        self: Pin<&mut Self>,
+    ) -> &mut TryPrimaryMap<DefinedMemoryIndex, Option<Box<[u8]>>> {
+        // SAFETY: see `store_mut` above.
+        unsafe { &mut self.get_unchecked_mut().an_enc_shadows }
     }
 
     pub(crate) fn tables_mut(

@@ -73,6 +73,10 @@ pub const TRAP_CONTINUATION_ALREADY_CONSUMED: TrapCode =
     TrapCode::unwrap_user(Trap::ContinuationAlreadyConsumed as u8 + TRAP_OFFSET);
 pub const TRAP_CAST_FAILURE: TrapCode =
     TrapCode::unwrap_user(Trap::CastFailure as u8 + TRAP_OFFSET);
+pub const TRAP_AN_MEMORY_MISMATCH: TrapCode =
+    TrapCode::unwrap_user(Trap::AnMemoryMismatch as u8 + TRAP_OFFSET);
+pub const TRAP_AN_CODEWORD_INVALID: TrapCode =
+    TrapCode::unwrap_user(Trap::AnCodewordInvalid as u8 + TRAP_OFFSET);
 
 /// Creates a new cranelift `Signature` with no wasm params/results for the
 /// given calling convention.

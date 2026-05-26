@@ -23,6 +23,12 @@
 //      imported_memories: [VMMemoryImport; module.num_imported_memories],
 //      memories: [*mut VMMemoryDefinition; module.num_defined_memories],
 //      owned_memories: [VMMemoryDefinition; module.num_owned_memories],
+//      // Parallel to `memories`. Holds the base pointer of each defined
+//      // memory's AN-encoding shadow buffer (`A·u32_le(raw[4i..4i+4])` per
+//      // 8-byte slot). Always allocated; entries are null unless
+//      // `tunables.an_encoding` is true and the memory is non-shared and
+//      // defined (not imported). See `wasmtime_environ::ENC_MEM_GROWTH_FACTOR`.
+//      defined_memories_enc_bases: [VmPtr<u8>; module.num_defined_memories],
 //      imported_functions: [VMFunctionImport; module.num_imported_functions],
 //      imported_tables: [VMTableImport; module.num_imported_tables],
 //      imported_globals: [VMGlobalImport; module.num_imported_globals],
@@ -97,6 +103,11 @@ pub struct VMOffsets<P> {
     defined_tables: u32,
     defined_memories: u32,
     owned_memories: u32,
+    /// Offset of the AN-encoding `enc_base` pointer array, parallel to
+    /// `defined_memories`. Always present (size = `num_defined_memories *
+    /// pointer_size`); entries are null unless AN-encoding is on. See the
+    /// VMContext layout comment at the top of this file.
+    defined_memories_enc_bases: u32,
     defined_globals: u32,
     defined_tags: u32,
     defined_func_refs: u32,
@@ -659,6 +670,7 @@ impl<P: PtrSize> VMOffsets<P> {
             imported_globals: "imported globals",
             imported_tables: "imported tables",
             imported_functions: "imported functions",
+            defined_memories_enc_bases: "AN-encoding shadow bases",
             owned_memories: "owned memories",
             defined_memories: "defined memories",
             imported_memories: "imported memories",
@@ -689,6 +701,7 @@ impl<P: PtrSize> From<VMOffsetsFields<P>> for VMOffsets<P> {
             defined_tables: 0,
             defined_memories: 0,
             owned_memories: 0,
+            defined_memories_enc_bases: 0,
             defined_globals: 0,
             defined_tags: 0,
             defined_func_refs: 0,
@@ -731,6 +744,11 @@ impl<P: PtrSize> From<VMOffsetsFields<P>> for VMOffsets<P> {
                 = cmul(ret.num_defined_memories, ret.ptr.size_of_vmmemory_pointer()),
             size(owned_memories)
                 = cmul(ret.num_owned_memories, ret.ptr.size_of_vmmemory_definition()),
+            // Parallel to `defined_memories`, one pointer slot per defined
+            // memory holding the AN-encoding shadow base. Always sized; left
+            // null when AN-encoding is off or the memory is shared/imported.
+            size(defined_memories_enc_bases)
+                = cmul(ret.num_defined_memories, ret.ptr.size()),
             size(imported_functions)
                 = cmul(ret.num_imported_functions, ret.size_of_vmfunction_import()),
             size(imported_tables)
@@ -980,6 +998,16 @@ impl<P: PtrSize> VMOffsets<P> {
         self.owned_memories
     }
 
+    /// The offset of the parallel AN-encoding `enc_base` pointer array.
+    ///
+    /// Sized as `num_defined_memories * pointer_size`. Entries are null
+    /// pointers unless AN-encoding is enabled on the engine and the
+    /// corresponding defined memory has been allocated with a shadow.
+    #[inline]
+    pub fn vmctx_defined_memories_enc_bases_begin(&self) -> u32 {
+        self.defined_memories_enc_bases
+    }
+
     /// The offset of the `globals` array.
     #[inline]
     pub fn vmctx_globals_begin(&self) -> u32 {
@@ -1056,6 +1084,17 @@ impl<P: PtrSize> VMOffsets<P> {
         assert!(index.as_u32() < self.num_defined_memories);
         self.vmctx_memories_begin()
             + index.as_u32() * u32::from(self.ptr.size_of_vmmemory_pointer())
+    }
+
+    /// Return the offset to the AN-encoding shadow base pointer for the
+    /// defined memory at `index`. The slot stores a `*mut u8` (treated as
+    /// nullable from JIT code's perspective); see the VMContext layout
+    /// comment at the top of the file for the encoding invariant.
+    #[inline]
+    pub fn vmctx_an_enc_memory_base(&self, index: DefinedMemoryIndex) -> u32 {
+        assert!(index.as_u32() < self.num_defined_memories);
+        self.vmctx_defined_memories_enc_bases_begin()
+            + index.as_u32() * u32::from(self.pointer_size())
     }
 
     /// Return the offset to the owned `VMMemoryDefinition` at index `index`.

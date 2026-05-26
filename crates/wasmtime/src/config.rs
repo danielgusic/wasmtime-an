@@ -2296,6 +2296,57 @@ impl Config {
         self
     }
 
+    /// Opt-in to AN-encoding's load-side validity check.
+    ///
+    /// When `true` (and `an_encoding(true)` is also set), every i32 load
+    /// emits an inline assertion that the encoded shadow slot(s) it touches
+    /// satisfy `slot % A == 0 && slot / A == u32_le(raw_slot)`. Any
+    /// divergence raises `Trap::AnMemoryMismatch` immediately at the load
+    /// site, rather than at the next host-call boundary.
+    ///
+    /// Cost is significant for load-heavy programs (≥ one extra `udiv` per
+    /// touched shadow slot per load), so this is off by default.
+    pub fn an_load_validity_check(&mut self, enable: bool) -> &mut Self {
+        self.tunables.an_load_validity_check = Some(enable);
+        self
+    }
+
+    /// Test-only AN-encoding boundary codeword fault injection.
+    ///
+    /// When `offset != 0` AND `an_encoding(true)` is set, the wasm/host
+    /// trampolines add `offset` to the first encoded i32 arg/result
+    /// crossing the boundary BEFORE the modulo-`A` codeword check fires.
+    /// Any offset in `(0, A)` guarantees a non-multiple-of-`A`, which
+    /// raises `Trap::AnCodewordInvalid`.
+    ///
+    /// Intended only for testing the trap-fires path of the boundary
+    /// codeword validity check. Production code should leave this at the
+    /// default of `0` (no injection).
+    #[doc(hidden)]
+    pub fn an_inject_codeword_fault(&mut self, offset: u64) -> &mut Self {
+        self.tunables.an_inject_codeword_fault = Some(offset);
+        self
+    }
+
+    /// Test-only AN-encoding conversion-site codeword fault injection.
+    ///
+    /// When `offset != 0` AND `an_encoding(true)` is set, every
+    /// cross-type conversion op that decodes an encoded i32
+    /// (`i64.extend_i32_s/u`, `f*.convert_i32_s/u`,
+    /// `f32.reinterpret_i32`) adds `offset` to the operand BEFORE the
+    /// modulo-`A` codeword check fires at the conversion boundary. Any
+    /// offset in `(0, A)` guarantees a non-multiple-of-`A`, which raises
+    /// `Trap::AnCodewordInvalid`.
+    ///
+    /// Distinct from [`Self::an_inject_codeword_fault`], which targets the
+    /// wasm/host trampoline boundary. Production code should leave this at
+    /// the default of `0`.
+    #[doc(hidden)]
+    pub fn an_inject_conversion_fault(&mut self, offset: u64) -> &mut Self {
+        self.tunables.an_inject_conversion_fault = Some(offset);
+        self
+    }
+
     /// Returns the set of features that the currently selected compiler backend
     /// does not support at all and may panic on.
     ///

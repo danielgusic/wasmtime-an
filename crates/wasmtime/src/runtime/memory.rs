@@ -434,6 +434,32 @@ impl Memory {
         }
     }
 
+    /// Returns the AN-encoding shadow buffer for this memory as a mutable
+    /// slice, or `None` when no shadow is allocated (AN-encoding disabled,
+    /// or this memory is shared/imported).
+    ///
+    /// Test-only accessor: the shadow layout is `2 * raw_byte_size` and each
+    /// 4-byte raw slot maps to an 8-byte shadow slot holding the
+    /// little-endian encoding of `A * u32_le(raw_slot)`. Embedders should
+    /// not rely on the layout. Tampering the shadow under this accessor and
+    /// then performing any wasm op that triggers the host-boundary
+    /// cross-check (or, under `an_load_validity_check`, an i32 load of the
+    /// touched slot) raises `Trap::AnMemoryMismatch`.
+    #[doc(hidden)]
+    pub fn an_shadow_data_mut_for_test<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContextMut<'a, T>>,
+    ) -> Option<&'a mut [u8]> {
+        let store = store.into();
+        let (base, len) = store[self.instance].an_shadow_raw_parts_for_test(self.index)?;
+        // SAFETY: shadow buffer is owned by the instance and remains valid
+        // for the borrow lifetime — `StoreContextMut` keeps the store
+        // borrowed for `'a`, and the shadow is not reallocated except by
+        // `memory.grow`, which can only run via wasm execution that would
+        // require re-borrowing the store.
+        Some(unsafe { slice::from_raw_parts_mut(base, len) })
+    }
+
     /// Same as [`Memory::data_mut`], but also returns the `T` from the
     /// [`StoreContextMut`].
     ///

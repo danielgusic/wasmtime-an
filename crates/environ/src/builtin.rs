@@ -250,6 +250,29 @@ macro_rules! foreach_builtin_function {
 
             // Process a debug breakpoint.
             breakpoint(vmctx: vmctx) -> bool;
+
+            // AN-encoding host-call boundary cross-check.
+            //
+            // Walks every defined linear memory's encoded shadow slot-by-slot
+            // and asserts `decode(enc_slot) == u32_le(raw_slot)`. Returns
+            // `false` (a `Falsy` trap sentinel) on the first mismatch, which
+            // the trampoline turns into an `AnMemoryMismatch` trap. Returns
+            // `true` when all slots match. Emitted by the wasm-to-host
+            // trampoline immediately before the host call when
+            // `tunables.an_encoding` is on, so that bit flips accumulated
+            // during wasm execution are surfaced at the next host boundary.
+            an_check_host_boundary(vmctx: vmctx) -> bool;
+
+            // AN-encoding host-call boundary resync.
+            //
+            // Re-encodes every defined linear memory's raw bytes into the
+            // encoded shadow. Emitted by the wasm-to-host trampoline
+            // immediately after the host returns when `tunables.an_encoding`
+            // is on, so that direct host writes to the raw buffer (e.g. WASI
+            // copying input bytes into memory) are reflected in the shadow
+            // before wasm resumes. Always returns `true`; the bool return is
+            // for ABI uniformity with the other libcalls.
+            an_resync_host_boundary(vmctx: vmctx) -> bool;
         }
     };
 }

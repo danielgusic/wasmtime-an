@@ -411,15 +411,31 @@ impl wasmtime_environ::Compiler for Compiler {
         save_last_wasm_exit_fp_and_pc(&mut builder, pointer_type, &ptr, vm_store_context);
 
         // AN-encoding boundary (wasm → host): wasm args arrive widened to I64
-        // (encoded `A*v`). Host expects raw I32 in the `ValRaw` slot. Decode
-        // each i32 arg before spilling.
+        // (encoded `A*v`). Host expects raw I32 in the `ValRaw` slot. Before
+        // decoding each i32 arg, assert it is a valid codeword
+        // (`val % A == 0`); any non-multiple raises `Trap::AnCodewordInvalid`.
+        // Then decode via `udiv` + `ireduce`.
         let mut spill_args: Vec<Value> = args[2..].to_vec();
         if self.tunables.an_encoding {
             let an_const = builder
                 .ins()
                 .iconst(ir::types::I64, self.tunables.an_constant as i64);
+            let fault_offset = self.tunables.an_inject_codeword_fault;
+            let mut first_i32_corrupted = false;
             for (i, ty) in wasm_func_ty.params().iter().enumerate() {
                 if matches!(ty, WasmValType::I32) {
+                    // Test-only fault injection: bump the FIRST i32 arg by the
+                    // configured offset before the codeword check fires.
+                    if fault_offset != 0 && !first_i32_corrupted {
+                        spill_args[i] =
+                            builder.ins().iadd_imm(spill_args[i], fault_offset as i64);
+                        first_i32_corrupted = true;
+                    }
+                    crate::translate::emit_an_codeword_validity_check(
+                        &mut builder,
+                        self.tunables.an_constant,
+                        spill_args[i],
+                    );
                     let decoded = builder.ins().udiv(spill_args[i], an_const);
                     spill_args[i] = builder.ins().ireduce(ir::types::I32, decoded);
                 }
@@ -440,6 +456,21 @@ impl wasmtime_environ::Compiler for Compiler {
             callee_vmctx,
             ptr_size.vmarray_call_host_func_context_func_ref() + ptr_size.vm_func_ref_array_call(),
         );
+
+        // AN-encoding host-boundary cross-check. Emitted right
+        // before the host call so any divergence between raw and shadow
+        // (e.g. a bit flip in either copy) traps as `AnMemoryMismatch`
+        // before the host gets a chance to interpret possibly-corrupted
+        // bytes. No-op when AN-encoding is off on the engine.
+        if self.tunables.an_encoding {
+            let sigs = BuiltinFunctionSignatures::new(self);
+            let check_idx = BuiltinFunctionIndex::an_check_host_boundary();
+            let check_sig = sigs.host_signature(check_idx);
+            let check_call =
+                self.call_builtin(&mut builder, caller_vmctx, &[caller_vmctx], check_idx, check_sig);
+            let check_ok = builder.func.dfg.inst_results(check_call)[0];
+            self.raise_if_host_trapped(&mut builder, caller_vmctx, check_ok);
+        }
 
         // Do an indirect call to the callee.
         let callee_signature = builder.func.import_signature(array_call_sig);
@@ -478,6 +509,27 @@ impl wasmtime_environ::Compiler for Compiler {
         // Invoke `raise` if the callee (host) returned an error.
         let succeeded = builder.func.dfg.inst_results(call)[0];
         self.raise_if_host_trapped(&mut builder, caller_vmctx, succeeded);
+
+        // AN-encoding host-boundary resync. Emitted immediately
+        // after the host call so any raw-memory writes the host performed
+        // (e.g. WASI `fd_read` copying input bytes) get reflected in the
+        // encoded shadow before wasm resumes and either reads memory or
+        // hits the next host call's cross-check. No-op when AN-encoding is
+        // off on the engine.
+        if self.tunables.an_encoding {
+            let sigs = BuiltinFunctionSignatures::new(self);
+            let resync_idx = BuiltinFunctionIndex::an_resync_host_boundary();
+            let resync_sig = sigs.host_signature(resync_idx);
+            let resync_call = self.call_builtin(
+                &mut builder,
+                caller_vmctx,
+                &[caller_vmctx],
+                resync_idx,
+                resync_sig,
+            );
+            let resync_ok = builder.func.dfg.inst_results(resync_call)[0];
+            self.raise_if_host_trapped(&mut builder, caller_vmctx, resync_ok);
+        }
 
         // Return results from the array as native return values.
         let mut results =
@@ -1261,7 +1313,7 @@ impl Compiler {
 
     /// Helper to load the core `builtin` from `vmctx` and invoke it with
     /// `args`.
-    fn call_builtin(
+    pub(super) fn call_builtin(
         &self,
         builder: &mut FunctionBuilder<'_>,
         vmctx: ir::Value,
@@ -1468,14 +1520,29 @@ impl Compiler {
 
         // AN-decoding boundary (wasm → host): wasm returns each `i32` result as
         // a widened I64 holding `A*v`. The host's `ValRaw` slot expects raw
-        // I32. Divide by `A`, then truncate.
+        // I32. Before decoding each i32 result, assert it is a valid codeword
+        // (`val % A == 0`); any non-multiple raises `Trap::AnCodewordInvalid`.
+        // Then divide by `A` and truncate.
         let mut decoded_returns = normal_return_values.clone();
         if self.tunables.an_encoding {
             let an_const = builder
                 .ins()
                 .iconst(ir::types::I64, self.tunables.an_constant as i64);
+            let fault_offset = self.tunables.an_inject_codeword_fault;
+            let mut first_i32_corrupted = false;
             for (i, ty) in callee_sig.results().iter().enumerate() {
                 if matches!(ty, WasmValType::I32) {
+                    if fault_offset != 0 && !first_i32_corrupted {
+                        decoded_returns[i] = builder
+                            .ins()
+                            .iadd_imm(decoded_returns[i], fault_offset as i64);
+                        first_i32_corrupted = true;
+                    }
+                    crate::translate::emit_an_codeword_validity_check(
+                        &mut builder,
+                        self.tunables.an_constant,
+                        decoded_returns[i],
+                    );
                     let decoded = builder.ins().udiv(decoded_returns[i], an_const);
                     decoded_returns[i] = builder.ins().ireduce(ir::types::I32, decoded);
                 }

@@ -25,3 +25,5 @@ pub use self::heap::{Heap, HeapData, MemoryKind};
 pub use self::stack::FuncTranslationStacks;
 pub use self::table::{TableData, TableSize};
 pub use self::translation_utils::*;
+
+pub(crate) use self::an_helpers::emit_an_codeword_validity_check;

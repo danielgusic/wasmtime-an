@@ -87,6 +87,50 @@ fn fib_with_an() -> wasmtime::Result<()> {
     fib_check(true)
 }
 
+// WASI roundtrip stress under `an_load_validity_check`. WASI `fd_read`
+// writes raw input bytes into wasm linear memory via `Memory::data_mut`;
+// without the post-host resync libcall the encoded shadow would lag behind
+// raw and the next wasm `i32.load8_u` of those bytes (inside `$parse`)
+// would trap with `AnMemoryMismatch` under the load-validity check. The
+// fact that fib still computes the right output is end-to-end proof that
+// the resync hook fires and keeps the shadow in lockstep with raw after
+// host writes.
+fn run_fib_with_load_check(n: u32) -> wasmtime::Result<String> {
+    let mut config = Config::new();
+    config.an_encoding(true);
+    config.an_load_validity_check(true);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, FIB_WAT)?;
+    let mut linker: Linker<wasmtime_wasi::p1::WasiP1Ctx> = Linker::new(&engine);
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |t| t)?;
+
+    let stdin = wasmtime_wasi::p2::pipe::MemoryInputPipe::new(format!("{n}\n"));
+    let stdout = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(64);
+    let ctx = wasmtime_wasi::WasiCtxBuilder::new()
+        .stdin(stdin)
+        .stdout(stdout.clone())
+        .build_p1();
+    let mut store = Store::new(&engine, ctx);
+
+    let instance = linker.instantiate(&mut store, &module)?;
+    let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
+    start.call(&mut store, ())?;
+    drop(store);
+
+    let bytes = stdout.contents();
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+#[test]
+fn fib_with_an_and_load_validity_check() -> wasmtime::Result<()> {
+    // Same answers as `fib_check`, exercising the WASI `fd_read` →
+    // post-host resync → wasm load chain with the per-load shadow check on.
+    assert_eq!(run_fib_with_load_check(0)?, "0");
+    assert_eq!(run_fib_with_load_check(5)?, "5");
+    assert_eq!(run_fib_with_load_check(20)?, "6765");
+    Ok(())
+}
+
 // Per-operator regression suite. One wat module covers every i32 operator that
 // the AN-encoding prototype touches; each `ops_*` test runs the same module
 // with AN off and on and asserts the same expected results from both. The wat
@@ -455,4 +499,2174 @@ fn ops_with_an_custom_constants() -> wasmtime::Result<()> {
             .map_err(|e| wasmtime::Error::msg(format!("ops_assertions failed with A={a}: {e}")))?;
     }
     Ok(())
+}
+
+// Module-level feature refusals: AN-encoding allocates an encoded shadow per
+// defined linear memory, which requires owning the memory's storage and
+// excludes imported and shared (atomic) memories. Each refusal is exercised
+// below by compiling a minimal wat module under AN and asserting compile
+// fails with a message mentioning AN-encoding.
+
+fn compile_with_config(config: &Config, wat: &str) -> wasmtime::Result<Module> {
+    let engine = Engine::new(config)?;
+    Module::new(&engine, wat)
+}
+
+fn assert_an_refusal(config: &Config, wat: &str, label: &str) {
+    let err = compile_with_config(config, wat).expect_err(&format!("{label}: expected compile error"));
+    let s = format!("{err:#}");
+    assert!(
+        s.contains("AN-encoding"),
+        "{label}: error message did not mention AN-encoding: {s}"
+    );
+}
+
+fn assert_an_float_refusal(wat: &str, label: &str) {
+    let err = compile_with_config(&make_config(true), wat)
+        .expect_err(&format!("{label}: expected float refusal under AN"));
+    let s = format!("{err:#}");
+    assert!(
+        s.contains("AN-encoding") && s.contains("floating-point"),
+        "{label}: error did not mention float refusal: {s}",
+    );
+}
+
+#[test]
+fn refuse_float_param_under_an() {
+    let wat = r#"
+        (module
+            (func (export "f") (param f32) (result i32) i32.const 0))
+    "#;
+    assert_an_float_refusal(wat, "f32 param");
+}
+
+#[test]
+fn refuse_float_result_under_an() {
+    let wat = r#"
+        (module
+            (func (export "f") (result f64) f64.const 0))
+    "#;
+    assert_an_float_refusal(wat, "f64 result");
+}
+
+#[test]
+fn refuse_float_local_under_an() {
+    let wat = r#"
+        (module
+            (func (export "f") (result i32)
+                (local f32)
+                i32.const 0))
+    "#;
+    assert_an_float_refusal(wat, "f32 local");
+}
+
+#[test]
+fn refuse_float_global_under_an() {
+    let wat = r#"
+        (module
+            (global $g f64 (f64.const 0))
+            (func (export "f") (result i32) i32.const 0))
+    "#;
+    assert_an_float_refusal(wat, "f64 global");
+}
+
+#[test]
+fn refuse_float_op_under_an() {
+    // No float in sigs/globals/locals — only a transient `f32.const; drop`.
+    // Caught by the operator-walk arm.
+    let wat = r#"
+        (module
+            (func (export "f") (result i32)
+                f32.const 1.0
+                drop
+                i32.const 0))
+    "#;
+    assert_an_float_refusal(wat, "f32.const operator");
+}
+
+#[test]
+fn refuse_imported_memory_under_an() {
+    let wat = r#"
+        (module
+            (import "env" "m" (memory 1))
+            (func (export "f") (result i32) i32.const 0))
+    "#;
+    assert_an_refusal(&make_config(true), wat, "imported memory");
+}
+
+// Multi-memory: the dual-buffer plumbing is per-defined-memory and exercised
+// end-to-end, so compilation must succeed.
+#[test]
+fn multi_memory_compiles_under_an() -> wasmtime::Result<()> {
+    let wat = r#"
+        (module
+            (memory (export "m0") 1)
+            (memory (export "m1") 1)
+            (func (export "f") (result i32) i32.const 0))
+    "#;
+    let mut config = make_config(true);
+    config.wasm_multi_memory(true);
+    let engine = Engine::new(&config)?;
+    let _module = Module::new(&engine, wat)?;
+    Ok(())
+}
+
+#[test]
+fn refuse_shared_memory_under_an() {
+    let wat = r#"
+        (module
+            (memory (export "m") 1 1 shared)
+            (func (export "f") (result i32) i32.const 0))
+    "#;
+    let mut config = make_config(true);
+    config.wasm_threads(true);
+    assert_an_refusal(&config, wat, "shared memory");
+}
+
+// Atomic memory ops (threads proposal) have no shadow-update wiring, so they
+// are refused when AN is on. Each test exercises a representative op and
+// asserts the compile error mentions AN-encoding.
+
+fn an_refusal_with_threads(wat: &str, label: &str) {
+    let mut config = make_config(true);
+    config.wasm_threads(true);
+    assert_an_refusal(&config, wat, label);
+}
+
+#[test]
+fn refuse_atomic_load_under_an() {
+    let wat = r#"
+        (module
+            (memory (export "m") 1 1)
+            (func (export "f") (result i32)
+                i32.const 0
+                i32.atomic.load))
+    "#;
+    an_refusal_with_threads(wat, "i32.atomic.load");
+}
+
+#[test]
+fn refuse_atomic_store_under_an() {
+    let wat = r#"
+        (module
+            (memory (export "m") 1 1)
+            (func (export "f")
+                i32.const 0
+                i32.const 1
+                i32.atomic.store))
+    "#;
+    an_refusal_with_threads(wat, "i32.atomic.store");
+}
+
+#[test]
+fn refuse_atomic_rmw_add_under_an() {
+    let wat = r#"
+        (module
+            (memory (export "m") 1 1)
+            (func (export "f") (result i32)
+                i32.const 0
+                i32.const 1
+                i32.atomic.rmw.add))
+    "#;
+    an_refusal_with_threads(wat, "i32.atomic.rmw.add");
+}
+
+#[test]
+fn refuse_atomic_rmw_cmpxchg_under_an() {
+    let wat = r#"
+        (module
+            (memory (export "m") 1 1)
+            (func (export "f") (result i32)
+                i32.const 0
+                i32.const 1
+                i32.const 2
+                i32.atomic.rmw.cmpxchg))
+    "#;
+    an_refusal_with_threads(wat, "i32.atomic.rmw.cmpxchg");
+}
+
+#[test]
+fn refuse_atomic_fence_under_an() {
+    let wat = r#"
+        (module
+            (memory (export "m") 1 1)
+            (func (export "f")
+                atomic.fence))
+    "#;
+    an_refusal_with_threads(wat, "atomic.fence");
+}
+
+#[test]
+fn refuse_memory_atomic_wait32_under_an() {
+    let wat = r#"
+        (module
+            (memory (export "m") 1 1 shared)
+            (func (export "f") (result i32)
+                i32.const 0
+                i32.const 1
+                i64.const 0
+                memory.atomic.wait32))
+    "#;
+    // Note: shared memory is also refused, so this would normally bounce on
+    // shared. To isolate atomic-ops refusal we use a separate wat without
+    // `shared`. wasmparser allows wait32 on non-shared memory at the parse
+    // level even though it traps at runtime, so the atomic-op walk fires
+    // before the shared-memory walk.
+    let wat_nonshared = r#"
+        (module
+            (memory (export "m") 1 1)
+            (func (export "f") (result i32)
+                i32.const 0
+                i32.const 1
+                i64.const 0
+                memory.atomic.wait32))
+    "#;
+    let _ = wat;
+    an_refusal_with_threads(wat_nonshared, "memory.atomic.wait32");
+}
+
+#[test]
+fn refuse_memory_atomic_notify_under_an() {
+    let wat = r#"
+        (module
+            (memory (export "m") 1 1)
+            (func (export "f") (result i32)
+                i32.const 0
+                i32.const 1
+                memory.atomic.notify))
+    "#;
+    an_refusal_with_threads(wat, "memory.atomic.notify");
+}
+
+#[test]
+fn instantiate_data_segment_under_an() -> wasmtime::Result<()> {
+    // Data-segment init runs `Instance::an_encode_full_memory_from_raw` after
+    // raw bytes land, so the shadow must reflect the segment content. Verify
+    // by reading each byte back through a wasm `i32.load8_u`, then triggering
+    // a host-boundary cross-check via a host call. Either path would surface
+    // a divergence: the load (only when `an_load_validity_check` were on) or
+    // the cross-check at the noop call (always-on under AN).
+    let wat = r#"
+        (module
+            (import "env" "noop" (func $noop))
+            (memory (export "m") 1)
+            (data (i32.const 0) "Hello, AN-encoding!")
+            (func (export "load_byte") (param $a i32) (result i32)
+                local.get $a i32.load8_u)
+            (func (export "trigger_host")
+                call $noop))
+    "#;
+    let mut config = make_config(true);
+    config.an_constant(65521);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, wat)?;
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap("env", "noop", |_caller: wasmtime::Caller<'_, ()>| {})?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module)?;
+    let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
+    let trigger = instance.get_typed_func::<(), ()>(&mut store, "trigger_host")?;
+    let expected = b"Hello, AN-encoding!";
+    for (i, &want) in expected.iter().enumerate() {
+        let got = load_byte.call(&mut store, i as i32)? as u8;
+        assert_eq!(got, want, "data segment byte {i}");
+    }
+    trigger.call(&mut store, ())?;
+    Ok(())
+}
+
+#[test]
+fn memory64_with_an_is_allowed_with_warning() -> wasmtime::Result<()> {
+    // memory64 is allowed under AN-encoding (warning only — addresses are not
+    // protected). We verify compilation succeeds; the warning is fire-and-
+    // forget via `log::warn!` and not directly observable from the test
+    // harness without a custom logger.
+    let wat = r#"
+        (module
+            (memory (export "m") i64 1)
+            (func (export "f") (result i32) i32.const 0))
+    "#;
+    let mut config = make_config(true);
+    config.wasm_memory64(true);
+    let engine = Engine::new(&config)?;
+    let _module = Module::new(&engine, wat)?;
+    Ok(())
+}
+
+// Fault-injection tests. Each one tampers with linear memory from the host
+// side between instance setup and the next host-call boundary, then triggers
+// a host call from wasm and asserts the cross-check raises
+// `Trap::AnMemoryMismatch`. Any divergence between raw bytes and the encoded
+// shadow — regardless of which side was flipped — surfaces deterministically
+// at the trampoline.
+
+/// Builds an AN-encoding instance whose wasm calls a single host function
+/// that does nothing. Returns the store, the instance, the imported host
+/// function, the memory, and the `f` export (taking 0 args, returning i32).
+/// Each test pokes the memory between setup and `f.call(...)` and expects
+/// the trap.
+fn fault_injection_setup(
+    a: u64,
+) -> wasmtime::Result<(
+    Store<()>,
+    wasmtime::Instance,
+    wasmtime::Memory,
+    wasmtime::TypedFunc<(), i32>,
+)> {
+    let wat = r#"
+        (module
+            (import "env" "noop" (func $noop))
+            (memory (export "m") 1)
+            (func (export "f") (result i32)
+                call $noop
+                i32.const 0))
+    "#;
+    let mut config = make_config(true);
+    config.an_constant(a);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, wat)?;
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap("env", "noop", |_caller: wasmtime::Caller<'_, ()>| {})?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module)?;
+    let memory = instance
+        .get_memory(&mut store, "m")
+        .expect("memory export missing");
+    let f = instance.get_typed_func::<(), i32>(&mut store, "f")?;
+    Ok((store, instance, memory, f))
+}
+
+fn expect_an_mismatch_trap(res: wasmtime::Result<i32>, label: &str) {
+    let err = res.expect_err(&format!("{label}: expected AnMemoryMismatch trap, got Ok"));
+    let trap = err
+        .downcast_ref::<wasmtime::Trap>()
+        .unwrap_or_else(|| panic!("{label}: not a Trap: {err:?}"));
+    assert_eq!(
+        *trap,
+        wasmtime::Trap::AnMemoryMismatch,
+        "{label}: wrong trap code"
+    );
+}
+
+#[test]
+fn fault_inject_flip_in_raw_traps() -> wasmtime::Result<()> {
+    let (mut store, _instance, memory, f) = fault_injection_setup(65521)?;
+    // The whole memory was zeroed at instantiation and re-encoded into the
+    // shadow, so raw[0..4] == 0 and shadow[0..8] == A·0 == 0. Flip a single
+    // bit in raw to introduce a divergence.
+    memory.data_mut(&mut store)[3] ^= 0x80;
+    expect_an_mismatch_trap(f.call(&mut store, ()), "raw bit flip");
+    Ok(())
+}
+
+#[test]
+fn fault_inject_flip_in_shadow_traps() -> wasmtime::Result<()> {
+    // Symmetric to the raw-flip test: tamper the encoded shadow directly via
+    // the `#[doc(hidden)]` `Memory::an_shadow_data_mut_for_test` accessor.
+    // The slot is initialized to `A*0 == 0` at setup; flipping any shadow
+    // byte makes `enc_slot % A != 0` (or `enc_slot / A != raw_u32`),
+    // surfacing as `AnMemoryMismatch` at the next host-call cross-check.
+    let (mut store, _instance, memory, f) = fault_injection_setup(65521)?;
+    let shadow = memory
+        .an_shadow_data_mut_for_test(&mut store)
+        .expect("shadow allocated under AN");
+    shadow[8] ^= 0x01;
+    expect_an_mismatch_trap(f.call(&mut store, ()), "shadow byte flip");
+    Ok(())
+}
+
+#[test]
+fn fault_inject_various_an_constants() -> wasmtime::Result<()> {
+    // The cross-check is independent of A, but exercise a few values to
+    // confirm both the decode (slot / A) and the modular check (slot % A)
+    // produce a trap consistently.
+    for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+        let (mut store, _instance, memory, f) = fault_injection_setup(a)?;
+        memory.data_mut(&mut store)[16] = 0x55;
+        expect_an_mismatch_trap(
+            f.call(&mut store, ()),
+            &format!("raw poke with A={a}"),
+        );
+    }
+    Ok(())
+}
+
+// Unaligned `i32.store` and cross-slot `i32.store16`. The
+// wat below stores at every byte offset in `0..8`, then triggers a host call
+// so the cross-check runs against the shadow. If the unaligned path ever
+// leaves the shadow inconsistent, the host-call cross-check raises
+// `Trap::AnMemoryMismatch` and the test fails.
+
+const UNALIGNED_WAT: &str = r#"
+    (module
+        (import "env" "noop" (func $noop))
+        (memory (export "m") 1)
+        (func (export "store_i32") (param $addr i32) (param $val i32)
+            local.get $addr local.get $val i32.store
+            call $noop)
+        (func (export "store_i32_8") (param $addr i32) (param $val i32)
+            local.get $addr local.get $val i32.store8
+            call $noop)
+        (func (export "store_i32_16") (param $addr i32) (param $val i32)
+            local.get $addr local.get $val i32.store16
+            call $noop)
+        (func (export "load_i32") (param $addr i32) (result i32)
+            local.get $addr i32.load)
+        (func (export "load_i32_8") (param $addr i32) (result i32)
+            local.get $addr i32.load8_u)
+        (func (export "load_i32_16") (param $addr i32) (result i32)
+            local.get $addr i32.load16_u))
+"#;
+
+fn unaligned_setup(
+    a: u64,
+) -> wasmtime::Result<(Store<()>, wasmtime::Instance)> {
+    let mut config = make_config(true);
+    config.an_constant(a);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, UNALIGNED_WAT)?;
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap("env", "noop", |_caller: wasmtime::Caller<'_, ()>| {})?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module)?;
+    Ok((store, instance))
+}
+
+#[test]
+fn unaligned_i32_store_every_offset() -> wasmtime::Result<()> {
+    // For each byte offset `a` in 0..8, store an i32 then load it back via
+    // four byte loads to verify the raw bytes are correct, and trigger a
+    // host call so the cross-check confirms the shadow matches raw.
+    let (mut store, instance) = unaligned_setup(65521)?;
+    let store_i32 =
+        instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_i32")?;
+    let load_i32_8 = instance.get_typed_func::<i32, i32>(&mut store, "load_i32_8")?;
+
+    let value: i32 = 0x12_34_56_78;
+    for a in 0i32..8 {
+        store_i32.call(&mut store, (a, value))?;
+        for i in 0..4 {
+            let got = load_i32_8.call(&mut store, a + i)?;
+            let expected = ((value as u32) >> (8 * i)) & 0xff;
+            assert_eq!(
+                got as u32, expected,
+                "unaligned i32.store at addr {a} byte {i}",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cross_slot_i32_store16_every_offset() -> wasmtime::Result<()> {
+    // `i32.store16` at byte_pos == 3 spans two shadow slots. Cover every
+    // position 0..8 to exercise both in-slot (0,1,2,4,5,6) and cross-slot
+    // (3,7) cases.
+    let (mut store, instance) = unaligned_setup(65521)?;
+    let store_i32_16 =
+        instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_i32_16")?;
+    let load_i32_8 = instance.get_typed_func::<i32, i32>(&mut store, "load_i32_8")?;
+
+    let value: i32 = 0xab_cd; // low half-word
+    for a in 0i32..8 {
+        store_i32_16.call(&mut store, (a, value))?;
+        for i in 0..2 {
+            let got = load_i32_8.call(&mut store, a + i)?;
+            let expected = ((value as u32) >> (8 * i)) & 0xff;
+            assert_eq!(
+                got as u32, expected,
+                "i32.store16 at addr {a} byte {i}",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn unaligned_store_then_aligned_store_same_slot() -> wasmtime::Result<()> {
+    // After an unaligned store touches a slot via byte-RMW decomposition,
+    // a subsequent aligned store to the same slot must produce the right
+    // final encoded value (verifies the byte-RMW path leaves the
+    // `A * u32` invariant intact for downstream reads/stores).
+    let (mut store, instance) = unaligned_setup(65521)?;
+    let store_i32 =
+        instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_i32")?;
+    let load_i32 = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
+
+    // Write 0xAAAABBBB at addr 1 (unaligned). Bytes:
+    //   raw[1]=BB raw[2]=BB raw[3]=AA raw[4]=AA
+    // Slot 0 ends at byte 3; slot 1 starts at byte 4.
+    store_i32.call(&mut store, (1, 0xAAAA_BBBBu32 as i32))?;
+
+    // Now write 0x11223344 at addr 0 (aligned).
+    //   raw[0]=44 raw[1]=33 raw[2]=22 raw[3]=11
+    // Slot 0 becomes 0x11223344.
+    store_i32.call(&mut store, (0, 0x1122_3344))?;
+
+    // Aligned load of slot 0 should see 0x11223344.
+    let v0 = load_i32.call(&mut store, 0)?;
+    assert_eq!(v0 as u32, 0x1122_3344, "slot 0 after overwrite");
+
+    // Aligned load of slot 1 should still see the AA bytes (well, the high
+    // byte of the first store: raw[4] = AA, raw[5..8] = 0).
+    let v4 = load_i32.call(&mut store, 4)?;
+    assert_eq!(v4 as u32, 0x0000_00AA, "slot 1 high byte preserved");
+    Ok(())
+}
+
+// Bulk memory ops must keep the encoded shadow in sync
+// with raw bytes so the host-boundary cross-check does not trap. Each test
+// runs a bulk op, then a host call, and asserts no trap (clean cross-check)
+// plus the visible content via byte loads.
+
+const BULK_WAT: &str = r#"
+    (module
+        (import "env" "noop" (func $noop))
+        (memory (export "m") 1)
+        (data (i32.const 200) "DATAseg")
+        (func (export "fill") (param $dst i32) (param $v i32) (param $len i32)
+            local.get $dst local.get $v local.get $len memory.fill
+            call $noop)
+        (func (export "copy") (param $dst i32) (param $src i32) (param $len i32)
+            local.get $dst local.get $src local.get $len memory.copy
+            call $noop)
+        (func (export "init") (param $dst i32) (param $src i32) (param $len i32)
+            local.get $dst local.get $src local.get $len (memory.init 0)
+            call $noop)
+        (func (export "grow") (param $delta i32) (result i32)
+            local.get $delta memory.grow
+            call $noop)
+        (func (export "size") (result i32)
+            memory.size)
+        (func (export "store_byte") (param $a i32) (param $v i32)
+            local.get $a local.get $v i32.store8
+            call $noop)
+        (func (export "load_byte") (param $a i32) (result i32)
+            local.get $a i32.load8_u)
+        (func (export "load_i32") (param $a i32) (result i32)
+            local.get $a i32.load))
+"#;
+
+fn bulk_setup(a: u64) -> wasmtime::Result<(Store<()>, wasmtime::Instance)> {
+    let mut config = make_config(true);
+    config.an_constant(a);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, BULK_WAT)?;
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap("env", "noop", |_caller: wasmtime::Caller<'_, ()>| {})?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module)?;
+    Ok((store, instance))
+}
+
+#[test]
+fn bulk_wat_compiles_without_an() -> wasmtime::Result<()> {
+    let config = make_config(false);
+    let engine = Engine::new(&config)?;
+    let _module = Module::new(&engine, BULK_WAT)?;
+    Ok(())
+}
+
+#[test]
+fn bulk_wat_compiles_with_an() -> wasmtime::Result<()> {
+    let config = make_config(true);
+    let engine = Engine::new(&config)?;
+    let _module = Module::new(&engine, BULK_WAT)?;
+    Ok(())
+}
+
+#[test]
+fn bulk_memory_fill_keeps_shadow_consistent() -> wasmtime::Result<()> {
+    let (mut store, instance) = bulk_setup(65521)?;
+    let fill = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "fill")?;
+    let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
+
+    // Cover aligned fill, unaligned fill, byte-level fill that crosses
+    // multiple slots, and a non-zero fill byte. Each `fill` call ends with
+    // a host call so the cross-check fires.
+    fill.call(&mut store, (0, 0xAB, 16))?;
+    for i in 0..16 {
+        assert_eq!(load_byte.call(&mut store, i)? as u32, 0xAB, "fill1 byte {i}");
+    }
+    fill.call(&mut store, (3, 0xCD, 10))?; // straddles slot boundary
+    for i in 0..3 {
+        assert_eq!(load_byte.call(&mut store, i)? as u32, 0xAB, "fill2 untouched {i}");
+    }
+    for i in 3..13 {
+        assert_eq!(load_byte.call(&mut store, i)? as u32, 0xCD, "fill2 byte {i}");
+    }
+    for i in 13..16 {
+        assert_eq!(load_byte.call(&mut store, i)? as u32, 0xAB, "fill2 untouched {i}");
+    }
+    Ok(())
+}
+
+#[test]
+fn bulk_memory_copy_keeps_shadow_consistent() -> wasmtime::Result<()> {
+    let (mut store, instance) = bulk_setup(65521)?;
+    let fill = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "fill")?;
+    let copy = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "copy")?;
+    let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
+
+    // Pre-fill source region, copy to disjoint dst, verify.
+    fill.call(&mut store, (0, 0x11, 8))?;
+    copy.call(&mut store, (64, 0, 8))?;
+    for i in 0..8 {
+        assert_eq!(load_byte.call(&mut store, 64 + i)? as u32, 0x11, "copy byte {i}");
+    }
+
+    // Overlapping copy. Wasm `memory.copy` is `memmove`-safe: each
+    // `dst[i] = src[i]` reads the *pre-copy* source byte. With pre-copy
+    // raw[100..108] = [22 22 22 22 33 33 33 33] and `copy(dst=102, src=100,
+    // len=8)`, the result is raw[102..110] = pre-copy raw[100..108]. Bytes
+    // 100,101 are outside the destination range and stay 0x22.
+    fill.call(&mut store, (100, 0x22, 4))?;
+    fill.call(&mut store, (104, 0x33, 4))?;
+    copy.call(&mut store, (102, 100, 8))?;
+    let expected = [
+        0x22, 0x22, // raw[100..102] untouched
+        0x22, 0x22, 0x22, 0x22, // raw[102..106] = pre-copy raw[100..104]
+        0x33, 0x33, 0x33, 0x33, // raw[106..110] = pre-copy raw[104..108]
+    ];
+    for (i, &want) in expected.iter().enumerate() {
+        assert_eq!(
+            load_byte.call(&mut store, 100 + i as i32)? as u32,
+            want as u32,
+            "overlap byte {i}",
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn active_data_segment_keeps_shadow_consistent() -> wasmtime::Result<()> {
+    // Active data segment in `BULK_WAT` places "DATAseg" at addr 200; the
+    // segment is laid down at instantiation. Verify the bytes round-trip
+    // through wasm-side i32 loads and that the host-boundary cross-check
+    // (run via `load_byte`'s wat — wait, `load_byte` has no host call).
+    // The cross-check fires inside any `fill`/`copy` call. Issue a no-op
+    // fill of length 0 to force a host-boundary visit without disturbing
+    // raw bytes.
+    let (mut store, instance) = bulk_setup(65521)?;
+    let fill = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "fill")?;
+    let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
+
+    let expected = b"DATAseg";
+    for (i, &want) in expected.iter().enumerate() {
+        let got = load_byte.call(&mut store, 200 + i as i32)? as u8;
+        assert_eq!(got, want, "active data segment byte {i}");
+    }
+    // Length-zero fill at the segment offset is a no-op for raw and shadow
+    // both, but it routes through the `call $noop` cross-check.
+    fill.call(&mut store, (200, 0, 0))?;
+    Ok(())
+}
+
+// Passive data segment + explicit `memory.init` under AN. The active variant
+// above is exercised by `BULK_WAT`; this one separately confirms the
+// `memory.init` libcall path drives `Instance::an_encode_range_from_raw` and
+// the resulting shadow agrees with raw via the host-boundary cross-check.
+const PASSIVE_INIT_WAT: &str = r#"
+    (module
+        (import "env" "noop" (func $noop))
+        (memory (export "m") 1)
+        (data $d "PASSIVE")
+        (func (export "do_init") (param $dst i32) (param $src i32) (param $len i32)
+            local.get $dst local.get $src local.get $len memory.init $d
+            call $noop)
+        (func (export "load_byte") (param $a i32) (result i32)
+            local.get $a i32.load8_u))
+"#;
+
+#[test]
+fn passive_memory_init_keeps_shadow_consistent() -> wasmtime::Result<()> {
+    let mut config = make_config(true);
+    config.an_constant(65521);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, PASSIVE_INIT_WAT)?;
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap("env", "noop", |_caller: wasmtime::Caller<'_, ()>| {})?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module)?;
+    let do_init = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "do_init")?;
+    let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
+
+    // Cover three placements: aligned (slot start), unaligned (mid-slot), and
+    // straddling a slot boundary. Each call ends in a host-boundary
+    // cross-check via `call $noop`.
+    let expected = b"PASSIVE";
+    for &dst in &[0i32, 5, 13] {
+        do_init.call(&mut store, (dst, 0, expected.len() as i32))?;
+        for (i, &want) in expected.iter().enumerate() {
+            let got = load_byte.call(&mut store, dst + i as i32)? as u8;
+            assert_eq!(got, want, "passive init dst={dst} byte {i}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn bulk_memory_grow_keeps_shadow_consistent() -> wasmtime::Result<()> {
+    let (mut store, instance) = bulk_setup(65521)?;
+    let grow = instance.get_typed_func::<i32, i32>(&mut store, "grow")?;
+    let size = instance.get_typed_func::<(), i32>(&mut store, "size")?;
+    let store_byte = instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_byte")?;
+    let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
+
+    // Write a sentinel before growing — must survive grow + cross-check.
+    store_byte.call(&mut store, (1024, 0x77))?;
+    assert_eq!(load_byte.call(&mut store, 1024)? as u32, 0x77);
+
+    // Grow by 1 page (64 KiB). Old content preserved, new pages zeroed.
+    let old_pages = grow.call(&mut store, 1)?;
+    assert_eq!(old_pages, 1);
+    assert_eq!(size.call(&mut store, ())?, 2);
+
+    // Sentinel still readable.
+    assert_eq!(load_byte.call(&mut store, 1024)? as u32, 0x77);
+
+    // New page (at offset 65536) reads back as zero.
+    assert_eq!(load_byte.call(&mut store, 65_536 + 100)? as u32, 0);
+
+    // Write/read on the new page exercises the freshly grown shadow.
+    store_byte.call(&mut store, (65_536 + 100, 0x99))?;
+    assert_eq!(load_byte.call(&mut store, 65_536 + 100)? as u32, 0x99);
+    Ok(())
+}
+
+#[test]
+fn bulk_memory_with_various_an_constants() -> wasmtime::Result<()> {
+    // Re-run a small bulk-op sequence with several A values to confirm the
+    // shadow range encoder reads A from tunables consistently.
+    for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+        let (mut store, instance) = bulk_setup(a)?;
+        let fill = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "fill")?;
+        let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
+        fill.call(&mut store, (5, 0xEF, 13))?;
+        for i in 5..18 {
+            assert_eq!(
+                load_byte.call(&mut store, i)? as u32,
+                0xEF,
+                "A={a} byte {i}",
+            );
+        }
+    }
+    Ok(())
+}
+
+// Table-op AN audit. Table ops take i32 index/length operands the
+// same way bulk-memory ops do; under AN those operands arrive on the value
+// stack as encoded `I64` (`A*v`) and must be decoded before flowing into the
+// builtin helpers. Operators that return an i32 (`table.grow`, `table.size`)
+// must re-encode the result before pushing.
+//
+// Each test compiles a wat module that exercises a table op under AN-on,
+// then runs it and asserts the visible behavior. Without the i32 decode the
+// underlying cranelift cast (`uextend.i64`) panics on an `I64` input.
+
+const TABLE_WAT: &str = r#"
+    (module
+        (import "env" "noop" (func $noop))
+        (table $t 4 funcref)
+        (func $f0 (result i32) i32.const 100)
+        (func $f1 (result i32) i32.const 200)
+        (func $f2 (result i32) i32.const 300)
+        (elem (i32.const 0) $f0 $f1 $f2)
+        (func (export "size") (result i32) table.size $t)
+        (func (export "grow") (param $delta i32) (result i32)
+            ref.null func local.get $delta table.grow $t)
+        (func (export "fill") (param $dst i32) (param $len i32)
+            local.get $dst ref.null func local.get $len table.fill $t)
+        (func (export "copy") (param $dst i32) (param $src i32) (param $len i32)
+            local.get $dst local.get $src local.get $len table.copy $t $t)
+        (func (export "call_idx") (param $i i32) (result i32)
+            local.get $i call_indirect $t (result i32))
+        (func (export "trigger_host")
+            call $noop))
+"#;
+
+fn table_setup(an_on: bool) -> wasmtime::Result<(Store<()>, wasmtime::Instance)> {
+    let mut config = make_config(an_on);
+    if an_on {
+        config.an_constant(65521);
+    }
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, TABLE_WAT)?;
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap("env", "noop", |_caller: wasmtime::Caller<'_, ()>| {})?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module)?;
+    Ok((store, instance))
+}
+
+#[test]
+fn table_size_under_an() -> wasmtime::Result<()> {
+    let (mut store, instance) = table_setup(true)?;
+    let size = instance.get_typed_func::<(), i32>(&mut store, "size")?;
+    assert_eq!(size.call(&mut store, ())?, 4);
+    Ok(())
+}
+
+#[test]
+fn table_grow_under_an() -> wasmtime::Result<()> {
+    let (mut store, instance) = table_setup(true)?;
+    let grow = instance.get_typed_func::<i32, i32>(&mut store, "grow")?;
+    let size = instance.get_typed_func::<(), i32>(&mut store, "size")?;
+    // Grow by 2 from initial size 4. Result is previous size (4).
+    assert_eq!(grow.call(&mut store, 2)?, 4);
+    assert_eq!(size.call(&mut store, ())?, 6);
+    Ok(())
+}
+
+#[test]
+fn table_fill_under_an() -> wasmtime::Result<()> {
+    let (mut store, instance) = table_setup(true)?;
+    let fill = instance.get_typed_func::<(i32, i32), ()>(&mut store, "fill")?;
+    fill.call(&mut store, (1, 2))?;
+    Ok(())
+}
+
+#[test]
+fn table_copy_under_an() -> wasmtime::Result<()> {
+    let (mut store, instance) = table_setup(true)?;
+    let copy = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "copy")?;
+    copy.call(&mut store, (1, 0, 2))?;
+    Ok(())
+}
+
+#[test]
+fn call_indirect_under_an() -> wasmtime::Result<()> {
+    let (mut store, instance) = table_setup(true)?;
+    let call_idx = instance.get_typed_func::<i32, i32>(&mut store, "call_idx")?;
+    assert_eq!(call_idx.call(&mut store, 0)?, 100);
+    assert_eq!(call_idx.call(&mut store, 1)?, 200);
+    assert_eq!(call_idx.call(&mut store, 2)?, 300);
+    Ok(())
+}
+
+#[test]
+fn table_ops_match_without_an() -> wasmtime::Result<()> {
+    // Sanity counterpart: same wat without AN must produce the same observable
+    // outcomes. Confirms the AN-on path matches semantics, not just compiles.
+    let (mut store, instance) = table_setup(false)?;
+    let size = instance.get_typed_func::<(), i32>(&mut store, "size")?;
+    let grow = instance.get_typed_func::<i32, i32>(&mut store, "grow")?;
+    let call_idx = instance.get_typed_func::<i32, i32>(&mut store, "call_idx")?;
+    assert_eq!(size.call(&mut store, ())?, 4);
+    assert_eq!(grow.call(&mut store, 2)?, 4);
+    assert_eq!(size.call(&mut store, ())?, 6);
+    assert_eq!(call_idx.call(&mut store, 0)?, 100);
+    assert_eq!(call_idx.call(&mut store, 1)?, 200);
+    Ok(())
+}
+
+// table.init + elem.drop with a passive elem segment.
+const TABLE_INIT_WAT: &str = r#"
+    (module
+        (table $t 4 funcref)
+        (func $g0 (result i32) i32.const 11)
+        (func $g1 (result i32) i32.const 22)
+        (elem $e func $g0 $g1)
+        (func (export "init") (param $dst i32) (param $src i32) (param $len i32)
+            local.get $dst local.get $src local.get $len table.init $t $e)
+        (func (export "drop_elem") elem.drop $e)
+        (func (export "call_at") (param $i i32) (result i32)
+            local.get $i call_indirect $t (result i32)))
+"#;
+
+#[test]
+fn table_init_under_an() -> wasmtime::Result<()> {
+    let mut config = make_config(true);
+    config.an_constant(65521);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, TABLE_INIT_WAT)?;
+    let mut store = Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
+    let init = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "init")?;
+    let call_at = instance.get_typed_func::<i32, i32>(&mut store, "call_at")?;
+    init.call(&mut store, (0, 0, 2))?;
+    assert_eq!(call_at.call(&mut store, 0)?, 11);
+    assert_eq!(call_at.call(&mut store, 1)?, 22);
+    Ok(())
+}
+
+#[test]
+fn fault_inject_clean_run_passes() -> wasmtime::Result<()> {
+    // Sanity counterpart: without any tampering the host-call boundary
+    // cross-check must NOT trap. Distinguishes "any host call traps under
+    // AN" from "host call traps only on real divergence".
+    let (mut store, _instance, _memory, f) = fault_injection_setup(65521)?;
+    let r = f.call(&mut store, ())?;
+    assert_eq!(r, 0, "wasm returned non-zero from a clean run");
+    Ok(())
+}
+
+// Multi-memory under AN-encoding. The dual-buffer plumbing is
+// per-defined-memory: each memory gets its own encoded shadow allocated in
+// `Instance::set_an_enc_shadows`, and the host-call boundary cross-check
+// walks `0..num_defined_memories`. Stores route through `memarg.memory` so
+// the cranelift codegen already targets the right shadow. These tests
+// verify the end-to-end behavior:
+//   1. A wat with two memories instantiates and stores into each.
+//   2. Host-call boundary cross-check passes (clean run).
+//   3. Tampering either memory's raw bytes triggers `AnMemoryMismatch`.
+
+const MULTI_MEM_WAT: &str = r#"
+    (module
+        (import "env" "noop" (func $noop))
+        (memory $m0 (export "m0") 1)
+        (memory $m1 (export "m1") 1)
+        (func (export "store_m0") (param $a i32) (param $v i32)
+            local.get $a local.get $v i32.store $m0
+            call $noop)
+        (func (export "store_m1") (param $a i32) (param $v i32)
+            local.get $a local.get $v i32.store $m1
+            call $noop)
+        (func (export "load_m0") (param $a i32) (result i32)
+            local.get $a i32.load $m0)
+        (func (export "load_m1") (param $a i32) (result i32)
+            local.get $a i32.load $m1)
+        (func (export "trigger_host") (result i32)
+            call $noop
+            i32.const 0))
+"#;
+
+fn multi_memory_setup(a: u64) -> wasmtime::Result<(Store<()>, wasmtime::Instance)> {
+    let mut config = make_config(true);
+    config.wasm_multi_memory(true);
+    config.an_constant(a);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, MULTI_MEM_WAT)?;
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap("env", "noop", |_caller: wasmtime::Caller<'_, ()>| {})?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module)?;
+    Ok((store, instance))
+}
+
+#[test]
+fn multi_memory_stores_keep_shadows_consistent() -> wasmtime::Result<()> {
+    // Aligned stores into each defined memory should round-trip through the
+    // raw buffers and pass the per-memory cross-check at the host-call
+    // trampoline. If either shadow drifted, the trailing `call $noop` would
+    // raise `AnMemoryMismatch`.
+    let (mut store, instance) = multi_memory_setup(65521)?;
+    let store_m0 = instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_m0")?;
+    let store_m1 = instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_m1")?;
+    let load_m0 = instance.get_typed_func::<i32, i32>(&mut store, "load_m0")?;
+    let load_m1 = instance.get_typed_func::<i32, i32>(&mut store, "load_m1")?;
+
+    store_m0.call(&mut store, (0, 0x1111_2222u32 as i32))?;
+    store_m1.call(&mut store, (0, 0x3333_4444u32 as i32))?;
+    store_m0.call(&mut store, (16, 0x5555_6666u32 as i32))?;
+    store_m1.call(&mut store, (16, 0x7777_8888u32 as i32))?;
+
+    assert_eq!(load_m0.call(&mut store, 0)? as u32, 0x1111_2222);
+    assert_eq!(load_m1.call(&mut store, 0)? as u32, 0x3333_4444);
+    assert_eq!(load_m0.call(&mut store, 16)? as u32, 0x5555_6666);
+    assert_eq!(load_m1.call(&mut store, 16)? as u32, 0x7777_8888);
+    Ok(())
+}
+
+#[test]
+fn multi_memory_tamper_mem0_traps() -> wasmtime::Result<()> {
+    // Flipping a bit in defined memory 0 raw bytes diverges its shadow.
+    // The host-call cross-check iterates all defined memories and must
+    // report the mismatch.
+    let (mut store, instance) = multi_memory_setup(65521)?;
+    let trigger = instance.get_typed_func::<(), i32>(&mut store, "trigger_host")?;
+    let m0 = instance
+        .get_memory(&mut store, "m0")
+        .expect("memory m0 export missing");
+    m0.data_mut(&mut store)[3] ^= 0x80;
+    expect_an_mismatch_trap(trigger.call(&mut store, ()), "m0 raw bit flip");
+    Ok(())
+}
+
+#[test]
+fn multi_memory_tamper_mem1_traps() -> wasmtime::Result<()> {
+    // Symmetric to the m0 test: divergence in memory 1 must also surface.
+    // Confirms the cross-check loop visits every defined memory, not just
+    // index 0.
+    let (mut store, instance) = multi_memory_setup(65521)?;
+    let trigger = instance.get_typed_func::<(), i32>(&mut store, "trigger_host")?;
+    let m1 = instance
+        .get_memory(&mut store, "m1")
+        .expect("memory m1 export missing");
+    m1.data_mut(&mut store)[7] = 0x42;
+    expect_an_mismatch_trap(trigger.call(&mut store, ()), "m1 raw bit flip");
+    Ok(())
+}
+
+// Opt-in per-load shadow-validity check. When
+// `Config::an_load_validity_check(true)` is set on top of `an_encoding(true)`,
+// every i32 load emits an inline assertion that the encoded shadow slot(s) it
+// touches still satisfy `slot % A == 0 && slot / A == u32_le(raw_slot)`.
+//
+// We exercise the flag through the same `Memory::data_mut` poke trick used by
+// the host-boundary fault-injection tests, but with one difference:
+//   - In the host-boundary tests the trap fires on the *next host call* (the
+//     wasm-to-array trampoline runs the cross-check).
+//   - With the load-side check enabled, the trap must fire on the *next i32
+//     load* of a tampered slot, BEFORE the host call ever runs.
+
+const LOAD_CHECK_WAT: &str = r#"
+    (module
+        (import "env" "noop" (func $noop))
+        (memory (export "m") 1)
+        (func (export "load_i32") (param $a i32) (result i32)
+            local.get $a i32.load)
+        (func (export "load_i32_8u") (param $a i32) (result i32)
+            local.get $a i32.load8_u)
+        (func (export "load_i32_16u") (param $a i32) (result i32)
+            local.get $a i32.load16_u)
+        (func (export "noop_host") (result i32)
+            call $noop
+            i32.const 0))
+"#;
+
+fn load_check_setup(
+    a: u64,
+    validity_check: bool,
+) -> wasmtime::Result<(Store<()>, wasmtime::Instance, wasmtime::Memory)> {
+    let mut config = make_config(true);
+    config.an_constant(a);
+    config.an_load_validity_check(validity_check);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, LOAD_CHECK_WAT)?;
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap("env", "noop", |_caller: wasmtime::Caller<'_, ()>| {})?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module)?;
+    let mem = instance
+        .get_memory(&mut store, "m")
+        .expect("memory export missing");
+    Ok((store, instance, mem))
+}
+
+#[test]
+fn load_validity_check_default_off() -> wasmtime::Result<()> {
+    // With AN on but the sub-tunable off, the load path does NOT consult the
+    // shadow. Tampering raw between wasm calls is invisible to wasm loads
+    // (the next host call still traps via the host-boundary cross-check,
+    // but a load by itself does not). This documents the default behavior.
+    let (mut store, instance, mem) = load_check_setup(65521, false)?;
+    let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
+    mem.data_mut(&mut store)[0] = 0x42;
+    // Load without an intervening host call returns the tampered raw byte
+    // without raising AnMemoryMismatch (default-off path).
+    let v = load.call(&mut store, 0)?;
+    assert_eq!(v as u32, 0x42);
+    Ok(())
+}
+
+#[test]
+fn load_validity_check_clean_run_passes() -> wasmtime::Result<()> {
+    // With the validity check on, a clean module with no tampering must still
+    // load correctly. This guards against the check accidentally tripping
+    // on the post-instantiation shadow state. Use UNALIGNED_WAT (exports
+    // both store_i32 and load_i32) so we can write through the shadow-aware
+    // store path and then read back through the validity-checked load path.
+    let mut config = make_config(true);
+    config.an_constant(65521);
+    config.an_load_validity_check(true);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, UNALIGNED_WAT)?;
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap("env", "noop", |_caller: wasmtime::Caller<'_, ()>| {})?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module)?;
+    let store_fn = instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_i32")?;
+    let load_fn = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
+    store_fn.call(&mut store, (0, 0x12345678))?;
+    assert_eq!(load_fn.call(&mut store, 0)? as u32, 0x12345678);
+    // Load at byte offset 4 (a zero slot) — must not trap.
+    let _ = load_fn.call(&mut store, 4)?;
+    Ok(())
+}
+
+#[test]
+fn load_validity_check_traps_on_raw_tamper() -> wasmtime::Result<()> {
+    // Raw tamper between host call and the next i32 load: with the validity
+    // check on the load must raise AnMemoryMismatch immediately, no host
+    // call in between needed.
+    let (mut store, instance, mem) = load_check_setup(65521, true)?;
+    let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
+    mem.data_mut(&mut store)[3] = 0x80;
+    let res = load.call(&mut store, 0);
+    expect_an_mismatch_trap(res, "raw tamper + i32.load");
+    Ok(())
+}
+
+#[test]
+fn load_validity_check_traps_on_load8u() -> wasmtime::Result<()> {
+    // load8_u touches a single shadow slot. Tampering a byte inside that
+    // slot must surface at the load.
+    let (mut store, instance, mem) = load_check_setup(65521, true)?;
+    let load8 = instance.get_typed_func::<i32, i32>(&mut store, "load_i32_8u")?;
+    mem.data_mut(&mut store)[2] ^= 0x55;
+    let res = load8.call(&mut store, 0);
+    expect_an_mismatch_trap(res, "raw tamper + i32.load8_u");
+    Ok(())
+}
+
+#[test]
+fn load_validity_check_traps_on_load16u_cross_slot() -> wasmtime::Result<()> {
+    // load16_u at byte offset 3 spans two shadow slots. Tampering at byte 4
+    // (the second slot) must still surface at the load — confirming the
+    // check fires on both touched slots.
+    let (mut store, instance, mem) = load_check_setup(65521, true)?;
+    let load16 = instance.get_typed_func::<i32, i32>(&mut store, "load_i32_16u")?;
+    mem.data_mut(&mut store)[4] = 0xCD;
+    let res = load16.call(&mut store, 3);
+    expect_an_mismatch_trap(res, "raw tamper + cross-slot i32.load16_u");
+    Ok(())
+}
+
+#[test]
+fn load_validity_check_traps_unaligned_i32_load() -> wasmtime::Result<()> {
+    // Unaligned i32.load (byte_pos != 0) spans two shadow slots. Tampering
+    // either slot must surface.
+    let (mut store, instance, mem) = load_check_setup(65521, true)?;
+    let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
+    // Load at byte offset 1: touches slot 0 (bytes 1..4) and slot 1 (byte 4).
+    // Flip a bit in slot 1's raw byte 5 — only the second slot diverges.
+    mem.data_mut(&mut store)[5] ^= 0x80;
+    let res = load.call(&mut store, 1);
+    expect_an_mismatch_trap(res, "unaligned i32.load second-slot tamper");
+    Ok(())
+}
+
+#[test]
+fn load_validity_check_various_an_constants() -> wasmtime::Result<()> {
+    // The shadow encoding parameterized on A, so re-run a single trap test
+    // across a few values to confirm the codegen reads A from tunables.
+    for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+        let (mut store, instance, mem) = load_check_setup(a, true)?;
+        let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
+        mem.data_mut(&mut store)[0] = 0x55;
+        let res = load.call(&mut store, 0);
+        expect_an_mismatch_trap(res, &format!("validity check with A={a}"));
+    }
+    Ok(())
+}
+
+#[test]
+fn multi_memory_clean_run_passes() -> wasmtime::Result<()> {
+    // Sanity counterpart: clean stores into both memories followed by a
+    // host call must not trap.
+    let (mut store, instance) = multi_memory_setup(65521)?;
+    let store_m0 = instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_m0")?;
+    let store_m1 = instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_m1")?;
+    let trigger = instance.get_typed_func::<(), i32>(&mut store, "trigger_host")?;
+
+    store_m0.call(&mut store, (32, 0xAAAA_BBBBu32 as i32))?;
+    store_m1.call(&mut store, (48, 0xCCCC_DDDDu32 as i32))?;
+    assert_eq!(trigger.call(&mut store, ())?, 0);
+    Ok(())
+}
+
+// AN-encoding paths through component-model trampolines.
+//
+// The core `compile_wasm_to_array_trampoline` already emits the AN
+// cross-check / resync libcalls around wasm→host calls, but components
+// route imports through `compile_component_trampoline` (via
+// `TrampolineCompiler::translate_hostcall`) which is a separate code path.
+// Without the same hook there, a wasm-in-component store followed by a
+// host import could leave the encoded shadow stale undetected.
+//
+// These tests cover the smoke path: a component with a core module that
+// performs an `i32.store` and then invokes a host import. The clean run
+// must complete without `AnMemoryMismatch` — i.e. the AN-encoding paths
+// don't false-positive in the component-trampoline path AND the host
+// boundary cross-check is wired correctly to the core caller's vmctx.
+//
+// Tampering core memory from the embedder to trigger a trap would require
+// reaching into a component's nested core memory, which the public
+// component API doesn't expose today. That side of coverage is deferred to
+// future work (see AN_ENCODING_CHANGELOG.md).
+mod component_an {
+    use wasmtime::component::{Component, Linker};
+    use wasmtime::{Config, Engine, Store};
+
+    const COMPONENT_WAT: &str = r#"
+        (component
+            (import "noop" (func $noop))
+
+            (core module $m
+                (import "env" "noop" (func $noop))
+                (memory (export "m") 1)
+                (func (export "call") (result i32)
+                    ;; Write a sentinel to the shadow-mirrored memory ...
+                    i32.const 0
+                    i32.const 0x1122_3344
+                    i32.store
+                    ;; ... and then cross the host boundary.
+                    call $noop
+                    ;; Return the sentinel, decoded via i32.load.
+                    i32.const 0
+                    i32.load))
+
+            (core func $noop_lower (canon lower (func $noop)))
+            (core instance $i (instantiate $m
+                (with "env" (instance (export "noop" (func $noop_lower))))))
+
+            (func (export "call") (result u32)
+                (canon lift (core func $i "call"))))
+    "#;
+
+    fn make_engine(an_on: bool) -> wasmtime::Result<Engine> {
+        let mut config = Config::new();
+        // Component-model is on by default in the workspace test config,
+        // but be explicit so the test is self-contained.
+        config.wasm_component_model(true);
+        config.an_encoding(an_on);
+        if an_on {
+            config.an_constant(65521);
+        }
+        Engine::new(&config)
+    }
+
+    fn instantiate(
+        an_on: bool,
+    ) -> wasmtime::Result<(Store<()>, wasmtime::component::TypedFunc<(), (u32,)>)> {
+        let engine = make_engine(an_on)?;
+        let component = Component::new(&engine, COMPONENT_WAT)?;
+        let mut linker = Linker::new(&engine);
+        linker
+            .root()
+            .func_wrap("noop", |_store, _: ()| Ok(()))?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component)?;
+        let call = instance.get_typed_func::<(), (u32,)>(&mut store, "call")?;
+        Ok((store, call))
+    }
+
+    #[test]
+    fn component_compiles_without_an() -> wasmtime::Result<()> {
+        // Baseline: same component must compile + run with AN off. Confirms
+        // the wat itself is well-formed and that any failure in the AN-on
+        // counterpart is specific to the AN path.
+        let (mut store, call) = instantiate(false)?;
+        let (v,) = call.call(&mut store, ())?;
+        assert_eq!(v, 0x1122_3344);
+        Ok(())
+    }
+
+    #[test]
+    fn component_compiles_with_an() -> wasmtime::Result<()> {
+        // AN on, no tampering: the hostcall trampoline must NOT false-
+        // positive on the cross-check (the wasm store + the libcall path
+        // both keep the shadow in lockstep with raw). If the cross-check
+        // were misrouted to the component vmctx instead of the core caller
+        // vmctx the call would crash; if it ran on the right vmctx but the
+        // shadow update path were missing the call would trap with
+        // `AnMemoryMismatch`. We assert neither happens.
+        let (mut store, call) = instantiate(true)?;
+        let (v,) = call.call(&mut store, ())?;
+        assert_eq!(v, 0x1122_3344);
+        Ok(())
+    }
+
+    #[test]
+    fn component_with_an_various_constants() -> wasmtime::Result<()> {
+        // Re-run the smoke test across A values to confirm the
+        // hostcall-trampoline libcall reads `A` from the engine's tunables
+        // (the resync re-encodes raw → shadow using that A; if it baked
+        // the default A the next host call would surface a mismatch).
+        for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+            let mut config = Config::new();
+            config.wasm_component_model(true);
+            config.an_encoding(true);
+            config.an_constant(a);
+            let engine = Engine::new(&config)?;
+            let component = Component::new(&engine, COMPONENT_WAT)?;
+            let mut linker = Linker::new(&engine);
+            linker
+                .root()
+                .func_wrap("noop", |_store, _: ()| Ok(()))?;
+            let mut store = Store::new(&engine, ());
+            let instance = linker.instantiate(&mut store, &component)?;
+            let call = instance.get_typed_func::<(), (u32,)>(&mut store, "call")?;
+            let (v,) = call.call(&mut store, ())?;
+            assert_eq!(v, 0x1122_3344, "A={a}");
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Boundary codeword validity check
+//
+// The wasm/host trampolines decode encoded i32 values (`A*v` widened to I64)
+// into raw i32 in two places:
+//
+//   * `compile_wasm_to_array_trampoline`: encoded args from wasm → raw i32
+//     in the ValRaw slots passed to the host.
+//   * `array_to_wasm_trampoline`: encoded results from wasm → raw i32 in the
+//     ValRaw slots returned to the host.
+//
+// Always-on when AN-encoding is on: before each `udiv` decode, emit
+// `val % A`; if non-zero, raise `Trap::AnCodewordInvalid`. Defends against
+// external corruption (bit flip in a register / on the wasm operand stack).
+//
+// The check can never fire in valid wasm: every codepath that places an
+// encoded I64 on the operand stack multiplies by `A` at some point, so the
+// invariant `val % A == 0` is structurally maintained. To exercise the
+// trap-fires path the test-only `Config::an_inject_codeword_fault(offset)`
+// knob causes the trampoline to add `offset` to the first encoded i32
+// arg/result BEFORE the modulo check fires. Any offset in `(0, A)`
+// guarantees a non-multiple.
+mod codeword_check {
+    use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
+
+    // Module with one host import (i32 -> i32) and a wasm wrapper that calls
+    // it through the wasm→host trampoline.
+    const ECHO_WAT: &str = r#"
+        (module
+            (import "host" "echo" (func $echo (param i32) (result i32)))
+            (func (export "run") (param i32) (result i32)
+                (call $echo (local.get 0))))
+    "#;
+
+    // Multi-i32-arg module.
+    const SUM3_WAT: &str = r#"
+        (module
+            (import "host" "sum3" (func $sum3 (param i32 i32 i32) (result i32)))
+            (func (export "run") (param i32 i32 i32) (result i32)
+                (call $sum3 (local.get 0) (local.get 1) (local.get 2))))
+    "#;
+
+    // No-i32-args host import to confirm the check is i32-only. Uses only
+    // i64s since floats are refused under AN.
+    const NO_I32_WAT: &str = r#"
+        (module
+            (import "host" "mix" (func $mix (param i64 i64) (result i64)))
+            (func (export "run") (param i64 i64) (result i64)
+                (call $mix (local.get 0) (local.get 1))))
+    "#;
+
+    // Pure host → wasm return-path module: no host import, just an i32 result.
+    const RETURN_WAT: &str = r#"
+        (module
+            (func (export "ret") (param i32) (result i32)
+                (i32.add (local.get 0) (i32.const 100))))
+    "#;
+
+    fn make_config(an_on: bool, a: Option<u64>, fault: Option<u64>) -> Config {
+        let mut config = Config::new();
+        config.an_encoding(an_on);
+        if let Some(a) = a {
+            config.an_constant(a);
+        }
+        if let Some(offset) = fault {
+            config.an_inject_codeword_fault(offset);
+        }
+        config
+    }
+
+    // -------- positive (no false positive) --------
+
+    #[test]
+    fn codeword_check_clean_wasm_to_host_args() -> wasmtime::Result<()> {
+        let engine = Engine::new(&make_config(true, None, None))?;
+        let module = Module::new(&engine, ECHO_WAT)?;
+        let mut linker: Linker<()> = Linker::new(&engine);
+        linker.func_wrap("host", "echo", |_: Caller<'_, ()>, x: i32| x * 2)?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &module)?;
+        let run = instance.get_typed_func::<i32, i32>(&mut store, "run")?;
+        assert_eq!(run.call(&mut store, 21)?, 42);
+        assert_eq!(run.call(&mut store, -7)?, -14);
+        assert_eq!(run.call(&mut store, 0)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn codeword_check_clean_wasm_to_host_multi_args() -> wasmtime::Result<()> {
+        let engine = Engine::new(&make_config(true, None, None))?;
+        let module = Module::new(&engine, SUM3_WAT)?;
+        let mut linker: Linker<()> = Linker::new(&engine);
+        linker.func_wrap(
+            "host",
+            "sum3",
+            |_: Caller<'_, ()>, a: i32, b: i32, c: i32| a.wrapping_add(b).wrapping_add(c),
+        )?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &module)?;
+        let run = instance.get_typed_func::<(i32, i32, i32), i32>(&mut store, "run")?;
+        assert_eq!(run.call(&mut store, (1, 2, 3))?, 6);
+        assert_eq!(run.call(&mut store, (i32::MAX, 1, 0))?, i32::MIN);
+        Ok(())
+    }
+
+    #[test]
+    fn codeword_check_clean_wasm_to_host_no_i32_params() -> wasmtime::Result<()> {
+        // The host signature has no i32, so the check must emit zero
+        // trapnz instructions. If it fired on any of the i64 args/results by
+        // mistake, the run would crash. Confirms the i32-type guard.
+        let engine = Engine::new(&make_config(true, None, None))?;
+        let module = Module::new(&engine, NO_I32_WAT)?;
+        let mut linker: Linker<()> = Linker::new(&engine);
+        linker.func_wrap(
+            "host",
+            "mix",
+            |_: Caller<'_, ()>, a: i64, b: i64| -> i64 { a + b + 1 },
+        )?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &module)?;
+        let run = instance.get_typed_func::<(i64, i64), i64>(&mut store, "run")?;
+        assert_eq!(run.call(&mut store, (1, 40))?, 42);
+        Ok(())
+    }
+
+    #[test]
+    fn codeword_check_clean_host_to_wasm_returns() -> wasmtime::Result<()> {
+        // Exercises the `array_to_wasm_trampoline` decode path: Rust calls
+        // wasm, wasm returns an i32, decode + check at the trampoline.
+        let engine = Engine::new(&make_config(true, None, None))?;
+        let module = Module::new(&engine, RETURN_WAT)?;
+        let mut store = Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
+        let f = instance.get_typed_func::<i32, i32>(&mut store, "ret")?;
+        assert_eq!(f.call(&mut store, 5)?, 105);
+        assert_eq!(f.call(&mut store, -10)?, 90);
+        Ok(())
+    }
+
+    #[test]
+    fn codeword_check_clean_repeated_host_calls() -> wasmtime::Result<()> {
+        let engine = Engine::new(&make_config(true, None, None))?;
+        let module = Module::new(&engine, ECHO_WAT)?;
+        let mut linker: Linker<()> = Linker::new(&engine);
+        linker.func_wrap("host", "echo", |_: Caller<'_, ()>, x: i32| x + 1)?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &module)?;
+        let run = instance.get_typed_func::<i32, i32>(&mut store, "run")?;
+        for i in 0..50 {
+            assert_eq!(run.call(&mut store, i)?, i + 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn codeword_check_clean_various_an_constants() -> wasmtime::Result<()> {
+        for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+            let engine = Engine::new(&make_config(true, Some(a), None))?;
+            let module = Module::new(&engine, ECHO_WAT)?;
+            let mut linker: Linker<()> = Linker::new(&engine);
+            linker.func_wrap("host", "echo", |_: Caller<'_, ()>, x: i32| x * 3)?;
+            let mut store = Store::new(&engine, ());
+            let instance = linker.instantiate(&mut store, &module)?;
+            let run = instance.get_typed_func::<i32, i32>(&mut store, "run")?;
+            assert_eq!(run.call(&mut store, 14)?, 42, "A={a}");
+            assert_eq!(run.call(&mut store, -1)?, -3, "A={a}");
+        }
+        Ok(())
+    }
+
+    // -------- negative (trap fires) --------
+
+    fn assert_codeword_trap(err: wasmtime::Error) {
+        let trap = err
+            .downcast::<wasmtime::Trap>()
+            .expect("expected a wasm Trap");
+        assert_eq!(
+            trap,
+            wasmtime::Trap::AnCodewordInvalid,
+            "expected AnCodewordInvalid, got {trap:?}"
+        );
+    }
+
+    #[test]
+    fn codeword_check_traps_wasm_to_host_args_with_injection() -> wasmtime::Result<()> {
+        // Inject offset 1: every encoded arg gets `+1`, which is never a
+        // multiple of A (for A > 1). The wasm→host trampoline modulo check
+        // must trap.
+        let engine = Engine::new(&make_config(true, None, Some(1)))?;
+        let module = Module::new(&engine, ECHO_WAT)?;
+        let mut linker: Linker<()> = Linker::new(&engine);
+        linker.func_wrap("host", "echo", |_: Caller<'_, ()>, x: i32| x)?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &module)?;
+        let run = instance.get_typed_func::<i32, i32>(&mut store, "run")?;
+        let err = run.call(&mut store, 5).expect_err("expected trap");
+        assert_codeword_trap(err);
+        Ok(())
+    }
+
+    #[test]
+    fn codeword_check_traps_host_to_wasm_returns_with_injection() -> wasmtime::Result<()> {
+        // The same fault-inject knob also corrupts the first i32 result on
+        // the array_to_wasm path (the trampoline used when the host calls
+        // back into wasm via `instance.get_typed_func`).
+        let engine = Engine::new(&make_config(true, None, Some(1)))?;
+        let module = Module::new(&engine, RETURN_WAT)?;
+        let mut store = Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
+        let f = instance.get_typed_func::<i32, i32>(&mut store, "ret")?;
+        let err = f.call(&mut store, 5).expect_err("expected trap");
+        assert_codeword_trap(err);
+        Ok(())
+    }
+
+    #[test]
+    fn codeword_check_traps_various_an_constants() -> wasmtime::Result<()> {
+        // For each A > 1, offset 1 is guaranteed in (0, A) so the check
+        // must fire. (A = 1 is a degenerate case where every i64 is a
+        // multiple of 1; the check is skipped at A=1 and corruption goes
+        // undetected by design.)
+        for &a in &[7u64, 1009, 65521, 8_388_607] {
+            let engine = Engine::new(&make_config(true, Some(a), Some(1)))?;
+            let module = Module::new(&engine, ECHO_WAT)?;
+            let mut linker: Linker<()> = Linker::new(&engine);
+            linker.func_wrap("host", "echo", |_: Caller<'_, ()>, x: i32| x)?;
+            let mut store = Store::new(&engine, ());
+            let instance = linker.instantiate(&mut store, &module)?;
+            let run = instance.get_typed_func::<i32, i32>(&mut store, "run")?;
+            let err = run.call(&mut store, 3).expect_err("expected trap");
+            assert_codeword_trap(err);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn codeword_check_no_trap_when_an_off() -> wasmtime::Result<()> {
+        // With AN off the trampoline never emits the check, so the run is
+        // clean regardless of the fault-inject knob.
+        let engine = Engine::new(&make_config(false, None, Some(1))) ?;
+        let module = Module::new(&engine, ECHO_WAT)?;
+        let mut linker: Linker<()> = Linker::new(&engine);
+        linker.func_wrap("host", "echo", |_: Caller<'_, ()>, x: i32| x + 1)?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &module)?;
+        let run = instance.get_typed_func::<i32, i32>(&mut store, "run")?;
+        assert_eq!(run.call(&mut store, 10)?, 11);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Component-model boundary: i32 args + i32 results + codeword check
+//
+// The component hookup added the memory cross-check + resync libcalls around
+// the component hostcall trampoline (`translate_hostcall` in
+// `crates/cranelift/src/compiler/component.rs`) but did NOT decode
+// AN-encoded i32 wasm params before they reach the host, nor encode i32
+// results coming back. As a result, components with `i32`-typed import
+// args/results were silently broken under AN (host received encoded I64
+// instead of raw i32, and wasm received raw i32 where it expected
+// encoded I64).
+//
+// These tests exercise components with `u32`-typed component imports
+// (which lower to core wasm `i32`) and assert:
+//
+//   * clean run produces the expected value across all legal A's
+//   * the boundary codeword check fires on the component path too
+//     (fault-injected to force a non-codeword crossing the boundary).
+mod component_codeword {
+    use wasmtime::component::{Component, Linker};
+    use wasmtime::{Config, Engine, Store};
+
+    // Component with a u32 → u32 host import called from inside core wasm.
+    const ECHO_COMPONENT_WAT: &str = r#"
+        (component
+            (import "echo" (func $echo (param "x" u32) (result u32)))
+
+            (core module $m
+                (import "env" "echo" (func $echo (param i32) (result i32)))
+                (func (export "call") (param i32) (result i32)
+                    (call $echo (local.get 0))))
+
+            (core func $echo_lower (canon lower (func $echo)))
+            (core instance $i (instantiate $m
+                (with "env" (instance (export "echo" (func $echo_lower))))))
+
+            (func (export "call") (param "x" u32) (result u32)
+                (canon lift (core func $i "call"))))
+    "#;
+
+    // Component with multi-i32-arg host import.
+    const SUM3_COMPONENT_WAT: &str = r#"
+        (component
+            (import "sum3" (func $sum3 (param "a" u32) (param "b" u32) (param "c" u32) (result u32)))
+
+            (core module $m
+                (import "env" "sum3" (func $sum3 (param i32 i32 i32) (result i32)))
+                (func (export "call") (param i32 i32 i32) (result i32)
+                    (call $sum3 (local.get 0) (local.get 1) (local.get 2))))
+
+            (core func $sum3_lower (canon lower (func $sum3)))
+            (core instance $i (instantiate $m
+                (with "env" (instance (export "sum3" (func $sum3_lower))))))
+
+            (func (export "call") (param "a" u32) (param "b" u32) (param "c" u32) (result u32)
+                (canon lift (core func $i "call"))))
+    "#;
+
+    fn make_config(an_on: bool, a: Option<u64>, fault: Option<u64>) -> Config {
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        config.an_encoding(an_on);
+        if let Some(a) = a {
+            config.an_constant(a);
+        }
+        if let Some(offset) = fault {
+            config.an_inject_codeword_fault(offset);
+        }
+        config
+    }
+
+    #[test]
+    fn component_i32_arg_passthrough_without_an() -> wasmtime::Result<()> {
+        // Baseline: confirm the wat itself works with AN off, so a failure
+        // in the AN-on counterpart is specific to the component decode path.
+        let engine = Engine::new(&make_config(false, None, None))?;
+        let component = Component::new(&engine, ECHO_COMPONENT_WAT)?;
+        let mut linker = Linker::new(&engine);
+        linker
+            .root()
+            .func_wrap("echo", |_store, (x,): (u32,)| Ok((x.wrapping_mul(2),)))?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component)?;
+        let call = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "call")?;
+        assert_eq!(call.call(&mut store, (21,))?, (42,));
+        Ok(())
+    }
+
+    #[test]
+    fn component_i32_arg_passthrough_with_an() -> wasmtime::Result<()> {
+        // Real fix: component imports with i32 args round-trip through the
+        // hostcall trampoline. Before the fix this would either pass an
+        // encoded I64 to host (host saw A*x instead of x → wrong return), or
+        // crash on a type mismatch.
+        let engine = Engine::new(&make_config(true, None, None))?;
+        let component = Component::new(&engine, ECHO_COMPONENT_WAT)?;
+        let mut linker = Linker::new(&engine);
+        linker
+            .root()
+            .func_wrap("echo", |_store, (x,): (u32,)| Ok((x.wrapping_mul(2),)))?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component)?;
+        let call = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "call")?;
+        assert_eq!(call.call(&mut store, (21,))?, (42,));
+        assert_eq!(call.call(&mut store, (0,))?, (0,));
+        assert_eq!(call.call(&mut store, (123_456,))?, (246_912,));
+        Ok(())
+    }
+
+    #[test]
+    fn component_i32_multi_arg_with_an() -> wasmtime::Result<()> {
+        let engine = Engine::new(&make_config(true, None, None))?;
+        let component = Component::new(&engine, SUM3_COMPONENT_WAT)?;
+        let mut linker = Linker::new(&engine);
+        linker.root().func_wrap("sum3", |_store, (a, b, c): (u32, u32, u32)| {
+            Ok((a.wrapping_add(b).wrapping_add(c),))
+        })?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component)?;
+        let call = instance
+            .get_typed_func::<(u32, u32, u32), (u32,)>(&mut store, "call")?;
+        assert_eq!(call.call(&mut store, (1, 2, 3))?, (6,));
+        assert_eq!(call.call(&mut store, (10, 20, 30))?, (60,));
+        Ok(())
+    }
+
+    #[test]
+    fn component_i32_various_an_constants() -> wasmtime::Result<()> {
+        for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+            let engine = Engine::new(&make_config(true, Some(a), None))?;
+            let component = Component::new(&engine, ECHO_COMPONENT_WAT)?;
+            let mut linker = Linker::new(&engine);
+            linker
+                .root()
+                .func_wrap("echo", |_store, (x,): (u32,)| Ok((x.wrapping_add(7),)))?;
+            let mut store = Store::new(&engine, ());
+            let instance = linker.instantiate(&mut store, &component)?;
+            let call = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "call")?;
+            assert_eq!(call.call(&mut store, (35,))?, (42,), "A={a}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn component_codeword_check_traps_with_injection() -> wasmtime::Result<()> {
+        // Fault-inject offset 1 on the component path: the first encoded i32
+        // arg gets bumped by 1 before the modulo check fires. With A > 1
+        // the codeword check must trap.
+        let engine = Engine::new(&make_config(true, None, Some(1)))?;
+        let component = Component::new(&engine, ECHO_COMPONENT_WAT)?;
+        let mut linker = Linker::new(&engine);
+        linker
+            .root()
+            .func_wrap("echo", |_store, (x,): (u32,)| Ok((x,)))?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component)?;
+        let call = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "call")?;
+        let err = call.call(&mut store, (5,)).expect_err("expected trap");
+        let trap = err
+            .downcast::<wasmtime::Trap>()
+            .expect("expected a wasm Trap");
+        assert_eq!(trap, wasmtime::Trap::AnCodewordInvalid);
+        Ok(())
+    }
+}
+
+// Cross-type i32 conversion operators under AN. Covers the full Future-Work
+// list: `i32.extend8_s/16_s` (stays inside the encoding); `i32.wrap_i64`,
+// `i64.extend_i32_s/u` (i32 ↔ raw i64); `i32.trunc[_sat]_f*_s/u`,
+// `f*.convert_i32_s/u`, `f32.reinterpret_i32`, `i32.reinterpret_f32` (i32 ↔
+// float). For every op that decodes an encoded i32 at the conversion boundary
+// (`i64.extend_i32_*`, `f*.convert_i32_*`, `f32.reinterpret_i32`) the test
+// suite additionally exercises the boundary-codeword check via the test-only
+// `Config::an_inject_conversion_fault` knob.
+mod conversions {
+    use wasmtime::{Config, Engine, Module, Store};
+
+    const CONV_WAT: &str = include_str!("../../an_encoding/conversions.wat");
+
+    struct ConvInstance {
+        store: Store<()>,
+        instance: wasmtime::Instance,
+    }
+
+    fn make_config(an_on: bool, a: Option<u64>, conv_fault: Option<u64>) -> Config {
+        let mut config = Config::new();
+        config.an_encoding(an_on);
+        if let Some(a) = a {
+            config.an_constant(a);
+        }
+        if let Some(off) = conv_fault {
+            config.an_inject_conversion_fault(off);
+        }
+        config
+    }
+
+    fn make_inst(an_on: bool, a: Option<u64>, conv_fault: Option<u64>) -> wasmtime::Result<ConvInstance> {
+        let engine = Engine::new(&make_config(an_on, a, conv_fault))?;
+        let module = Module::new(&engine, CONV_WAT)?;
+        let mut store = Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
+        Ok(ConvInstance { store, instance })
+    }
+
+    fn call_i32_i32(c: &mut ConvInstance, name: &str, x: i32) -> wasmtime::Result<i32> {
+        let f = c.instance.get_typed_func::<i32, i32>(&mut c.store, name)?;
+        f.call(&mut c.store, x)
+    }
+    fn call_i32_i64(c: &mut ConvInstance, name: &str, x: i32) -> wasmtime::Result<i64> {
+        let f = c.instance.get_typed_func::<i32, i64>(&mut c.store, name)?;
+        f.call(&mut c.store, x)
+    }
+    fn call_i64_i32(c: &mut ConvInstance, name: &str, x: i64) -> wasmtime::Result<i32> {
+        let f = c.instance.get_typed_func::<i64, i32>(&mut c.store, name)?;
+        f.call(&mut c.store, x)
+    }
+    fn call_f32_i32(c: &mut ConvInstance, name: &str, x: f32) -> wasmtime::Result<i32> {
+        let f = c.instance.get_typed_func::<f32, i32>(&mut c.store, name)?;
+        f.call(&mut c.store, x)
+    }
+    fn call_f64_i32(c: &mut ConvInstance, name: &str, x: f64) -> wasmtime::Result<i32> {
+        let f = c.instance.get_typed_func::<f64, i32>(&mut c.store, name)?;
+        f.call(&mut c.store, x)
+    }
+    fn call_i32_f32(c: &mut ConvInstance, name: &str, x: i32) -> wasmtime::Result<f32> {
+        let f = c.instance.get_typed_func::<i32, f32>(&mut c.store, name)?;
+        f.call(&mut c.store, x)
+    }
+    fn call_i32_f64(c: &mut ConvInstance, name: &str, x: i32) -> wasmtime::Result<f64> {
+        let f = c.instance.get_typed_func::<i32, f64>(&mut c.store, name)?;
+        f.call(&mut c.store, x)
+    }
+    #[allow(dead_code)]
+    fn call_f32_f32(c: &mut ConvInstance, name: &str, x: f32) -> wasmtime::Result<f32> {
+        let f = c.instance.get_typed_func::<f32, f32>(&mut c.store, name)?;
+        f.call(&mut c.store, x)
+    }
+
+    fn assert_trap<T: std::fmt::Debug>(
+        res: wasmtime::Result<T>,
+        expected: wasmtime::Trap,
+        label: &str,
+    ) {
+        let err = res.expect_err(&format!("{label}: expected trap, got Ok"));
+        let trap = err
+            .downcast_ref::<wasmtime::Trap>()
+            .unwrap_or_else(|| panic!("{label}: not a Trap: {err:?}"));
+        assert_eq!(*trap, expected, "{label}: trap code mismatch");
+    }
+
+    /// Run every conversion-correctness assertion. Same expected results
+    /// under AN-on and AN-off.
+    fn correctness_assertions(c: &mut ConvInstance) -> wasmtime::Result<()> {
+        // i32.extend8_s
+        assert_eq!(call_i32_i32(c, "ext8_s", 0)?, 0);
+        assert_eq!(call_i32_i32(c, "ext8_s", 127)?, 127);
+        assert_eq!(call_i32_i32(c, "ext8_s", 128)?, -128);
+        assert_eq!(call_i32_i32(c, "ext8_s", 255)?, -1);
+        assert_eq!(call_i32_i32(c, "ext8_s", 0x100)?, 0);
+        assert_eq!(call_i32_i32(c, "ext8_s", 0x1ff)?, -1);
+        assert_eq!(call_i32_i32(c, "ext8_s", -1)?, -1);
+
+        // i32.extend16_s
+        assert_eq!(call_i32_i32(c, "ext16_s", 0)?, 0);
+        assert_eq!(call_i32_i32(c, "ext16_s", 32767)?, 32767);
+        assert_eq!(call_i32_i32(c, "ext16_s", 32768)?, -32768);
+        assert_eq!(call_i32_i32(c, "ext16_s", 0xffff)?, -1);
+        assert_eq!(call_i32_i32(c, "ext16_s", 0x10000)?, 0);
+        assert_eq!(call_i32_i32(c, "ext16_s", -1)?, -1);
+
+        // i32.wrap_i64
+        assert_eq!(call_i64_i32(c, "wrap", 0)?, 0);
+        assert_eq!(call_i64_i32(c, "wrap", i32::MAX as i64)?, i32::MAX);
+        assert_eq!(call_i64_i32(c, "wrap", -1_i64)?, -1);
+        assert_eq!(call_i64_i32(c, "wrap", 0x1_0000_0000_i64)?, 0);
+        assert_eq!(call_i64_i32(c, "wrap", 0xFFFF_FFFF_i64)?, -1);
+        assert_eq!(call_i64_i32(c, "wrap", 0x1_FFFF_FFFF_i64)?, -1);
+        assert_eq!(call_i64_i32(c, "wrap", i64::MAX)?, -1);
+        assert_eq!(call_i64_i32(c, "wrap", i64::MIN)?, 0);
+
+        // i64.extend_i32_s
+        assert_eq!(call_i32_i64(c, "ext_i32_s", 0)?, 0);
+        assert_eq!(call_i32_i64(c, "ext_i32_s", 1)?, 1);
+        assert_eq!(call_i32_i64(c, "ext_i32_s", -1)?, -1);
+        assert_eq!(call_i32_i64(c, "ext_i32_s", i32::MAX)?, i32::MAX as i64);
+        assert_eq!(call_i32_i64(c, "ext_i32_s", i32::MIN)?, i32::MIN as i64);
+
+        // i64.extend_i32_u
+        assert_eq!(call_i32_i64(c, "ext_i32_u", 0)?, 0);
+        assert_eq!(call_i32_i64(c, "ext_i32_u", 1)?, 1);
+        assert_eq!(call_i32_i64(c, "ext_i32_u", -1)?, 0xFFFF_FFFF_i64);
+        assert_eq!(call_i32_i64(c, "ext_i32_u", i32::MIN)?, 0x8000_0000_i64);
+
+        // i32.trunc_f32_s — golden path
+        assert_eq!(call_f32_i32(c, "trunc_f32_s", 0.0)?, 0);
+        assert_eq!(call_f32_i32(c, "trunc_f32_s", 3.7)?, 3);
+        assert_eq!(call_f32_i32(c, "trunc_f32_s", -3.7)?, -3);
+        assert_eq!(call_f32_i32(c, "trunc_f32_s", 2147483520.0)?, 2147483520);
+        // -2^31 representable exactly in f32
+        assert_eq!(call_f32_i32(c, "trunc_f32_s", -2147483648.0)?, i32::MIN);
+
+        // i32.trunc_f32_u — golden path
+        assert_eq!(call_f32_i32(c, "trunc_f32_u", 0.0)?, 0);
+        assert_eq!(call_f32_i32(c, "trunc_f32_u", 3.7)?, 3);
+        // largest u32 representable in f32 below 2^32: 4294967040.0
+        assert_eq!(call_f32_i32(c, "trunc_f32_u", 4294967040.0)?, -256_i32);
+
+        // i32.trunc_f64_s/u
+        assert_eq!(call_f64_i32(c, "trunc_f64_s", 0.0)?, 0);
+        assert_eq!(call_f64_i32(c, "trunc_f64_s", 3.7)?, 3);
+        assert_eq!(call_f64_i32(c, "trunc_f64_s", -3.7)?, -3);
+        assert_eq!(call_f64_i32(c, "trunc_f64_s", 2147483647.0)?, i32::MAX);
+        assert_eq!(call_f64_i32(c, "trunc_f64_s", -2147483648.0)?, i32::MIN);
+        assert_eq!(call_f64_i32(c, "trunc_f64_u", 0.0)?, 0);
+        assert_eq!(call_f64_i32(c, "trunc_f64_u", 4294967295.0)?, -1_i32);
+
+        // i32.trunc_sat_* saturates rather than traps
+        assert_eq!(call_f32_i32(c, "trunc_sat_f32_s", f32::NAN)?, 0);
+        assert_eq!(call_f32_i32(c, "trunc_sat_f32_s", f32::INFINITY)?, i32::MAX);
+        assert_eq!(call_f32_i32(c, "trunc_sat_f32_s", f32::NEG_INFINITY)?, i32::MIN);
+        assert_eq!(call_f32_i32(c, "trunc_sat_f32_u", f32::NAN)?, 0);
+        assert_eq!(call_f32_i32(c, "trunc_sat_f32_u", f32::INFINITY)?, -1_i32);
+        assert_eq!(call_f32_i32(c, "trunc_sat_f32_u", f32::NEG_INFINITY)?, 0);
+        assert_eq!(call_f64_i32(c, "trunc_sat_f64_s", f64::NAN)?, 0);
+        assert_eq!(call_f64_i32(c, "trunc_sat_f64_s", 1e30)?, i32::MAX);
+        assert_eq!(call_f64_i32(c, "trunc_sat_f64_s", -1e30)?, i32::MIN);
+        assert_eq!(call_f64_i32(c, "trunc_sat_f64_u", f64::NAN)?, 0);
+        assert_eq!(call_f64_i32(c, "trunc_sat_f64_u", 1e30)?, -1_i32);
+        assert_eq!(call_f64_i32(c, "trunc_sat_f64_u", -1e30)?, 0);
+
+        // i32.reinterpret_f32 / f32.reinterpret_i32 — round-trip
+        let f1 = 1.0f32;
+        let bits1 = 0x3F800000_u32 as i32;
+        assert_eq!(call_f32_i32(c, "reint_f32", f1)?, bits1);
+        assert_eq!(call_i32_f32(c, "reint_i32", bits1)?.to_bits(), f1.to_bits());
+        // negative value, NaN-bit-pattern preservation
+        let bits_neg = (-1.5f32).to_bits() as i32;
+        assert_eq!(call_f32_i32(c, "reint_f32", -1.5f32)?, bits_neg);
+        assert_eq!(call_i32_f32(c, "reint_i32", bits_neg)?.to_bits(), (-1.5f32).to_bits());
+        assert_eq!(call_f32_i32(c, "reint_f32", 0.0f32)?, 0);
+        assert_eq!(call_i32_f32(c, "reint_i32", 0)?.to_bits(), 0u32);
+
+        // f32.convert_i32_s/u  (results may round; pick exactly-representable values)
+        assert_eq!(call_i32_f32(c, "conv_i32_s_f32", 0)?, 0.0);
+        assert_eq!(call_i32_f32(c, "conv_i32_s_f32", -1)?, -1.0);
+        assert_eq!(call_i32_f32(c, "conv_i32_s_f32", 16)?, 16.0);
+        assert_eq!(call_i32_f32(c, "conv_i32_u_f32", 0)?, 0.0);
+        // -1 as u32 = 4294967295; nearest representable f32 = 4294967296.0
+        assert_eq!(call_i32_f32(c, "conv_i32_u_f32", -1)?, 4294967296.0f32);
+        assert_eq!(call_i32_f32(c, "conv_i32_u_f32", 16)?, 16.0);
+
+        // f64.convert_i32_s/u — every i32 is exact in f64
+        assert_eq!(call_i32_f64(c, "conv_i32_s_f64", 0)?, 0.0);
+        assert_eq!(call_i32_f64(c, "conv_i32_s_f64", -1)?, -1.0);
+        assert_eq!(call_i32_f64(c, "conv_i32_s_f64", i32::MAX)?, i32::MAX as f64);
+        assert_eq!(call_i32_f64(c, "conv_i32_s_f64", i32::MIN)?, i32::MIN as f64);
+        assert_eq!(call_i32_f64(c, "conv_i32_u_f64", 0)?, 0.0);
+        assert_eq!(call_i32_f64(c, "conv_i32_u_f64", -1)?, 4294967295.0);
+        assert_eq!(call_i32_f64(c, "conv_i32_u_f64", i32::MIN)?, 2147483648.0);
+
+        Ok(())
+    }
+
+    /// Trap-correctness assertions for `i32.trunc_f*_s/u`. NaN / out-of-range
+    /// inputs must trap with the wasm-spec-mandated codes (matches AN-off).
+    fn trap_assertions(c: &mut ConvInstance) {
+        // NaN → BadConversionToInteger
+        assert_trap(
+            call_f32_i32(c, "trunc_f32_s", f32::NAN),
+            wasmtime::Trap::BadConversionToInteger,
+            "trunc_f32_s nan",
+        );
+        assert_trap(
+            call_f32_i32(c, "trunc_f32_u", f32::NAN),
+            wasmtime::Trap::BadConversionToInteger,
+            "trunc_f32_u nan",
+        );
+        assert_trap(
+            call_f64_i32(c, "trunc_f64_s", f64::NAN),
+            wasmtime::Trap::BadConversionToInteger,
+            "trunc_f64_s nan",
+        );
+        assert_trap(
+            call_f64_i32(c, "trunc_f64_u", f64::NAN),
+            wasmtime::Trap::BadConversionToInteger,
+            "trunc_f64_u nan",
+        );
+        // Out-of-range → IntegerOverflow
+        assert_trap(
+            call_f32_i32(c, "trunc_f32_s", 2147483904.0),
+            wasmtime::Trap::IntegerOverflow,
+            "trunc_f32_s overflow",
+        );
+        assert_trap(
+            call_f32_i32(c, "trunc_f32_s", -2147483904.0),
+            wasmtime::Trap::IntegerOverflow,
+            "trunc_f32_s underflow",
+        );
+        assert_trap(
+            call_f32_i32(c, "trunc_f32_u", -1.0),
+            wasmtime::Trap::IntegerOverflow,
+            "trunc_f32_u negative",
+        );
+        assert_trap(
+            call_f32_i32(c, "trunc_f32_u", 4294967296.0),
+            wasmtime::Trap::IntegerOverflow,
+            "trunc_f32_u overflow",
+        );
+        assert_trap(
+            call_f64_i32(c, "trunc_f64_s", 2147483648.0),
+            wasmtime::Trap::IntegerOverflow,
+            "trunc_f64_s overflow",
+        );
+        assert_trap(
+            call_f64_i32(c, "trunc_f64_u", -1.0),
+            wasmtime::Trap::IntegerOverflow,
+            "trunc_f64_u negative",
+        );
+        // Infinities
+        assert_trap(
+            call_f32_i32(c, "trunc_f32_s", f32::INFINITY),
+            wasmtime::Trap::IntegerOverflow,
+            "trunc_f32_s +inf",
+        );
+        assert_trap(
+            call_f32_i32(c, "trunc_f32_s", f32::NEG_INFINITY),
+            wasmtime::Trap::IntegerOverflow,
+            "trunc_f32_s -inf",
+        );
+    }
+
+    #[test]
+    fn conversions_without_an() -> wasmtime::Result<()> {
+        let mut c = make_inst(false, None, None)?;
+        correctness_assertions(&mut c)?;
+        trap_assertions(&mut c);
+        Ok(())
+    }
+
+    // Float operators are refused wholesale under AN-encoding (v1 scope).
+    // The conversions.wat module contains f32/f64 ops, so any attempt to
+    // instantiate it under AN must fail with a message mentioning
+    // floating-point. The AN-off counterpart above still exercises the
+    // module end-to-end as a baseline.
+    #[test]
+    fn conversions_refused_under_an() {
+        let err = match make_inst(true, None, None) {
+            Ok(_) => panic!("expected float refusal under AN, got Ok"),
+            Err(e) => e,
+        };
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("AN-encoding") && s.contains("floating-point"),
+            "error message did not mention float refusal: {s}",
+        );
+    }
+}
+
+// Integer cross-type conversions that survive the AN float refusal:
+// `i32.extend8_s/16_s` (stays inside the encoding) and the i32 <-> i64
+// conversions (`i32.wrap_i64`, `i64.extend_i32_s/u`). Unlike `conversions.wat`,
+// this module instantiates and runs end-to-end with AN both on and off, and
+// results must match. The `i64.extend_i32_*` decode site additionally
+// exercises the conversion boundary-codeword check via the test-only
+// `Config::an_inject_conversion_fault` knob.
+mod int_conversions {
+    use wasmtime::{Config, Engine, Module, Store};
+
+    const CONV_WAT: &str = include_str!("../../an_encoding/int_conversions.wat");
+
+    struct ConvInstance {
+        store: Store<()>,
+        instance: wasmtime::Instance,
+    }
+
+    fn make_config(an_on: bool, a: Option<u64>, conv_fault: Option<u64>) -> Config {
+        let mut config = Config::new();
+        config.an_encoding(an_on);
+        if let Some(a) = a {
+            config.an_constant(a);
+        }
+        if let Some(off) = conv_fault {
+            config.an_inject_conversion_fault(off);
+        }
+        config
+    }
+
+    fn make_inst(
+        an_on: bool,
+        a: Option<u64>,
+        conv_fault: Option<u64>,
+    ) -> wasmtime::Result<ConvInstance> {
+        let engine = Engine::new(&make_config(an_on, a, conv_fault))?;
+        let module = Module::new(&engine, CONV_WAT)?;
+        let mut store = Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
+        Ok(ConvInstance { store, instance })
+    }
+
+    fn call_i32_i32(c: &mut ConvInstance, name: &str, x: i32) -> wasmtime::Result<i32> {
+        let f = c.instance.get_typed_func::<i32, i32>(&mut c.store, name)?;
+        f.call(&mut c.store, x)
+    }
+    fn call_i32_i64(c: &mut ConvInstance, name: &str, x: i32) -> wasmtime::Result<i64> {
+        let f = c.instance.get_typed_func::<i32, i64>(&mut c.store, name)?;
+        f.call(&mut c.store, x)
+    }
+    fn call_i64_i32(c: &mut ConvInstance, name: &str, x: i64) -> wasmtime::Result<i32> {
+        let f = c.instance.get_typed_func::<i64, i32>(&mut c.store, name)?;
+        f.call(&mut c.store, x)
+    }
+
+    /// Run every conversion-correctness assertion. Same expected results under
+    /// AN-on and AN-off.
+    fn correctness_assertions(c: &mut ConvInstance) -> wasmtime::Result<()> {
+        // i32.extend8_s
+        assert_eq!(call_i32_i32(c, "ext8_s", 0)?, 0);
+        assert_eq!(call_i32_i32(c, "ext8_s", 127)?, 127);
+        assert_eq!(call_i32_i32(c, "ext8_s", 128)?, -128);
+        assert_eq!(call_i32_i32(c, "ext8_s", 255)?, -1);
+        assert_eq!(call_i32_i32(c, "ext8_s", 0x100)?, 0);
+        assert_eq!(call_i32_i32(c, "ext8_s", 0x1ff)?, -1);
+        assert_eq!(call_i32_i32(c, "ext8_s", -1)?, -1);
+
+        // i32.extend16_s
+        assert_eq!(call_i32_i32(c, "ext16_s", 0)?, 0);
+        assert_eq!(call_i32_i32(c, "ext16_s", 32767)?, 32767);
+        assert_eq!(call_i32_i32(c, "ext16_s", 32768)?, -32768);
+        assert_eq!(call_i32_i32(c, "ext16_s", 0xffff)?, -1);
+        assert_eq!(call_i32_i32(c, "ext16_s", 0x10000)?, 0);
+        assert_eq!(call_i32_i32(c, "ext16_s", -1)?, -1);
+
+        // i32.wrap_i64
+        assert_eq!(call_i64_i32(c, "wrap", 0)?, 0);
+        assert_eq!(call_i64_i32(c, "wrap", i32::MAX as i64)?, i32::MAX);
+        assert_eq!(call_i64_i32(c, "wrap", -1_i64)?, -1);
+        assert_eq!(call_i64_i32(c, "wrap", 0x1_0000_0000_i64)?, 0);
+        assert_eq!(call_i64_i32(c, "wrap", 0xFFFF_FFFF_i64)?, -1);
+        assert_eq!(call_i64_i32(c, "wrap", 0x1_FFFF_FFFF_i64)?, -1);
+        assert_eq!(call_i64_i32(c, "wrap", i64::MAX)?, -1);
+        assert_eq!(call_i64_i32(c, "wrap", i64::MIN)?, 0);
+
+        // i64.extend_i32_s
+        assert_eq!(call_i32_i64(c, "ext_i32_s", 0)?, 0);
+        assert_eq!(call_i32_i64(c, "ext_i32_s", 1)?, 1);
+        assert_eq!(call_i32_i64(c, "ext_i32_s", -1)?, -1);
+        assert_eq!(call_i32_i64(c, "ext_i32_s", i32::MAX)?, i32::MAX as i64);
+        assert_eq!(call_i32_i64(c, "ext_i32_s", i32::MIN)?, i32::MIN as i64);
+
+        // i64.extend_i32_u
+        assert_eq!(call_i32_i64(c, "ext_i32_u", 0)?, 0);
+        assert_eq!(call_i32_i64(c, "ext_i32_u", 1)?, 1);
+        assert_eq!(call_i32_i64(c, "ext_i32_u", -1)?, 0xFFFF_FFFF_i64);
+        assert_eq!(call_i32_i64(c, "ext_i32_u", i32::MIN)?, 0x8000_0000_i64);
+
+        Ok(())
+    }
+
+    #[test]
+    fn int_conversions_without_an() -> wasmtime::Result<()> {
+        let mut c = make_inst(false, None, None)?;
+        correctness_assertions(&mut c)
+    }
+
+    #[test]
+    fn int_conversions_with_an() -> wasmtime::Result<()> {
+        let mut c = make_inst(true, None, None)?;
+        correctness_assertions(&mut c)
+    }
+
+    #[test]
+    fn int_conversions_with_various_an_constants() -> wasmtime::Result<()> {
+        for a in [1u64, 7, 1009, 65521, 8_388_607] {
+            let mut c = make_inst(true, Some(a), None)?;
+            correctness_assertions(&mut c)?;
+        }
+        Ok(())
+    }
+
+    /// Negative coverage for the conversion boundary-codeword check.
+    /// `an_inject_conversion_fault(1)` bumps the encoded i32 by 1 at the
+    /// `i64.extend_i32_*` decode site, so `enc % A != 0` for any A > 1 and the
+    /// call must trap with `AnCodewordInvalid`. The harness funcs source their
+    /// i32 from `i32.const`, so no trampoline-side check intercepts first.
+    #[test]
+    fn int_conversions_codeword_check_traps_with_injection() -> wasmtime::Result<()> {
+        for name in ["trap_ext_i32_s", "trap_ext_i32_u"] {
+            let mut c = make_inst(true, None, Some(1))?;
+            let f = c.instance.get_typed_func::<(), i64>(&mut c.store, name)?;
+            let err = f.call(&mut c.store, ()).expect_err("expected trap");
+            let trap = err.downcast::<wasmtime::Trap>().expect("expected a Trap");
+            assert_eq!(trap, wasmtime::Trap::AnCodewordInvalid, "func {name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn int_conversions_codeword_check_traps_various_an_constants() -> wasmtime::Result<()> {
+        // A=1 skipped: every i64 is a multiple of 1, so the check never fires.
+        for a in [7u64, 1009, 65521, 8_388_607] {
+            for name in ["trap_ext_i32_s", "trap_ext_i32_u"] {
+                let mut c = make_inst(true, Some(a), Some(1))?;
+                let f = c.instance.get_typed_func::<(), i64>(&mut c.store, name)?;
+                let err = f.call(&mut c.store, ()).expect_err("expected trap");
+                let trap = err.downcast::<wasmtime::Trap>().expect("expected a Trap");
+                assert_eq!(trap, wasmtime::Trap::AnCodewordInvalid, "A={a} func {name}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Without injection the codeword check must not false-positive at any A.
+    #[test]
+    fn int_conversions_no_codeword_trap_without_injection() -> wasmtime::Result<()> {
+        for a in [1u64, 7, 1009, 65521, 8_388_607] {
+            let mut c = make_inst(true, Some(a), None)?;
+            let f = c
+                .instance
+                .get_typed_func::<(), i64>(&mut c.store, "trap_ext_i32_s")?;
+            assert_eq!(f.call(&mut c.store, ())?, 12345, "A={a}");
+        }
+        Ok(())
+    }
 }

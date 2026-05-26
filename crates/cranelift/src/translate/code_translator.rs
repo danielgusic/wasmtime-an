@@ -76,8 +76,10 @@ use crate::bounds_checks::{BoundsCheck, bounds_check_and_compute_addr};
 use crate::func_environ::{Extension, FuncEnvironment};
 use crate::translate::TargetEnvironment;
 use crate::translate::an_helpers::{
-    AnBitwiseOp, emit_an_bitwise_i32, emit_an_shl_i32, emit_an_shr_u_i32, udiv_u128_by_u64_const,
-    umod_u128_by_u64_const_to_i64,
+    AnBitwiseOp, emit_an_bitwise_i32, emit_an_conversion_decode_i32, emit_an_enc_base_pointer,
+    emit_an_enc_offset_from_effective_addr, emit_an_encode_raw_i32, emit_an_load_validity_check,
+    emit_an_multi_byte_decomposed_store, emit_an_shl_i32, emit_an_shr_u_i32, encode_wasm_i32_bool,
+    encode_wasm_i32_raw, udiv_u128_by_u64_const, umod_u128_by_u64_const_to_i64,
 };
 use crate::translate::environ::StructFieldsVec;
 use crate::translate::stack::{ControlStackFrame, ElseData};
@@ -738,9 +740,15 @@ pub fn translate_operator(
             // `table_index` is the index of the table to search the function
             // in.
             let type_index = TypeIndex::from_u32(*type_index);
+            let table = TableIndex::from_u32(*table_index);
             let sigref = environ.get_or_create_sig_ref(builder.func, type_index);
             let num_args = environ.num_params_for_function_type(type_index);
-            let callee = environ.stacks.pop1();
+            let mut callee = environ.stacks.pop1();
+            // AN-encoding: the callee table index is a wasm i32 (on i32-indexed
+            // tables); decode it before the indirect-call lowering, which
+            // expects a raw index. For i64-indexed tables the value passes
+            // through unchanged.
+            callee = an_decode_if_i32_table_index(builder, environ, table, callee);
 
             // Bitcast any vector arguments to their default type, I8X16, before calling.
             let mut args = environ.stacks.peekn(num_args).to_vec();
@@ -750,7 +758,7 @@ pub fn translate_operator(
                 builder,
                 environ.next_srcloc,
                 validator.features(),
-                TableIndex::from_u32(*table_index),
+                table,
                 type_index,
                 sigref,
                 callee,
@@ -804,9 +812,12 @@ pub fn translate_operator(
             // `table_index` is the index of the table to search the function
             // in.
             let type_index = TypeIndex::from_u32(*type_index);
+            let table = TableIndex::from_u32(*table_index);
             let sigref = environ.get_or_create_sig_ref(builder.func, type_index);
             let num_args = environ.num_params_for_function_type(type_index);
-            let callee = environ.stacks.pop1();
+            let mut callee = environ.stacks.pop1();
+            // AN-encoding: see `Operator::CallIndirect`.
+            callee = an_decode_if_i32_table_index(builder, environ, table, callee);
 
             // Bitcast any vector arguments to their default type, I8X16, before calling.
             let mut args = environ.stacks.peekn(num_args).to_vec();
@@ -816,7 +827,7 @@ pub fn translate_operator(
                 builder,
                 srcloc,
                 validator.features(),
-                TableIndex::from_u32(*table_index),
+                table,
                 type_index,
                 sigref,
                 callee,
@@ -853,15 +864,18 @@ pub fn translate_operator(
             // argument to be a memory index.
             let mem = MemoryIndex::from_u32(*mem);
             let _heap = environ.get_or_create_heap(builder.func, mem);
-            let val = environ.stacks.pop1();
+            let mut val = environ.stacks.pop1();
+            val = an_decode_if_i32_index(builder, environ, mem, val);
             environ.before_memory_grow(builder, val, mem);
-            let result = environ.translate_memory_grow(builder, mem, val)?;
+            let mut result = environ.translate_memory_grow(builder, mem, val)?;
+            result = an_encode_if_i32_index(builder, environ, mem, result);
             environ.stacks.push1(result);
         }
         Operator::MemorySize { mem } => {
             let mem = MemoryIndex::from_u32(*mem);
             let _heap = environ.get_or_create_heap(builder.func, mem);
-            let result = environ.translate_memory_size(builder.cursor(), mem)?;
+            let mut result = environ.translate_memory_size(builder.cursor(), mem)?;
+            result = an_encode_if_i32_index(builder, environ, mem, result);
             environ.stacks.push1(result);
         }
         /******************************* Load instructions ***********************************
@@ -1129,15 +1143,40 @@ pub fn translate_operator(
         }
         Operator::I64ExtendI32S => {
             let val = environ.stacks.pop1();
-            environ.stacks.push1(builder.ins().sextend(I64, val));
+            let result = if environ.tunables().an_encoding {
+                // Encoded I64 (A*v) → raw i64 (signed). Boundary codeword
+                // check before decoding; output is unencoded i64.
+                let raw_i32 = emit_an_conversion_decode_i32(builder, environ, val);
+                builder.ins().sextend(I64, raw_i32)
+            } else {
+                builder.ins().sextend(I64, val)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I64ExtendI32U => {
             let val = environ.stacks.pop1();
-            environ.stacks.push1(builder.ins().uextend(I64, val));
+            let result = if environ.tunables().an_encoding {
+                // Encoded I64 → raw i64 (zero-extend). Boundary codeword
+                // check before decoding; output is unencoded i64.
+                let raw_i32 = emit_an_conversion_decode_i32(builder, environ, val);
+                builder.ins().uextend(I64, raw_i32)
+            } else {
+                builder.ins().uextend(I64, val)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I32WrapI64 => {
             let val = environ.stacks.pop1();
-            environ.stacks.push1(builder.ins().ireduce(I32, val));
+            let result = if environ.tunables().an_encoding {
+                // Raw i64 → encoded i32. Take low 32 bits, then encode as
+                // `A * u32`. No codeword check on the input (raw i64 is
+                // never an AN codeword).
+                let raw_i32 = builder.ins().ireduce(I32, val);
+                emit_an_encode_raw_i32(builder, environ, raw_i32)
+            } else {
+                builder.ins().ireduce(I32, val)
+            };
+            environ.stacks.push1(result);
         }
         Operator::F32Sqrt | Operator::F64Sqrt => {
             let arg = environ.stacks.pop1();
@@ -1191,19 +1230,37 @@ pub fn translate_operator(
             let arg = environ.stacks.pop1();
             environ.stacks.push1(builder.ins().fneg(arg));
         }
-        Operator::F64ConvertI64U | Operator::F64ConvertI32U => {
+        Operator::F64ConvertI64U => {
             let val = environ.stacks.pop1();
             environ.stacks.push1(builder.ins().fcvt_from_uint(F64, val));
         }
-        Operator::F64ConvertI64S | Operator::F64ConvertI32S => {
+        Operator::F64ConvertI32U => {
+            // Float ops are refused wholesale under AN-encoding, so the i32
+            // operand here is always raw (never encoded).
+            let val = environ.stacks.pop1();
+            environ.stacks.push1(builder.ins().fcvt_from_uint(F64, val));
+        }
+        Operator::F64ConvertI64S => {
             let val = environ.stacks.pop1();
             environ.stacks.push1(builder.ins().fcvt_from_sint(F64, val));
         }
-        Operator::F32ConvertI64S | Operator::F32ConvertI32S => {
+        Operator::F64ConvertI32S => {
+            let val = environ.stacks.pop1();
+            environ.stacks.push1(builder.ins().fcvt_from_sint(F64, val));
+        }
+        Operator::F32ConvertI64S => {
             let val = environ.stacks.pop1();
             environ.stacks.push1(builder.ins().fcvt_from_sint(F32, val));
         }
-        Operator::F32ConvertI64U | Operator::F32ConvertI32U => {
+        Operator::F32ConvertI32S => {
+            let val = environ.stacks.pop1();
+            environ.stacks.push1(builder.ins().fcvt_from_sint(F32, val));
+        }
+        Operator::F32ConvertI64U => {
+            let val = environ.stacks.pop1();
+            environ.stacks.push1(builder.ins().fcvt_from_uint(F32, val));
+        }
+        Operator::F32ConvertI32U => {
             let val = environ.stacks.pop1();
             environ.stacks.push1(builder.ins().fcvt_from_uint(F32, val));
         }
@@ -1243,9 +1300,7 @@ pub fn translate_operator(
         }
         Operator::I32TruncSatF64S | Operator::I32TruncSatF32S => {
             let val = environ.stacks.pop1();
-            environ
-                .stacks
-                .push1(builder.ins().fcvt_to_sint_sat(I32, val));
+            environ.stacks.push1(builder.ins().fcvt_to_sint_sat(I32, val));
         }
         Operator::I64TruncSatF64U | Operator::I64TruncSatF32U => {
             let val = environ.stacks.pop1();
@@ -1255,9 +1310,7 @@ pub fn translate_operator(
         }
         Operator::I32TruncSatF64U | Operator::I32TruncSatF32U => {
             let val = environ.stacks.pop1();
-            environ
-                .stacks
-                .push1(builder.ins().fcvt_to_uint_sat(I32, val));
+            environ.stacks.push1(builder.ins().fcvt_to_uint_sat(I32, val));
         }
         Operator::F32ReinterpretI32 => {
             let val = environ.stacks.pop1();
@@ -1285,15 +1338,40 @@ pub fn translate_operator(
         }
         Operator::I32Extend8S => {
             let val = environ.stacks.pop1();
-            environ.stacks.push1(builder.ins().ireduce(I8, val));
-            let val = environ.stacks.pop1();
-            environ.stacks.push1(builder.ins().sextend(I32, val));
+            let result = if environ.tunables().an_encoding {
+                // Stays inside the encoding. Decode (no codeword check —
+                // structural invariant, matches `clz`/`ctz`/`popcnt`),
+                // sign-extend the low byte to i32, re-encode.
+                let a_const = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let v_i64 = builder.ins().udiv(val, a_const);
+                let v_i32 = builder.ins().ireduce(I32, v_i64);
+                let v_i8 = builder.ins().ireduce(I8, v_i32);
+                let sext = builder.ins().sextend(I32, v_i8);
+                emit_an_encode_raw_i32(builder, environ, sext)
+            } else {
+                let red = builder.ins().ireduce(I8, val);
+                builder.ins().sextend(I32, red)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I32Extend16S => {
             let val = environ.stacks.pop1();
-            environ.stacks.push1(builder.ins().ireduce(I16, val));
-            let val = environ.stacks.pop1();
-            environ.stacks.push1(builder.ins().sextend(I32, val));
+            let result = if environ.tunables().an_encoding {
+                let a_const = builder
+                    .ins()
+                    .iconst(I64, environ.tunables().an_constant as i64);
+                let v_i64 = builder.ins().udiv(val, a_const);
+                let v_i32 = builder.ins().ireduce(I32, v_i64);
+                let v_i16 = builder.ins().ireduce(I16, v_i32);
+                let sext = builder.ins().sextend(I32, v_i16);
+                emit_an_encode_raw_i32(builder, environ, sext)
+            } else {
+                let red = builder.ins().ireduce(I16, val);
+                builder.ins().sextend(I32, red)
+            };
+            environ.stacks.push1(result);
         }
         Operator::I64Extend8S => {
             let val = environ.stacks.pop1();
@@ -1680,15 +1758,11 @@ pub fn translate_operator(
         Operator::I32Eqz | Operator::I64Eqz => {
             let arg = environ.stacks.pop1();
             let val = builder.ins().icmp_imm(IntCC::Equal, arg, 0);
-            if environ.tunables().an_encoding && matches!(op, Operator::I32Eqz) {
-                let an = builder
-                    .ins()
-                    .iconst(I64, environ.tunables().an_constant as i64);
-                let zero = builder.ins().iconst(I64, 0);
-                environ.stacks.push1(builder.ins().select(val, an, zero));
-            } else {
-                environ.stacks.push1(builder.ins().uextend(I32, val));
-            }
+            // Both produce a wasm-`i32` result. Under AN the bool encodes to
+            // `{0, A}` via `select`; non-AN uses the long-standing
+            // `uextend.i32` path.
+            let encoded = encode_wasm_i32_bool(builder, environ, val);
+            environ.stacks.push1(encoded);
         }
         Operator::I32Eq | Operator::I64Eq => {
             translate_icmp_dispatch(IntCC::Equal, op, builder, environ)
@@ -1717,7 +1791,10 @@ pub fn translate_operator(
                 unreachable!("validation")
             };
             let result = environ.translate_ref_is_null(builder.cursor(), value, *ty)?;
-            environ.stacks.push1(result);
+            // Result is a raw wasm-`i32` (`{0, 1}`); under AN re-encode to
+            // canonical `A*v`.
+            let encoded = encode_wasm_i32_raw(builder, environ, result);
+            environ.stacks.push1(encoded);
         }
         Operator::RefFunc { function_index } => {
             let index = FuncIndex::from_u32(*function_index);
@@ -1987,92 +2064,129 @@ pub fn translate_operator(
             let dst_index = MemoryIndex::from_u32(*dst_mem);
             let _dst_heap = environ.get_or_create_heap(builder.func, dst_index);
 
-            let len = environ.stacks.pop1();
-            let src_pos = environ.stacks.pop1();
-            let dst_pos = environ.stacks.pop1();
+            let mut len = environ.stacks.pop1();
+            let mut src_pos = environ.stacks.pop1();
+            let mut dst_pos = environ.stacks.pop1();
+            // Under AN-encoding with memory32 the i32-typed operands arrive
+            // on the value stack as encoded i64 (`A*v`). The bulk-op
+            // builtin expects raw i32 / i64 addresses, so decode here. For
+            // memory64 the operands are raw i64 and pass through.
+            dst_pos = an_decode_if_i32_index(builder, environ, dst_index, dst_pos);
+            src_pos = an_decode_if_i32_index(builder, environ, src_index, src_pos);
+            len = an_decode_if_i32_index(builder, environ, dst_index, len);
             environ.translate_memory_copy(builder, src_index, dst_index, dst_pos, src_pos, len)?;
         }
         Operator::MemoryFill { mem } => {
             let mem = MemoryIndex::from_u32(*mem);
             let _heap = environ.get_or_create_heap(builder.func, mem);
-            let len = environ.stacks.pop1();
-            let val = environ.stacks.pop1();
-            let dest = environ.stacks.pop1();
+            let mut len = environ.stacks.pop1();
+            let mut val = environ.stacks.pop1();
+            let mut dest = environ.stacks.pop1();
+            // Decode AN-encoded i32 operands when memory is memory32. The
+            // fill `val` is a wasm i32 (only low 8 bits used) — under AN
+            // it arrives encoded just like dst/len.
+            dest = an_decode_if_i32_index(builder, environ, mem, dest);
+            len = an_decode_if_i32_index(builder, environ, mem, len);
+            val = an_decode_i32_operand(builder, environ, val);
             environ.translate_memory_fill(builder, mem, dest, val, len)?;
         }
         Operator::MemoryInit { data_index, mem } => {
             let mem = MemoryIndex::from_u32(*mem);
             let _heap = environ.get_or_create_heap(builder.func, mem);
-            let len = environ.stacks.pop1();
-            let src = environ.stacks.pop1();
-            let dest = environ.stacks.pop1();
+            let mut len = environ.stacks.pop1();
+            let mut src = environ.stacks.pop1();
+            let mut dest = environ.stacks.pop1();
+            // `dest` follows the memory's index type; `src` and `len` are
+            // always wasm i32 (data segment offsets/lengths). Decode all
+            // three under AN+memory32.
+            dest = an_decode_if_i32_index(builder, environ, mem, dest);
+            src = an_decode_i32_operand(builder, environ, src);
+            len = an_decode_i32_operand(builder, environ, len);
             environ.translate_memory_init(builder, mem, *data_index, dest, src, len)?;
         }
         Operator::DataDrop { data_index } => {
             environ.translate_data_drop(builder.cursor(), *data_index)?;
         }
         Operator::TableSize { table: index } => {
-            let result =
-                environ.translate_table_size(builder.cursor(), TableIndex::from_u32(*index))?;
+            let table_index = TableIndex::from_u32(*index);
+            let mut result = environ.translate_table_size(builder.cursor(), table_index)?;
+            // AN-encoding: under i32-indexed tables the result is a wasm i32
+            // and must be encoded as `A*v` before pushing.
+            result = an_encode_if_i32_table_index(builder, environ, table_index, result);
             environ.stacks.push1(result);
         }
         Operator::TableGrow { table: index } => {
             let table_index = TableIndex::from_u32(*index);
-            let delta = environ.stacks.pop1();
+            let mut delta = environ.stacks.pop1();
             let init_value = environ.stacks.pop1();
-            let result = environ.translate_table_grow(builder, table_index, delta, init_value)?;
+            // AN: `delta` is an i32 length on i32-indexed tables; decode before
+            // handing to the builtin which expects raw widths. `init_value`
+            // is a reference and passes through unchanged.
+            delta = an_decode_if_i32_table_index(builder, environ, table_index, delta);
+            let mut result = environ.translate_table_grow(builder, table_index, delta, init_value)?;
+            // Result (previous size) is a wasm i32 — re-encode.
+            result = an_encode_if_i32_table_index(builder, environ, table_index, result);
             environ.stacks.push1(result);
         }
         Operator::TableGet { table: index } => {
             let table_index = TableIndex::from_u32(*index);
-            let index = environ.stacks.pop1();
+            let mut index = environ.stacks.pop1();
+            // AN: i32 index → decode. Result is a funcref/externref, passes
+            // through.
+            index = an_decode_if_i32_table_index(builder, environ, table_index, index);
             let result = environ.translate_table_get(builder, table_index, index)?;
             environ.stacks.push1(result);
         }
         Operator::TableSet { table: index } => {
             let table_index = TableIndex::from_u32(*index);
             let value = environ.stacks.pop1();
-            let index = environ.stacks.pop1();
+            let mut index = environ.stacks.pop1();
+            // AN: i32 index → decode.
+            index = an_decode_if_i32_table_index(builder, environ, table_index, index);
             environ.translate_table_set(builder, table_index, value, index)?;
         }
         Operator::TableCopy {
             dst_table: dst_table_index,
             src_table: src_table_index,
         } => {
-            let len = environ.stacks.pop1();
-            let src = environ.stacks.pop1();
-            let dest = environ.stacks.pop1();
-            environ.translate_table_copy(
-                builder,
-                TableIndex::from_u32(*dst_table_index),
-                TableIndex::from_u32(*src_table_index),
-                dest,
-                src,
-                len,
-            )?;
+            let dst_table = TableIndex::from_u32(*dst_table_index);
+            let src_table = TableIndex::from_u32(*src_table_index);
+            let mut len = environ.stacks.pop1();
+            let mut src = environ.stacks.pop1();
+            let mut dest = environ.stacks.pop1();
+            // AN: each operand's wasm type follows its respective table's
+            // index type. Decode each in its own context.
+            dest = an_decode_if_i32_table_index(builder, environ, dst_table, dest);
+            src = an_decode_if_i32_table_index(builder, environ, src_table, src);
+            // `len` is the smaller of the two index types per the wasm spec;
+            // when both tables are i32 it is an encoded i32 under AN.
+            len = an_decode_if_i32_table_index(builder, environ, dst_table, len);
+            environ.translate_table_copy(builder, dst_table, src_table, dest, src, len)?;
         }
         Operator::TableFill { table } => {
             let table_index = TableIndex::from_u32(*table);
-            let len = environ.stacks.pop1();
+            let mut len = environ.stacks.pop1();
             let val = environ.stacks.pop1();
-            let dest = environ.stacks.pop1();
+            let mut dest = environ.stacks.pop1();
+            dest = an_decode_if_i32_table_index(builder, environ, table_index, dest);
+            len = an_decode_if_i32_table_index(builder, environ, table_index, len);
             environ.translate_table_fill(builder, table_index, dest, val, len)?;
         }
         Operator::TableInit {
             elem_index,
             table: table_index,
         } => {
-            let len = environ.stacks.pop1();
-            let src = environ.stacks.pop1();
-            let dest = environ.stacks.pop1();
-            environ.translate_table_init(
-                builder,
-                *elem_index,
-                TableIndex::from_u32(*table_index),
-                dest,
-                src,
-                len,
-            )?;
+            let table_index = TableIndex::from_u32(*table_index);
+            let mut len = environ.stacks.pop1();
+            let mut src = environ.stacks.pop1();
+            let mut dest = environ.stacks.pop1();
+            // `dest` follows the table's index type; `src` and `len` are
+            // always wasm i32 (passive elem segment offsets/lengths). Under
+            // AN both are encoded i64.
+            dest = an_decode_if_i32_table_index(builder, environ, table_index, dest);
+            src = an_decode_i32_operand(builder, environ, src);
+            len = an_decode_i32_operand(builder, environ, len);
+            environ.translate_table_init(builder, *elem_index, table_index, dest, src, len)?;
         }
         Operator::ElemDrop { elem_index } => {
             environ.translate_elem_drop(builder.cursor(), *elem_index)?;
@@ -2165,24 +2279,35 @@ pub fn translate_operator(
         Operator::I8x16ExtractLaneS { lane } | Operator::I16x8ExtractLaneS { lane } => {
             let vector = pop1_with_bitcast(environ, type_of(op), builder);
             let extracted = builder.ins().extractlane(vector, *lane);
-            environ.stacks.push1(builder.ins().sextend(I32, extracted))
+            let raw = builder.ins().sextend(I32, extracted);
+            // Wasm i32 result; AN-encode.
+            let encoded = encode_wasm_i32_raw(builder, environ, raw);
+            environ.stacks.push1(encoded);
         }
         Operator::I8x16ExtractLaneU { lane } | Operator::I16x8ExtractLaneU { lane } => {
             let vector = pop1_with_bitcast(environ, type_of(op), builder);
             let extracted = builder.ins().extractlane(vector, *lane);
-            environ.stacks.push1(builder.ins().uextend(I32, extracted));
+            let raw = builder.ins().uextend(I32, extracted);
             // On x86, PEXTRB zeroes the upper bits of the destination register of extractlane so
             // uextend could be elided; for now, uextend is needed for Cranelift's type checks to
             // work.
+            let encoded = encode_wasm_i32_raw(builder, environ, raw);
+            environ.stacks.push1(encoded);
         }
         Operator::I32x4ExtractLane { lane }
         | Operator::I64x2ExtractLane { lane }
         | Operator::F32x4ExtractLane { lane }
         | Operator::F64x2ExtractLane { lane } => {
             let vector = pop1_with_bitcast(environ, type_of(op), builder);
-            environ
-                .stacks
-                .push1(builder.ins().extractlane(vector, *lane))
+            let extracted = builder.ins().extractlane(vector, *lane);
+            // I32x4 extract → wasm i32; under AN re-encode. Other lanes
+            // pass through (i64/f32/f64 not encoded).
+            let pushed = if matches!(op, Operator::I32x4ExtractLane { .. }) {
+                encode_wasm_i32_raw(builder, environ, extracted)
+            } else {
+                extracted
+            };
+            environ.stacks.push1(pushed);
         }
         Operator::I8x16ReplaceLane { lane } | Operator::I16x8ReplaceLane { lane } => {
             let (vector, replacement) = environ.stacks.pop2();
@@ -2323,9 +2448,8 @@ pub fn translate_operator(
         Operator::V128AnyTrue => {
             let a = pop1_with_bitcast(environ, type_of(op), builder);
             let bool_result = builder.ins().vany_true(a);
-            environ
-                .stacks
-                .push1(builder.ins().uextend(I32, bool_result))
+            let encoded = encode_wasm_i32_bool(builder, environ, bool_result);
+            environ.stacks.push1(encoded);
         }
         Operator::I8x16AllTrue
         | Operator::I16x8AllTrue
@@ -2333,16 +2457,17 @@ pub fn translate_operator(
         | Operator::I64x2AllTrue => {
             let a = pop1_with_bitcast(environ, type_of(op), builder);
             let bool_result = builder.ins().vall_true(a);
-            environ
-                .stacks
-                .push1(builder.ins().uextend(I32, bool_result))
+            let encoded = encode_wasm_i32_bool(builder, environ, bool_result);
+            environ.stacks.push1(encoded);
         }
         Operator::I8x16Bitmask
         | Operator::I16x8Bitmask
         | Operator::I32x4Bitmask
         | Operator::I64x2Bitmask => {
             let a = pop1_with_bitcast(environ, type_of(op), builder);
-            environ.stacks.push1(builder.ins().vhigh_bits(I32, a));
+            let raw = builder.ins().vhigh_bits(I32, a);
+            let encoded = encode_wasm_i32_raw(builder, environ, raw);
+            environ.stacks.push1(encoded);
         }
         Operator::I8x16Eq | Operator::I16x8Eq | Operator::I32x4Eq | Operator::I64x2Eq => {
             translate_vector_icmp(IntCC::Equal, type_of(op), builder, environ)
@@ -3284,8 +3409,8 @@ pub fn translate_operator(
         Operator::RefEq => {
             let (r1, r2) = environ.stacks.pop2();
             let eq = builder.ins().icmp(ir::condcodes::IntCC::Equal, r1, r2);
-            let eq = builder.ins().uextend(ir::types::I32, eq);
-            environ.stacks.push1(eq);
+            let encoded = encode_wasm_i32_bool(builder, environ, eq);
+            environ.stacks.push1(encoded);
         }
         Operator::RefTestNonNull { hty } => {
             let r = environ.stacks.pop1();
@@ -4087,6 +4212,52 @@ fn translate_load(
 
     environ.before_load(builder, mem_op_size, wasm_index, memarg.offset);
 
+    // AN-encoding load-side validity check (opt-in via
+    // `Tunables.an_load_validity_check`): assert that the encoded shadow
+    // slot(s) the load touches still match the raw bytes BEFORE we pull the
+    // value from raw. Any divergence — shadow flip, raw flip, or a code path
+    // that left the shadow stale — surfaces here as
+    // `Trap::AnMemoryMismatch`, at the load, instead of at the next host
+    // call boundary.
+    //
+    // Only fires for i32-family loads (the only ones whose underlying memory
+    // is mirrored into the shadow today). i64/f32/f64/v128 loads use the raw
+    // path; their bytes still belong to a slot whose shadow we COULD check,
+    // but the existing dual-buffer design does not maintain shadow
+    // consistency for non-i32 stores, so a check here would false-positive.
+    if environ.tunables().an_encoding
+        && environ.tunables().an_load_validity_check
+        && result_ty == I32
+    {
+        if let Some(enc_base) = emit_an_enc_base_pointer(
+            builder,
+            environ,
+            MemoryIndex::from_u32(memarg.memory),
+        ) {
+            let addr_ty = builder.func.dfg.value_type(wasm_index);
+            let wasm_index_i64 = if addr_ty == I64 {
+                wasm_index
+            } else {
+                builder.ins().uextend(I64, wasm_index)
+            };
+            let effective_addr_i64 = if memarg.offset == 0 {
+                wasm_index_i64
+            } else {
+                builder
+                    .ins()
+                    .iadd_imm(wasm_index_i64, memarg.offset as i64)
+            };
+            emit_an_load_validity_check(
+                builder,
+                environ,
+                enc_base,
+                base,
+                effective_addr_i64,
+                mem_op_size,
+            );
+        }
+    }
+
     let (load, dfg) = builder
         .ins()
         .Load(opcode, result_ty, flags, Offset32::new(0), base);
@@ -4120,6 +4291,11 @@ fn translate_store(
     environ: &mut FuncEnvironment<'_>,
 ) -> WasmResult<()> {
     let mut val = environ.stacks.pop1();
+    // Hold on to the encoded operand for the AN-encoding shadow store below.
+    // For non-AN paths this is unused; for AN i32 stores it is `A*v` and is
+    // written into the encoded shadow without round-tripping through the
+    // decode/encode pipeline.
+    let encoded_val = val;
     if environ.tunables().an_encoding && wasm_val_is_i32 {
         // val is encoded I64 = A*v with v ∈ [0, 2^32). Decode to raw I32.
         let an = builder
@@ -4138,9 +4314,341 @@ fn translate_store(
 
     environ.before_store(builder, mem_op_size, wasm_index, memarg.offset);
 
+    // AN-encoding: non-i32 stores (i64/f32/f64 family) must also keep the
+    // encoded shadow in sync, otherwise the next host-boundary cross-check
+    // sees a divergence and traps. The shadow encodes raw bytes 4 at a
+    // time, so we decompose the non-i32 store into one or two raw i32
+    // sub-stores, each routed through the same raw-plus-shadow path as
+    // `i32.store{,8,16}`.
+    if environ.tunables().an_encoding && !wasm_val_is_i32 {
+        translate_non_i32_store_an(
+            builder, environ, memarg, opcode, val, val_ty, flags, wasm_index, base,
+        )?;
+        return Ok(());
+    }
+
     builder
         .ins()
         .Store(opcode, val_ty, flags, Offset32::new(0), val, base);
+
+    // AN-encoding: mirror the i32 store family into the encoded shadow so
+    // the host-call-entry cross-check sees a consistent
+    // `decode(enc_slot) == u32_le(raw_slot)` invariant across the whole
+    // memory.
+    //
+    // - `ir::Opcode::Store` (full i32.store): aligned at runtime → direct
+    //   8-byte write of the encoded operand into `enc[2*effective_addr]`;
+    //   unaligned → 4-byte decomposed byte-RMW. Dispatched at runtime on
+    //   `byte_pos = effective_addr & 3`.
+    // - `ir::Opcode::Istore8` / `Istore16`: decomposed into 1 / 2 byte-RMWs,
+    //   each computing its own slot index so cross-slot cases fall out.
+    if environ.tunables().an_encoding && wasm_val_is_i32 {
+        if let Some(enc_base) = emit_an_enc_base_pointer(
+            builder,
+            environ,
+            MemoryIndex::from_u32(memarg.memory),
+        ) {
+            // Compute the wasm-level effective byte address = `wasm_index +
+            // memarg.offset`. `wasm_index` is the popped wasm address
+            // post-AN-decode, *without* the static offset folded in (the
+            // offset is folded into the raw heap pointer separately by
+            // `bounds_check_and_compute_addr`).
+            let addr_ty = builder.func.dfg.value_type(wasm_index);
+            let wasm_index_i64 = if addr_ty == I64 {
+                wasm_index
+            } else {
+                builder.ins().uextend(I64, wasm_index)
+            };
+            let effective_addr_i64 = if memarg.offset == 0 {
+                wasm_index_i64
+            } else {
+                builder
+                    .ins()
+                    .iadd_imm(wasm_index_i64, memarg.offset as i64)
+            };
+            // Decode the encoded operand to raw bytes once. Used by every
+            // sub-i32 / unaligned store path.
+            let a_const = builder
+                .ins()
+                .iconst(I64, environ.tunables().an_constant as i64);
+            let raw_value = builder.ins().udiv(encoded_val, a_const);
+
+            match opcode {
+                ir::Opcode::Store => {
+                    // i32.store: aligned at runtime → direct 8-byte slot
+                    // write; unaligned → 4-byte decomposed RMW. Pick at
+                    // runtime by branching on `byte_pos = effective_addr & 3`.
+                    let byte_pos = builder.ins().band_imm(effective_addr_i64, 3);
+                    let aligned_block = builder.create_block();
+                    let unaligned_block = builder.create_block();
+                    let merge_block = builder.create_block();
+                    builder.ins().brif(
+                        byte_pos,
+                        unaligned_block,
+                        &[][..],
+                        aligned_block,
+                        &[][..],
+                    );
+
+                    builder.switch_to_block(aligned_block);
+                    builder.seal_block(aligned_block);
+                    let enc_off =
+                        emit_an_enc_offset_from_effective_addr(builder, effective_addr_i64);
+                    let enc_target = builder.ins().iadd(enc_base, enc_off);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), encoded_val, enc_target, 0);
+                    builder.ins().jump(merge_block, &[][..]);
+
+                    builder.switch_to_block(unaligned_block);
+                    builder.seal_block(unaligned_block);
+                    emit_an_multi_byte_decomposed_store(
+                        builder,
+                        environ,
+                        enc_base,
+                        effective_addr_i64,
+                        raw_value,
+                        4,
+                    );
+                    builder.ins().jump(merge_block, &[][..]);
+
+                    builder.switch_to_block(merge_block);
+                    builder.seal_block(merge_block);
+                }
+                ir::Opcode::Istore8 => {
+                    emit_an_multi_byte_decomposed_store(
+                        builder,
+                        environ,
+                        enc_base,
+                        effective_addr_i64,
+                        raw_value,
+                        1,
+                    );
+                }
+                ir::Opcode::Istore16 => {
+                    // Always decompose to 2 byte-RMWs. Covers both in-slot
+                    // (byte_pos in 0..=2) and cross-slot (byte_pos == 3)
+                    // cases uniformly. Slightly slower than a single 2-byte
+                    // RMW for the in-slot case, but the per-byte helper
+                    // computes its own slot index so cross-slot transitions
+                    // fall out automatically.
+                    emit_an_multi_byte_decomposed_store(
+                        builder,
+                        environ,
+                        enc_base,
+                        effective_addr_i64,
+                        raw_value,
+                        2,
+                    );
+                }
+                _ => {
+                    unreachable!(
+                        "translate_store: unexpected opcode {:?} for i32 store family",
+                        opcode
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Sub-piece shape used by [`translate_non_i32_store_an`] when decomposing
+/// a non-i32 store into one or two raw `i32` sub-stores. Picks the matching
+/// raw-store opcode and shadow-mirror path.
+#[derive(Clone, Copy)]
+enum NonI32StorePiece {
+    /// Full 4-byte i32 store (aligned/unaligned dispatch on shadow side).
+    Full32,
+    /// Low-half-word (2 bytes) i32 store, mirrored via the `Istore16` path.
+    Sub16,
+    /// Low-byte (1 byte) i32 store, mirrored via the `Istore8` path.
+    Sub8,
+}
+
+/// Decompose a non-i32 wasm store (i64/f32/f64 family) into one or two raw
+/// `i32` sub-stores so the AN-encoded shadow stays in lockstep with raw.
+///
+/// Each piece writes the raw side via a small `Store`/`Istore8`/`Istore16`
+/// at a base-offset and then mirrors that same piece into the shadow using
+/// the same aligned/unaligned dispatch as `i32.store`. The decomposition
+/// is purely codegen-level: the wasm operand stack already gave us the
+/// non-i32 value, we just split it into `i32` pieces in IR.
+///
+/// V128 stores (full + lane variants) are not yet decomposed; under AN they
+/// surface as `wasm_unsupported!` so a Rust binary that pulls in SIMD will
+/// fail loudly rather than silently corrupt the shadow.
+fn translate_non_i32_store_an(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+    memarg: &MemArg,
+    opcode: ir::Opcode,
+    val: Value,
+    val_ty: Type,
+    flags: MemFlags,
+    wasm_index: Value,
+    base: Value,
+) -> WasmResult<()> {
+    use ir::Opcode::*;
+
+    // Split the non-i32 operand into raw i32 pieces. Floats are refused at
+    // compile time (see `validate_an_encoding_constraints`), so they never
+    // reach this helper — only i64-family stores need decomposing.
+    let pieces: Vec<(Value, u32, NonI32StorePiece)> = match (opcode, val_ty) {
+        (Store, ty) if ty == I64 => {
+            let lo = builder.ins().ireduce(I32, val);
+            let hi64 = builder.ins().ushr_imm(val, 32);
+            let hi = builder.ins().ireduce(I32, hi64);
+            vec![
+                (lo, 0, NonI32StorePiece::Full32),
+                (hi, 4, NonI32StorePiece::Full32),
+            ]
+        }
+        (Istore32, ty) if ty == I64 => {
+            let r = builder.ins().ireduce(I32, val);
+            vec![(r, 0, NonI32StorePiece::Full32)]
+        }
+        (Istore16, ty) if ty == I64 => {
+            let r = builder.ins().ireduce(I32, val);
+            vec![(r, 0, NonI32StorePiece::Sub16)]
+        }
+        (Istore8, ty) if ty == I64 => {
+            let r = builder.ins().ireduce(I32, val);
+            vec![(r, 0, NonI32StorePiece::Sub8)]
+        }
+        _ => {
+            return Err(wasm_unsupported!(
+                "AN-encoding: non-i32 store opcode {:?} with value type {:?} is not yet supported (v128 / lane stores fall here; floats are refused at compile time)",
+                opcode,
+                val_ty
+            ));
+        }
+    };
+
+    // Shadow base pointer. None when the memory has no shadow allocated
+    // (would happen only if the surrounding refusal logic regressed; in
+    // that case we still need to emit the raw stores, just skip mirror).
+    let enc_base = emit_an_enc_base_pointer(
+        builder,
+        environ,
+        MemoryIndex::from_u32(memarg.memory),
+    );
+
+    // Effective wasm byte address with `memarg.offset` folded in. Each
+    // piece adds its own intra-store byte offset.
+    let addr_ty = builder.func.dfg.value_type(wasm_index);
+    let wasm_index_i64 = if addr_ty == I64 {
+        wasm_index
+    } else {
+        builder.ins().uextend(I64, wasm_index)
+    };
+    let effective_addr_base = if memarg.offset == 0 {
+        wasm_index_i64
+    } else {
+        builder
+            .ins()
+            .iadd_imm(wasm_index_i64, memarg.offset as i64)
+    };
+    let a_const = builder
+        .ins()
+        .iconst(I64, environ.tunables().an_constant as i64);
+
+    for (raw_i32, byte_off, kind) in pieces {
+        // 1) Raw side. Each piece is a 1-, 2-, or 4-byte store at the
+        //    corresponding offset within the original store. `flags` came
+        //    from `prepare_addr` with the full mem_op_size bounds check
+        //    already applied, so all sub-stores are in-bounds by
+        //    construction.
+        let raw_opcode = match kind {
+            NonI32StorePiece::Full32 => Store,
+            NonI32StorePiece::Sub16 => Istore16,
+            NonI32StorePiece::Sub8 => Istore8,
+        };
+        builder.ins().Store(
+            raw_opcode,
+            I32,
+            flags,
+            Offset32::new(byte_off as i32),
+            raw_i32,
+            base,
+        );
+
+        // 2) Shadow side — mirror the piece into the encoded shadow.
+        if let Some(enc_base) = enc_base {
+            let piece_eff_addr = if byte_off == 0 {
+                effective_addr_base
+            } else {
+                builder.ins().iadd_imm(effective_addr_base, byte_off as i64)
+            };
+            let raw_widened = builder.ins().uextend(I64, raw_i32);
+            let encoded_piece = builder.ins().imul(raw_widened, a_const);
+            match kind {
+                NonI32StorePiece::Full32 => {
+                    // Same aligned/unaligned dispatch as `i32.store`: if the
+                    // effective address is 4-byte-aligned, write the
+                    // encoded value as one 8-byte shadow slot; otherwise
+                    // decompose into four byte-RMWs that handle cross-slot
+                    // transitions automatically.
+                    let byte_pos = builder.ins().band_imm(piece_eff_addr, 3);
+                    let aligned_block = builder.create_block();
+                    let unaligned_block = builder.create_block();
+                    let merge_block = builder.create_block();
+                    builder.ins().brif(
+                        byte_pos,
+                        unaligned_block,
+                        &[][..],
+                        aligned_block,
+                        &[][..],
+                    );
+
+                    builder.switch_to_block(aligned_block);
+                    builder.seal_block(aligned_block);
+                    let enc_off =
+                        emit_an_enc_offset_from_effective_addr(builder, piece_eff_addr);
+                    let enc_target = builder.ins().iadd(enc_base, enc_off);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), encoded_piece, enc_target, 0);
+                    builder.ins().jump(merge_block, &[][..]);
+
+                    builder.switch_to_block(unaligned_block);
+                    builder.seal_block(unaligned_block);
+                    emit_an_multi_byte_decomposed_store(
+                        builder,
+                        environ,
+                        enc_base,
+                        piece_eff_addr,
+                        raw_widened,
+                        4,
+                    );
+                    builder.ins().jump(merge_block, &[][..]);
+
+                    builder.switch_to_block(merge_block);
+                    builder.seal_block(merge_block);
+                }
+                NonI32StorePiece::Sub16 => {
+                    emit_an_multi_byte_decomposed_store(
+                        builder,
+                        environ,
+                        enc_base,
+                        piece_eff_addr,
+                        raw_widened,
+                        2,
+                    );
+                }
+                NonI32StorePiece::Sub8 => {
+                    emit_an_multi_byte_decomposed_store(
+                        builder,
+                        environ,
+                        enc_base,
+                        piece_eff_addr,
+                        raw_widened,
+                        1,
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4157,7 +4665,10 @@ fn mem_op_size(opcode: ir::Opcode, ty: Type) -> u8 {
 fn translate_icmp(cc: IntCC, builder: &mut FunctionBuilder, environ: &mut FuncEnvironment<'_>) {
     let (arg0, arg1) = environ.stacks.pop2();
     let val = builder.ins().icmp(cc, arg0, arg1);
-    environ.stacks.push1(builder.ins().uextend(I32, val));
+    // Compare result is a wasm-`i32` boolean. AN encodes via select to
+    // `{0, A}`; non-AN uses the long-standing `uextend.i32` path.
+    let encoded = encode_wasm_i32_bool(builder, environ, val);
+    environ.stacks.push1(encoded);
 }
 
 /// Picks the AN-encoded i32 compare path or the regular path based on `op`
@@ -4454,7 +4965,8 @@ fn translate_vector_icmp(
 fn translate_fcmp(cc: FloatCC, builder: &mut FunctionBuilder, env: &mut FuncEnvironment<'_>) {
     let (arg0, arg1) = env.stacks.pop2();
     let val = builder.ins().fcmp(cc, arg0, arg1);
-    env.stacks.push1(builder.ins().uextend(I32, val));
+    let encoded = encode_wasm_i32_bool(builder, env, val);
+    env.stacks.push1(encoded);
 }
 
 fn translate_vector_fcmp(
@@ -4988,4 +5500,127 @@ fn create_catch_block(
     canonicalise_then_jump(builder, frame.br_destination(), &params);
 
     Ok(block)
+}
+
+/// If AN-encoding is on and the wasm operand is a raw `I32` value, encode
+/// it as `A * v` in an `I64` so it can be pushed onto the operand stack.
+/// Otherwise return `val` unchanged (already-encoded I64, or non-i32 type).
+fn an_encode_i32_operand(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+    val: Value,
+) -> Value {
+    if !environ.tunables().an_encoding {
+        return val;
+    }
+    let ty = builder.func.dfg.value_type(val);
+    if ty != I32 {
+        return val;
+    }
+    let a = builder
+        .ins()
+        .iconst(I64, environ.tunables().an_constant as i64);
+    let zext = builder.ins().uextend(I64, val);
+    builder.ins().imul(zext, a)
+}
+
+/// Inverse of [`an_encode_i32_operand`]: decode an encoded `I64` (`A * v`)
+/// back to raw `I32`. When AN-encoding is off or `val` is already `I32`,
+/// return it unchanged.
+fn an_decode_i32_operand(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+    val: Value,
+) -> Value {
+    if !environ.tunables().an_encoding {
+        return val;
+    }
+    let ty = builder.func.dfg.value_type(val);
+    if ty == I32 {
+        return val;
+    }
+    let a = builder
+        .ins()
+        .iconst(I64, environ.tunables().an_constant as i64);
+    let decoded = builder.ins().udiv(val, a);
+    builder.ins().ireduce(I32, decoded)
+}
+
+/// Decode `val` if AN-encoding is on AND the memory at `mem` uses i32
+/// addresses (memory32). For memory64, indices are raw i64 even under AN
+/// and pass through. Used to normalise the address/length operands of the
+/// bulk-memory builtins before they're handed to the cast helpers in
+/// `func_environ` that expect raw widths.
+fn an_decode_if_i32_index(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+    mem: MemoryIndex,
+    val: Value,
+) -> Value {
+    if !environ.tunables().an_encoding {
+        return val;
+    }
+    let idx_ty = environ.module.memories[mem].idx_type;
+    if !matches!(idx_ty, wasmtime_environ::IndexType::I32) {
+        return val;
+    }
+    an_decode_i32_operand(builder, environ, val)
+}
+
+/// Companion to [`an_decode_if_i32_index`]: re-encode an `I32` result back
+/// to an encoded `I64` when the wasm op's output type is i32 (i.e. memory
+/// uses i32 indices). For memory64-typed results pass through unchanged.
+fn an_encode_if_i32_index(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+    mem: MemoryIndex,
+    val: Value,
+) -> Value {
+    if !environ.tunables().an_encoding {
+        return val;
+    }
+    let idx_ty = environ.module.memories[mem].idx_type;
+    if !matches!(idx_ty, wasmtime_environ::IndexType::I32) {
+        return val;
+    }
+    an_encode_i32_operand(builder, environ, val)
+}
+
+/// Table-flavoured sibling of [`an_decode_if_i32_index`]: decode an i32 table
+/// index/length operand under AN-encoding. Tables also have an `IndexType`
+/// (i32 by default, i64 when the memory64-on-tables proposal is in use), so
+/// i64-typed table operands flow through unchanged.
+fn an_decode_if_i32_table_index(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+    table: TableIndex,
+    val: Value,
+) -> Value {
+    if !environ.tunables().an_encoding {
+        return val;
+    }
+    let idx_ty = environ.module.tables[table].idx_type;
+    if !matches!(idx_ty, wasmtime_environ::IndexType::I32) {
+        return val;
+    }
+    an_decode_i32_operand(builder, environ, val)
+}
+
+/// Companion to [`an_decode_if_i32_table_index`]: re-encode an `I32` result
+/// (e.g. from `table.size` / `table.grow`) back to an encoded `I64` when
+/// the table uses i32 indices.
+fn an_encode_if_i32_table_index(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+    table: TableIndex,
+    val: Value,
+) -> Value {
+    if !environ.tunables().an_encoding {
+        return val;
+    }
+    let idx_ty = environ.module.tables[table].idx_type;
+    if !matches!(idx_ty, wasmtime_environ::IndexType::I32) {
+        return val;
+    }
+    an_encode_i32_operand(builder, environ, val)
 }

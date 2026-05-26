@@ -270,6 +270,14 @@ wasmtime_option_group! {
         /// AN-encoding constant `A` (default 65521). Must be in `1..2^31`.
         pub an_constant: Option<u64>,
 
+        /// Opt in to AN-encoding's per-load shadow-validity check. Adds an
+        /// inline assertion at every i32 load that the encoded shadow slot(s)
+        /// it touches still satisfy `slot % A == 0 && slot / A == raw_slot`.
+        /// Detects shadow corruption immediately at the load site instead of
+        /// waiting for the next host-call boundary, at the cost of extra
+        /// instructions per load. Off by default; requires `an-encoding=y`.
+        pub an_load_validity_check: Option<bool>,
+
         #[prefixed = "cranelift"]
         #[serde(default)]
         /// Set a cranelift-specific option. Use `wasmtime settings` to see
@@ -984,6 +992,9 @@ impl CommonOptions {
         }
         if let Some(a) = self.codegen.an_constant {
             config.an_constant(a);
+        }
+        if let Some(enable) = self.codegen.an_load_validity_check {
+            config.an_load_validity_check(enable);
         }
 
         // async_stack_size enabled by either async or stack-switching, so

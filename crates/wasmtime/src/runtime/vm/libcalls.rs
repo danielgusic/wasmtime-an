@@ -254,8 +254,11 @@ fn memory_grow(
     let memory_index = DefinedMemoryIndex::from_u32(memory_index);
     let (mut limiter, store) = store.resource_limiter_and_store_opaque();
     let limiter = limiter.as_mut();
+    let instance_id = instance;
     block_on!(store, async |store, _| {
-        let instance = store.instance_mut(instance);
+        let an_on = store.engine().tunables().an_encoding;
+        let a = store.engine().tunables().an_constant;
+        let instance = store.instance_mut(instance_id);
         let module = instance.env_module();
         let page_size_log2 = module.memories[module.memory_index(memory_index)].page_size_log2;
 
@@ -263,6 +266,16 @@ fn memory_grow(
             .memory_grow(limiter, memory_index, delta)
             .await?
             .map(|size_in_bytes| AllocationSize(size_in_bytes >> page_size_log2));
+
+        // AN-encoding: re-allocate the shadow to match the new raw size and
+        // re-encode existing content. Only runs on success — when grow
+        // returns `None` the raw allocation is unchanged so the shadow is
+        // still consistent.
+        if an_on && result.is_some() {
+            store
+                .instance_mut(instance_id)
+                .an_grow_shadow(memory_index, a);
+        }
 
         Ok(result)
     })?
@@ -545,9 +558,28 @@ fn memory_copy(
 ) -> Result<(), Trap> {
     let src_index = MemoryIndex::from_u32(src_index);
     let dst_index = MemoryIndex::from_u32(dst_index);
+    // Cache tunables + the destination's defined-memory index *before*
+    // taking the mutable borrow on `store` for `memory_copy`, so we can
+    // re-borrow afterwards to update the shadow.
+    let an_on = store.engine().tunables().an_encoding;
+    let a = store.engine().tunables().an_constant;
+    let def_dst = store
+        .instance(instance)
+        .env_module()
+        .defined_memory_index(dst_index);
     store
         .instance_mut(instance)
-        .memory_copy(dst_index, dst, src_index, src, len)
+        .memory_copy(dst_index, dst, src_index, src, len)?;
+    if an_on {
+        if let Some(def_idx) = def_dst {
+            let dst_usize = usize::try_from(dst).unwrap();
+            let len_usize = usize::try_from(len).unwrap();
+            store
+                .instance_mut(instance)
+                .an_encode_range_from_raw(def_idx, dst_usize, len_usize, a);
+        }
+    }
+    Ok(())
 }
 
 // Implementation of `memory.fill` for locally defined memories.
@@ -560,10 +592,20 @@ fn memory_fill(
     len: u64,
 ) -> Result<(), Trap> {
     let memory_index = DefinedMemoryIndex::from_u32(memory_index);
+    let an_on = store.engine().tunables().an_encoding;
+    let a = store.engine().tunables().an_constant;
     #[expect(clippy::cast_possible_truncation, reason = "known to truncate here")]
     store
         .instance_mut(instance)
-        .memory_fill(memory_index, dst, val as u8, len)
+        .memory_fill(memory_index, dst, val as u8, len)?;
+    if an_on {
+        let dst_usize = usize::try_from(dst).unwrap();
+        let len_usize = usize::try_from(len).unwrap();
+        store
+            .instance_mut(instance)
+            .an_encode_range_from_raw(memory_index, dst_usize, len_usize, a);
+    }
+    Ok(())
 }
 
 // Implementation of `memory.init`.
@@ -578,9 +620,25 @@ fn memory_init(
 ) -> Result<(), Trap> {
     let memory_index = MemoryIndex::from_u32(memory_index);
     let data_index = DataIndex::from_u32(data_index);
+    let an_on = store.engine().tunables().an_encoding;
+    let a = store.engine().tunables().an_constant;
+    let def_dst = store
+        .instance(instance)
+        .env_module()
+        .defined_memory_index(memory_index);
     store
         .instance_mut(instance)
-        .memory_init(memory_index, data_index, dst, src, len)
+        .memory_init(memory_index, data_index, dst, src, len)?;
+    if an_on {
+        if let Some(def_idx) = def_dst {
+            let dst_usize = usize::try_from(dst).unwrap();
+            let len_usize = usize::try_from(len).unwrap();
+            store
+                .instance_mut(instance)
+                .an_encode_range_from_raw(def_idx, dst_usize, len_usize, a);
+        }
+    }
+    Ok(())
 }
 
 // Implementation of `ref.func`.
@@ -1719,5 +1777,52 @@ fn breakpoint(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
     }
     // Avoid unused-argument warning in no-debugger builds.
     let _ = store;
+    Ok(())
+}
+
+/// AN-encoding cross-check at the wasm-to-host trampoline boundary.
+///
+/// Walks every defined linear memory's encoded shadow slot-by-slot and
+/// compares `decode(enc_slot)` to `u32_le(raw_slot)`. Returns
+/// `Err(Trap::AnMemoryMismatch)` on the first mismatch, which the trampoline
+/// turns into a wasm trap. When AN-encoding is disabled on the engine the
+/// function returns immediately.
+fn an_check_host_boundary(store: &mut dyn VMStore, instance: InstanceId) -> Result<(), Trap> {
+    if !store.engine().tunables().an_encoding {
+        return Ok(());
+    }
+    let a = store.engine().tunables().an_constant;
+    let instance = store.instance_mut(instance);
+    let num_defined_memories = u32::try_from(instance.env_module().num_defined_memories())
+        .expect("number of defined memories fits in u32");
+    for i in 0..num_defined_memories {
+        let def_idx = DefinedMemoryIndex::from_u32(i);
+        if !instance.an_cross_check_memory(def_idx, a) {
+            return Err(Trap::AnMemoryMismatch);
+        }
+    }
+    Ok(())
+}
+
+/// AN-encoding resync at the wasm-to-host trampoline boundary.
+///
+/// Re-encodes every defined linear memory's raw bytes into the encoded
+/// shadow. Called immediately after the host returns; restores the
+/// `enc_slot == A * u32_le(raw_slot)` invariant after host writes that may
+/// have touched raw memory directly (e.g. WASI `fd_read`).
+fn an_resync_host_boundary(store: &mut dyn VMStore, instance: InstanceId) -> Result<(), Trap> {
+    if !store.engine().tunables().an_encoding {
+        return Ok(());
+    }
+    let a = store.engine().tunables().an_constant;
+    let mut instance = store.instance_mut(instance);
+    let num_defined_memories = u32::try_from(instance.env_module().num_defined_memories())
+        .expect("number of defined memories fits in u32");
+    for i in 0..num_defined_memories {
+        let def_idx = DefinedMemoryIndex::from_u32(i);
+        instance
+            .as_mut()
+            .an_encode_full_memory_from_raw(def_idx, a);
+    }
     Ok(())
 }

@@ -45,6 +45,378 @@ pub use self::code_builder::{CodeBuilder, CodeHint, HashedEngineCompileEnv};
 #[cfg(feature = "runtime")]
 mod runtime;
 
+/// Reject (or warn about) module features that the AN-encoding linear-memory
+/// implementation does not yet support.
+///
+/// AN-encoding maintains an encoded "shadow" of every defined linear memory
+/// (sized at `ENC_MEM_GROWTH_FACTOR * raw_byte_size`). For v1 the shadow is
+/// only allocated for self-contained, non-shared defined memories.
+/// Imported memories cannot be doubled because we do not own their storage;
+/// shared memories cannot be doubled because atomic operations would need a
+/// per-slot lock across both copies. Multi-memory is supported: every
+/// defined memory gets its own shadow and the host-boundary cross-check
+/// walks all of them.
+///
+/// Memory64 modules are allowed but the user receives a one-shot warning:
+/// values and memory contents stay protected, but the i64 addresses that
+/// flow through memory64 ops are not encoded and therefore not cross-checked.
+///
+/// Atomic memory operators (threads proposal) are refused: their shadow
+/// update path is not wired and they would either leave the shadow stale or
+/// panic in cranelift the same way bulk-memory ops did before the per-op
+/// decode fix landed.
+fn validate_an_encoding_constraints(
+    translation: &ModuleTranslation<'_>,
+    tunables: &Tunables,
+    types: &ModuleTypesBuilder,
+) -> Result<()> {
+    if !tunables.an_encoding {
+        return Ok(());
+    }
+
+    let module = &translation.module;
+
+    if module.num_imported_memories > 0 {
+        bail!(
+            "AN-encoding does not support imported linear memories. \
+             Found {} imported memory(s).",
+            module.num_imported_memories
+        );
+    }
+
+    let mut saw_memory64 = false;
+    for (_, mem) in module.memories.iter() {
+        if mem.shared {
+            bail!(
+                "AN-encoding does not support shared (threads proposal) memories."
+            );
+        }
+        if mem.idx_type == wasmtime_environ::IndexType::I64 {
+            saw_memory64 = true;
+        }
+    }
+    if saw_memory64 {
+        log::warn!(
+            "AN-encoding: module uses memory64; the i64 addresses work but are \
+             not encoded or cross-checked."
+        );
+    }
+
+    // Floats are refused wholesale under AN-encoding for v1. The shadow
+    // memory only mirrors i32-family stores; float stores are out of
+    // scope, the boundary codeword check has no symmetric path for
+    // f32/f64, and the conversion-decode path
+    // (`emit_an_conversion_decode_i32`) only handles i32↔float as a one-way
+    // exit (never re-entering AN protection). The refusal below catches
+    // floats at three layers: function signatures, globals, locals, and
+    // operators. Any one is enough to fail; we report the first hit.
+
+    // 1) Function signatures (params + results).
+    for (def_func_index, func_type) in module.functions.iter() {
+        let sig_idx = func_type.signature.unwrap_module_type_index();
+        let wasm_func_ty = types[sig_idx].unwrap_func();
+        if let Some(where_) = first_float_in_slice(wasm_func_ty.params()) {
+            bail!(
+                "AN-encoding does not support floating-point types. Found `{where_}` \
+                 in params of function {}.",
+                def_func_index.as_u32()
+            );
+        }
+        if let Some(where_) = first_float_in_slice(wasm_func_ty.results()) {
+            bail!(
+                "AN-encoding does not support floating-point types. Found `{where_}` \
+                 in results of function {}.",
+                def_func_index.as_u32()
+            );
+        }
+    }
+
+    // 2) Globals.
+    for (idx, global) in module.globals.iter() {
+        if let Some(name) = wasm_val_type_float_name(&global.wasm_ty) {
+            bail!(
+                "AN-encoding does not support floating-point types. Global \
+                 {} has type `{name}`.",
+                idx.as_u32()
+            );
+        }
+    }
+
+    let mut saw_i64_conversion = false;
+    for (def_func_index, body_data) in translation.function_body_inputs.iter() {
+        // 3) Local declarations inside the function body.
+        let mut locals_reader = body_data
+            .body
+            .get_locals_reader()
+            .with_context(|| "AN-encoding: failed to read function locals")?;
+        let local_groups = locals_reader.get_count();
+        for _ in 0..local_groups {
+            let (_count, ty) = locals_reader
+                .read()
+                .with_context(|| "AN-encoding: failed to read local entry")?;
+            if let Some(name) = wasmparser_val_type_float_name(&ty) {
+                let func_index = module.func_index(def_func_index).as_u32();
+                bail!(
+                    "AN-encoding does not support floating-point types. \
+                     Function {func_index} declares a local of type `{name}`."
+                );
+            }
+        }
+
+        let mut reader = body_data
+            .body
+            .get_operators_reader()
+            .with_context(|| "AN-encoding: failed to read function body")?;
+        while !reader.eof() {
+            let op = reader
+                .read()
+                .with_context(|| "AN-encoding: failed to read operator")?;
+            if let Some(name) = atomic_op_name(&op) {
+                let func_index = module.func_index(def_func_index).as_u32();
+                bail!(
+                    "AN-encoding does not support atomic memory operations \
+                     (threads proposal). Found `{name}` in function {func_index}."
+                );
+            }
+            // 4) Operator-level float refusal: catches transient float
+            //    values (e.g. `f32.const; drop`) that never appear in a
+            //    signature, global, or local.
+            if let Some(name) = float_op_name(&op) {
+                let func_index = module.func_index(def_func_index).as_u32();
+                bail!(
+                    "AN-encoding does not support floating-point operations. \
+                     Found `{name}` in function {func_index}."
+                );
+            }
+            if is_i32_i64_conversion_op(&op) {
+                saw_i64_conversion = true;
+            }
+        }
+    }
+    if saw_i64_conversion {
+        log::warn!(
+            "AN-encoding: module contains i32↔i64 conversion ops which work but \
+             are not encoded."
+        );
+    }
+
+    Ok(())
+}
+
+/// Return the wasm type name (`"f32"` / `"f64"`) if the given `WasmValType`
+/// is a float, otherwise `None`.
+fn wasm_val_type_float_name(ty: &wasmtime_environ::WasmValType) -> Option<&'static str> {
+    use wasmtime_environ::WasmValType::*;
+    match ty {
+        F32 => Some("f32"),
+        F64 => Some("f64"),
+        _ => None,
+    }
+}
+
+/// Return the first float wasm type name found in `tys`, or `None`.
+fn first_float_in_slice(tys: &[wasmtime_environ::WasmValType]) -> Option<&'static str> {
+    tys.iter().find_map(wasm_val_type_float_name)
+}
+
+/// Return the type name if the wasmparser `ValType` is a float, otherwise
+/// `None`. Used for the per-function-body locals walk where types come
+/// directly from the body reader rather than the module's interned type
+/// table.
+fn wasmparser_val_type_float_name(ty: &wasmparser::ValType) -> Option<&'static str> {
+    use wasmparser::ValType::*;
+    match ty {
+        F32 => Some("f32"),
+        F64 => Some("f64"),
+        _ => None,
+    }
+}
+
+/// Return `true` if the operator is a cross-type `i32 ↔ i64` conversion
+/// (`i32.wrap_i64`, `i64.extend_i32_s/u`) — one that takes an i32 out of the AN
+/// encoding into a raw i64, or brings a raw i64 in as an encoded i32. Used by
+/// [`validate_an_encoding_constraints`] to emit a once-per-module warning.
+/// `i32.extend8_s/16_s` stay inside the encoding (i32 → i32) and are
+/// deliberately *not* reported. (Float conversions are refused wholesale, so
+/// they never reach this check.)
+fn is_i32_i64_conversion_op(op: &wasmparser::Operator<'_>) -> bool {
+    use wasmparser::Operator::*;
+    matches!(op, I32WrapI64 | I64ExtendI32S | I64ExtendI32U)
+}
+
+/// Return the operator name for any scalar float-typed wasm operator (`f32.*`
+/// / `f64.*`, including conversions in either direction), or `None` for
+/// non-float operators. Used by [`validate_an_encoding_constraints`] to refuse
+/// modules containing floating-point operations under AN-encoding. SIMD
+/// float-lane operators (`f32x4.*` / `f64x2.*`) are not covered here.
+fn float_op_name(op: &wasmparser::Operator<'_>) -> Option<&'static str> {
+    use wasmparser::Operator::*;
+    Some(match op {
+        // Constants
+        F32Const { .. } => "f32.const",
+        F64Const { .. } => "f64.const",
+        // Loads / stores
+        F32Load { .. } => "f32.load",
+        F64Load { .. } => "f64.load",
+        F32Store { .. } => "f32.store",
+        F64Store { .. } => "f64.store",
+        // Unary arithmetic
+        F32Abs => "f32.abs",
+        F32Neg => "f32.neg",
+        F32Ceil => "f32.ceil",
+        F32Floor => "f32.floor",
+        F32Trunc => "f32.trunc",
+        F32Nearest => "f32.nearest",
+        F32Sqrt => "f32.sqrt",
+        F64Abs => "f64.abs",
+        F64Neg => "f64.neg",
+        F64Ceil => "f64.ceil",
+        F64Floor => "f64.floor",
+        F64Trunc => "f64.trunc",
+        F64Nearest => "f64.nearest",
+        F64Sqrt => "f64.sqrt",
+        // Binary arithmetic
+        F32Add => "f32.add",
+        F32Sub => "f32.sub",
+        F32Mul => "f32.mul",
+        F32Div => "f32.div",
+        F32Min => "f32.min",
+        F32Max => "f32.max",
+        F32Copysign => "f32.copysign",
+        F64Add => "f64.add",
+        F64Sub => "f64.sub",
+        F64Mul => "f64.mul",
+        F64Div => "f64.div",
+        F64Min => "f64.min",
+        F64Max => "f64.max",
+        F64Copysign => "f64.copysign",
+        // Compares
+        F32Eq => "f32.eq",
+        F32Ne => "f32.ne",
+        F32Lt => "f32.lt",
+        F32Gt => "f32.gt",
+        F32Le => "f32.le",
+        F32Ge => "f32.ge",
+        F64Eq => "f64.eq",
+        F64Ne => "f64.ne",
+        F64Lt => "f64.lt",
+        F64Gt => "f64.gt",
+        F64Le => "f64.le",
+        F64Ge => "f64.ge",
+        // Conversions to/from float
+        F32ConvertI32S => "f32.convert_i32_s",
+        F32ConvertI32U => "f32.convert_i32_u",
+        F32ConvertI64S => "f32.convert_i64_s",
+        F32ConvertI64U => "f32.convert_i64_u",
+        F32DemoteF64 => "f32.demote_f64",
+        F64ConvertI32S => "f64.convert_i32_s",
+        F64ConvertI32U => "f64.convert_i32_u",
+        F64ConvertI64S => "f64.convert_i64_s",
+        F64ConvertI64U => "f64.convert_i64_u",
+        F64PromoteF32 => "f64.promote_f32",
+        F32ReinterpretI32 => "f32.reinterpret_i32",
+        F64ReinterpretI64 => "f64.reinterpret_i64",
+        I32ReinterpretF32 => "i32.reinterpret_f32",
+        I64ReinterpretF64 => "i64.reinterpret_f64",
+        I32TruncF32S => "i32.trunc_f32_s",
+        I32TruncF32U => "i32.trunc_f32_u",
+        I32TruncF64S => "i32.trunc_f64_s",
+        I32TruncF64U => "i32.trunc_f64_u",
+        I64TruncF32S => "i64.trunc_f32_s",
+        I64TruncF32U => "i64.trunc_f32_u",
+        I64TruncF64S => "i64.trunc_f64_s",
+        I64TruncF64U => "i64.trunc_f64_u",
+        I32TruncSatF32S => "i32.trunc_sat_f32_s",
+        I32TruncSatF32U => "i32.trunc_sat_f32_u",
+        I32TruncSatF64S => "i32.trunc_sat_f64_s",
+        I32TruncSatF64U => "i32.trunc_sat_f64_u",
+        I64TruncSatF32S => "i64.trunc_sat_f32_s",
+        I64TruncSatF32U => "i64.trunc_sat_f32_u",
+        I64TruncSatF64S => "i64.trunc_sat_f64_s",
+        I64TruncSatF64U => "i64.trunc_sat_f64_u",
+        _ => return None,
+    })
+}
+
+/// Return the wasm operator name for any atomic memory operator, or `None`
+/// for non-atomic operators. Used by [`validate_an_encoding_constraints`] to
+/// produce actionable diagnostics. Covers the full threads-proposal surface:
+/// load/store/rmw (all integer widths and sub-i32 sizes), `cmpxchg`,
+/// `memory.atomic.{notify,wait32,wait64}`, and `atomic.fence`.
+fn atomic_op_name(op: &wasmparser::Operator<'_>) -> Option<&'static str> {
+    use wasmparser::Operator::*;
+    Some(match op {
+        AtomicFence { .. } => "atomic.fence",
+        MemoryAtomicNotify { .. } => "memory.atomic.notify",
+        MemoryAtomicWait32 { .. } => "memory.atomic.wait32",
+        MemoryAtomicWait64 { .. } => "memory.atomic.wait64",
+        I32AtomicLoad { .. } => "i32.atomic.load",
+        I32AtomicLoad8U { .. } => "i32.atomic.load8_u",
+        I32AtomicLoad16U { .. } => "i32.atomic.load16_u",
+        I64AtomicLoad { .. } => "i64.atomic.load",
+        I64AtomicLoad8U { .. } => "i64.atomic.load8_u",
+        I64AtomicLoad16U { .. } => "i64.atomic.load16_u",
+        I64AtomicLoad32U { .. } => "i64.atomic.load32_u",
+        I32AtomicStore { .. } => "i32.atomic.store",
+        I32AtomicStore8 { .. } => "i32.atomic.store8",
+        I32AtomicStore16 { .. } => "i32.atomic.store16",
+        I64AtomicStore { .. } => "i64.atomic.store",
+        I64AtomicStore8 { .. } => "i64.atomic.store8",
+        I64AtomicStore16 { .. } => "i64.atomic.store16",
+        I64AtomicStore32 { .. } => "i64.atomic.store32",
+        I32AtomicRmwAdd { .. } => "i32.atomic.rmw.add",
+        I32AtomicRmw8AddU { .. } => "i32.atomic.rmw8.add_u",
+        I32AtomicRmw16AddU { .. } => "i32.atomic.rmw16.add_u",
+        I64AtomicRmwAdd { .. } => "i64.atomic.rmw.add",
+        I64AtomicRmw8AddU { .. } => "i64.atomic.rmw8.add_u",
+        I64AtomicRmw16AddU { .. } => "i64.atomic.rmw16.add_u",
+        I64AtomicRmw32AddU { .. } => "i64.atomic.rmw32.add_u",
+        I32AtomicRmwSub { .. } => "i32.atomic.rmw.sub",
+        I32AtomicRmw8SubU { .. } => "i32.atomic.rmw8.sub_u",
+        I32AtomicRmw16SubU { .. } => "i32.atomic.rmw16.sub_u",
+        I64AtomicRmwSub { .. } => "i64.atomic.rmw.sub",
+        I64AtomicRmw8SubU { .. } => "i64.atomic.rmw8.sub_u",
+        I64AtomicRmw16SubU { .. } => "i64.atomic.rmw16.sub_u",
+        I64AtomicRmw32SubU { .. } => "i64.atomic.rmw32.sub_u",
+        I32AtomicRmwAnd { .. } => "i32.atomic.rmw.and",
+        I32AtomicRmw8AndU { .. } => "i32.atomic.rmw8.and_u",
+        I32AtomicRmw16AndU { .. } => "i32.atomic.rmw16.and_u",
+        I64AtomicRmwAnd { .. } => "i64.atomic.rmw.and",
+        I64AtomicRmw8AndU { .. } => "i64.atomic.rmw8.and_u",
+        I64AtomicRmw16AndU { .. } => "i64.atomic.rmw16.and_u",
+        I64AtomicRmw32AndU { .. } => "i64.atomic.rmw32.and_u",
+        I32AtomicRmwOr { .. } => "i32.atomic.rmw.or",
+        I32AtomicRmw8OrU { .. } => "i32.atomic.rmw8.or_u",
+        I32AtomicRmw16OrU { .. } => "i32.atomic.rmw16.or_u",
+        I64AtomicRmwOr { .. } => "i64.atomic.rmw.or",
+        I64AtomicRmw8OrU { .. } => "i64.atomic.rmw8.or_u",
+        I64AtomicRmw16OrU { .. } => "i64.atomic.rmw16.or_u",
+        I64AtomicRmw32OrU { .. } => "i64.atomic.rmw32.or_u",
+        I32AtomicRmwXor { .. } => "i32.atomic.rmw.xor",
+        I32AtomicRmw8XorU { .. } => "i32.atomic.rmw8.xor_u",
+        I32AtomicRmw16XorU { .. } => "i32.atomic.rmw16.xor_u",
+        I64AtomicRmwXor { .. } => "i64.atomic.rmw.xor",
+        I64AtomicRmw8XorU { .. } => "i64.atomic.rmw8.xor_u",
+        I64AtomicRmw16XorU { .. } => "i64.atomic.rmw16.xor_u",
+        I64AtomicRmw32XorU { .. } => "i64.atomic.rmw32.xor_u",
+        I32AtomicRmwXchg { .. } => "i32.atomic.rmw.xchg",
+        I32AtomicRmw8XchgU { .. } => "i32.atomic.rmw8.xchg_u",
+        I32AtomicRmw16XchgU { .. } => "i32.atomic.rmw16.xchg_u",
+        I64AtomicRmwXchg { .. } => "i64.atomic.rmw.xchg",
+        I64AtomicRmw8XchgU { .. } => "i64.atomic.rmw8.xchg_u",
+        I64AtomicRmw16XchgU { .. } => "i64.atomic.rmw16.xchg_u",
+        I64AtomicRmw32XchgU { .. } => "i64.atomic.rmw32.xchg_u",
+        I32AtomicRmwCmpxchg { .. } => "i32.atomic.rmw.cmpxchg",
+        I32AtomicRmw8CmpxchgU { .. } => "i32.atomic.rmw8.cmpxchg_u",
+        I32AtomicRmw16CmpxchgU { .. } => "i32.atomic.rmw16.cmpxchg_u",
+        I64AtomicRmwCmpxchg { .. } => "i64.atomic.rmw.cmpxchg",
+        I64AtomicRmw8CmpxchgU { .. } => "i64.atomic.rmw8.cmpxchg_u",
+        I64AtomicRmw16CmpxchgU { .. } => "i64.atomic.rmw16.cmpxchg_u",
+        I64AtomicRmw32CmpxchgU { .. } => "i64.atomic.rmw32.cmpxchg_u",
+        _ => return None,
+    })
+}
+
 /// Converts an input binary-encoded WebAssembly module to compilation
 /// artifacts and type information.
 ///
@@ -85,6 +457,7 @@ pub(crate) fn build_module_artifacts<T: FinishedObject>(
     )
     .translate(parser, wasm)
     .context("failed to parse WebAssembly module")?;
+    validate_an_encoding_constraints(&translation, tunables, &types)?;
     let functions = mem::take(&mut translation.function_body_inputs);
 
     let compile_inputs = CompileInputs::for_module(&types, &translation, functions);
