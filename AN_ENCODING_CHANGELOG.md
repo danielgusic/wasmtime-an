@@ -54,6 +54,8 @@ Pick a large odd value (preferably prime), powers of two weaken detection.
   - the encode / cross-check / range-re-encode / grow routines that keep each shadow in lockstep with raw memory (used by the allocator and the libcalls)
 - **`runtime/vm/instance/allocator.rs`**
   - after memory initialization, mirrors data-segment / CoW content into each shadow before wasm starts
+- **`runtime/memory.rs`**
+  - `#[doc(hidden)]` test-only `Memory::an_shadow_data_mut_for_test` accessor that hands out the encoded shadow as a mutable slice, so the fault-injection tests can tamper the shadow directly
 - **`runtime/vm/libcalls.rs`**
   - `an_check_host_boundary` / `an_resync_host_boundary` libcalls (cross-check before a host call, re-encode after)
   - shadow updates appended to the `memory.grow/copy/fill/init` libcalls
@@ -95,6 +97,8 @@ Pick a large odd value (preferably prime), powers of two weaken detection.
   - widens the i32 local IR type under AN
 - **`translate/translation_utils.rs`**
   - widens the i32 block-param IR type under AN
+- **`translate/mod.rs`**
+  - re-exports `emit_an_codeword_validity_check` from `an_helpers` for the trampoline codegen
 - **`compiler.rs`**
   - the wasm/host trampolines (`array_to_wasm_trampoline`, `compile_wasm_to_array_trampoline`) encode/decode i32 at the boundary
   - emit the boundary codeword check at each decode site, and bracket host calls with the cross-check / resync libcalls
