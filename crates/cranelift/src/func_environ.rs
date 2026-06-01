@@ -1414,7 +1414,12 @@ impl FuncEnvironment<'_> {
         GlobalVariable::Memory {
             gv,
             offset: offset.into(),
-            ty: super::value_type(self.isa, ty),
+            // AN-encoding: an i32 global is stored encoded as `A*v`, which does
+            // not fit in 32 bits, so widen its storage type to `I64` (the
+            // `VMGlobalDefinition` slot is 16 bytes, so there is room). This
+            // matches the operand-stack representation, so the loaded value is
+            // already a canonical encoded i32 with no per-access transform.
+            ty: super::wasm_stack_value_type(self.isa, self.tunables(), ty),
         }
     }
 
@@ -2974,6 +2979,16 @@ impl FuncEnvironment<'_> {
     ) -> WasmResult<ir::Value> {
         match self.get_or_create_global(builder.func, global_index) {
             GlobalVariable::Constant { value } => match value {
+                // AN-encoding: a constant-folded immutable i32 global must enter
+                // the operand stack already encoded as `A*v` in `I64`, the same
+                // form a memory-backed global would load. Treat the constant's
+                // bits as the canonical `v in [0, 2^32)` (zero-extend) and
+                // multiply by `A`.
+                GlobalConstValue::I32(x) if self.tunables().an_encoding => {
+                    let encoded =
+                        (self.tunables().an_constant).wrapping_mul(u64::from(x as u32)) as i64;
+                    Ok(builder.ins().iconst(ir::types::I64, encoded))
+                }
                 GlobalConstValue::I32(x) => Ok(builder.ins().iconst(ir::types::I32, i64::from(x))),
                 GlobalConstValue::I64(x) => Ok(builder.ins().iconst(ir::types::I64, x)),
                 GlobalConstValue::F32(x) => {
@@ -3902,6 +3917,22 @@ impl FuncEnvironment<'_> {
         if self.compiler.wmemcheck {
             if global_index.index() == 0 {
                 // We are making the assumption that global 0 is the auxiliary stack pointer.
+                let mut value = value;
+                // AN-encoding: an i32 global (incl. the aux stack pointer) is
+                // stored encoded as `A*v` in `I64`. The `update_stack_pointer`
+                // builtin takes a raw `i32`, so decode before the call.
+                if self.tunables().an_encoding
+                    && matches!(
+                        self.module.globals[global_index].wasm_ty,
+                        WasmValType::I32
+                    )
+                {
+                    let a = builder
+                        .ins()
+                        .iconst(ir::types::I64, self.tunables().an_constant as i64);
+                    let decoded = builder.ins().udiv(value, a);
+                    value = builder.ins().ireduce(ir::types::I32, decoded);
+                }
                 let update_stack_pointer =
                     self.builtin_functions.update_stack_pointer(builder.func);
                 let vmctx = self.vmctx_val(&mut builder.cursor());

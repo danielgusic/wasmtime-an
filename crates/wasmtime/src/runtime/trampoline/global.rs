@@ -37,7 +37,19 @@ pub fn generate_global_export(
     unsafe {
         let global = &mut ctx.get().as_mut().global;
         match val {
-            Val::I32(x) => *global.as_i32_mut() = x,
+            // AN-encoding: a host-created i32 global is the external boundary,
+            // so its initial value is stored encoded as `A*v` in the 64-bit
+            // slot — the same form a guest `global.get` expects to load (and
+            // what `Global::get`/`set` decode/encode against).
+            Val::I32(x) => {
+                let tunables = store.engine().tunables();
+                if tunables.an_encoding {
+                    *global.as_i64_mut() =
+                        tunables.an_constant.wrapping_mul(u64::from(x as u32)) as i64;
+                } else {
+                    *global.as_i32_mut() = x;
+                }
+            }
             Val::I64(x) => *global.as_i64_mut() = x,
             Val::F32(x) => *global.as_f32_bits_mut() = x,
             Val::F64(x) => *global.as_f64_bits_mut() = x,

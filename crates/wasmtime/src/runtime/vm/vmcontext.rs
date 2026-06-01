@@ -612,7 +612,20 @@ impl VMGlobalDefinition {
         let mut global = Self::new();
         unsafe {
             match wasm_ty {
-                WasmValType::I32 => *global.as_i32_mut() = raw.get_i32(),
+                // AN-encoding: an i32 global is stored encoded as `A * v` in the
+                // 64-bit slot. A `ValRaw` carries the raw value, so encode at this
+                // boundary (mirrors host-side `Global::set`).
+                WasmValType::I32 => {
+                    let tunables = store.engine().tunables();
+                    if tunables.an_encoding {
+                        *global.as_i64_mut() = tunables
+                            .an_constant
+                            .wrapping_mul(u64::from(raw.get_i32() as u32))
+                            as i64;
+                    } else {
+                        *global.as_i32_mut() = raw.get_i32();
+                    }
+                }
                 WasmValType::I64 => *global.as_i64_mut() = raw.get_i64(),
                 WasmValType::F32 => *global.as_f32_bits_mut() = raw.get_f32(),
                 WasmValType::F64 => *global.as_f64_bits_mut() = raw.get_f64(),
@@ -650,7 +663,17 @@ impl VMGlobalDefinition {
     ) -> Result<ValRaw> {
         unsafe {
             Ok(match wasm_ty {
-                WasmValType::I32 => ValRaw::i32(*self.as_i32()),
+                // AN-encoding: decode the stored `A * v` (64-bit slot) back to the
+                // raw i32 carried by a `ValRaw` (mirrors host-side `Global::get`).
+                WasmValType::I32 => {
+                    let tunables = store.engine().tunables();
+                    if tunables.an_encoding {
+                        let v = (*self.as_i64() as u64) / tunables.an_constant;
+                        ValRaw::i32(v as u32 as i32)
+                    } else {
+                        ValRaw::i32(*self.as_i32())
+                    }
+                }
                 WasmValType::I64 => ValRaw::i64(*self.as_i64()),
                 WasmValType::F32 => ValRaw::f32(*self.as_f32_bits()),
                 WasmValType::F64 => ValRaw::f64(*self.as_f64_bits()),

@@ -501,6 +501,157 @@ fn ops_with_an_custom_constants() -> wasmtime::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Host-boundary global encode/decode.
+//
+// Under AN-encoding an i32 global is stored *encoded* as `A*v`. The guest
+// observes the encoded form directly via `global.get`/`global.set`; the host
+// is the external boundary, so `Global::get` must decode and `Global::set`
+// must encode. These tests cross-check the host view against the guest view to
+// prove the two stay in agreement and that the stored form is genuinely
+// encoded (not raw).
+// ---------------------------------------------------------------------------
+
+// Exports the globals directly (the `ops.wat` module only exports accessor
+// functions, so it never exercises the host-side `Global` API).
+const GLOBAL_EXPORT_WAT: &str = r#"
+(module
+  (global $g (export "g") (mut i32) (i32.const 42))
+  (global $g_neg (export "g_neg") i32 (i32.const -7))
+  (func (export "g_get") (result i32) global.get $g)
+  (func (export "g_set") (param i32) local.get 0 global.set $g))
+"#;
+
+fn global_boundary_check(an_enabled: bool, an_constant: Option<u64>) -> wasmtime::Result<()> {
+    use wasmtime::Val;
+
+    let mut config = Config::new();
+    config.an_encoding(an_enabled);
+    if let Some(a) = an_constant {
+        config.an_constant(a);
+    }
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, GLOBAL_EXPORT_WAT)?;
+    let mut store = Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
+
+    let g = instance.get_global(&mut store, "g").unwrap();
+    let g_neg = instance.get_global(&mut store, "g_neg").unwrap();
+    let g_get = instance.get_typed_func::<(), i32>(&mut store, "g_get")?;
+    let g_set = instance.get_typed_func::<i32, ()>(&mut store, "g_set")?;
+
+    // Host reads decode: the embedder sees the raw initializer, not `A*v`.
+    // The guest reads the same value via `global.get`.
+    assert_eq!(g.get(&mut store).unwrap_i32(), 42, "host get initial");
+    assert_eq!(g_neg.get(&mut store).unwrap_i32(), -7, "host get neg init");
+    assert_eq!(g_get.call(&mut store, ())?, 42, "guest get initial");
+
+    let cases = [
+        0i32,
+        1,
+        -1,
+        42,
+        -42,
+        i32::MIN,
+        i32::MAX,
+        0x7fff_ffff,
+        0x8000_0000u32 as i32,
+        0x1234_5678,
+    ];
+    for &v in &cases {
+        // Host write encodes; the guest observes the same value.
+        g.set(&mut store, Val::I32(v))?;
+        assert_eq!(g_get.call(&mut store, ())?, v, "guest sees host-set {v}");
+        assert_eq!(g.get(&mut store).unwrap_i32(), v, "host round-trip {v}");
+
+        // Guest write stores encoded; the host decodes the same value back.
+        let w = v.wrapping_neg();
+        g_set.call(&mut store, w)?;
+        assert_eq!(g.get(&mut store).unwrap_i32(), w, "host sees guest-set {w}");
+    }
+    Ok(())
+}
+
+#[test]
+fn global_boundary_without_an() -> wasmtime::Result<()> {
+    global_boundary_check(false, None)
+}
+
+#[test]
+fn global_boundary_with_an() -> wasmtime::Result<()> {
+    global_boundary_check(true, None)
+}
+
+// A host-created (`Global::new`) i32 global imported into an AN module. This
+// exercises the `VMGlobalKind::Host` storage path: the host initializer and
+// `Global::set` must encode, `Global::get` must decode, and the guest reads
+// the encoded form directly.
+const GLOBAL_IMPORT_WAT: &str = r#"
+(module
+  (global $imp (import "env" "g") (mut i32))
+  (func (export "get") (result i32) global.get $imp)
+  (func (export "inc") (param i32) (result i32)
+    global.get $imp local.get 0 i32.add
+    global.set $imp
+    global.get $imp))
+"#;
+
+fn global_import_check(an_enabled: bool, an_constant: Option<u64>) -> wasmtime::Result<()> {
+    use wasmtime::{Global, GlobalType, Mutability, Val, ValType};
+
+    let mut config = Config::new();
+    config.an_encoding(an_enabled);
+    if let Some(a) = an_constant {
+        config.an_constant(a);
+    }
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, GLOBAL_IMPORT_WAT)?;
+    let mut store = Store::new(&engine, ());
+
+    let g = Global::new(
+        &mut store,
+        GlobalType::new(ValType::I32, Mutability::Var),
+        Val::I32(100),
+    )?;
+    let instance = wasmtime::Instance::new(&mut store, &module, &[g.into()])?;
+    let get = instance.get_typed_func::<(), i32>(&mut store, "get")?;
+    let inc = instance.get_typed_func::<i32, i32>(&mut store, "inc")?;
+
+    // Guest reads the host-provided import (host init must have encoded it).
+    assert_eq!(get.call(&mut store, ())?, 100, "guest reads imported global");
+    // Guest mutation flows back to the host decoded.
+    assert_eq!(inc.call(&mut store, 23)?, 123, "guest inc");
+    assert_eq!(g.get(&mut store).unwrap_i32(), 123, "host sees guest mutation");
+    // Host write of a negative value is observed by the guest.
+    g.set(&mut store, Val::I32(-5))?;
+    assert_eq!(get.call(&mut store, ())?, -5, "guest sees host set");
+    Ok(())
+}
+
+#[test]
+fn global_import_without_an() -> wasmtime::Result<()> {
+    global_import_check(false, None)
+}
+
+#[test]
+fn global_import_with_an() -> wasmtime::Result<()> {
+    global_import_check(true, None)
+}
+
+// Both boundary paths must hold across several legal values of `A` (the same
+// picks as `ops_with_an_custom_constants`), confirming the encode/decode read
+// `A` from the tunables rather than baking in the default.
+#[test]
+fn global_boundary_various_an_constants() -> wasmtime::Result<()> {
+    for &a in &[1u64, 7, 1009, 8_388_607] {
+        global_boundary_check(true, Some(a))
+            .map_err(|e| wasmtime::Error::msg(format!("global_boundary failed with A={a}: {e}")))?;
+        global_import_check(true, Some(a))
+            .map_err(|e| wasmtime::Error::msg(format!("global_import failed with A={a}: {e}")))?;
+    }
+    Ok(())
+}
+
 // Module-level feature refusals: AN-encoding allocates an encoded shadow per
 // defined linear memory, which requires owning the memory's storage and
 // excludes imported and shared (atomic) memories. Each refusal is exercised

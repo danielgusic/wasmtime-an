@@ -191,23 +191,12 @@ pub fn translate_operator(
          ***********************************************************************************/
         Operator::GlobalGet { global_index } => {
             let global_index = GlobalIndex::from_u32(*global_index);
-            let mut val = environ.translate_global_get(builder, global_index)?;
-            // AN-encoding: i32 globals stay raw `I32` in storage (matches the
-            // linear-memory model — host-side `Global::get`/`set` keep working
-            // unchanged). Encode on the way out so the operand stack sees
-            // canonical `A*v` in `I64`.
-            if environ.tunables().an_encoding
-                && matches!(
-                    environ.module.globals[global_index].wasm_ty,
-                    WasmValType::I32
-                )
-            {
-                let a_const = builder
-                    .ins()
-                    .iconst(I64, environ.tunables().an_constant as i64);
-                let widened = builder.ins().uextend(I64, val);
-                val = builder.ins().imul(widened, a_const);
-            }
+            // AN-encoding: i32 globals are stored encoded as `A*v` in `I64`
+            // storage (the storage type is widened in `make_global`), so the
+            // loaded value is already a canonical encoded operand and needs no
+            // per-access transform. Decoding happens only at external boundaries
+            // (host-side `Global::get`).
+            let val = environ.translate_global_get(builder, global_index)?;
             environ.stacks.push1(val);
         }
         Operator::GlobalSet { global_index } => {
@@ -217,20 +206,10 @@ pub fn translate_operator(
             if builder.func.dfg.value_type(val).is_vector() {
                 val = optionally_bitcast_vector(val, I8X16, builder);
             }
-            // AN-encoding: decode the encoded `I64` value (`A*v` -> `v`) and
-            // narrow to `I32` before handing off to the raw-storage write.
-            if environ.tunables().an_encoding
-                && matches!(
-                    environ.module.globals[global_index].wasm_ty,
-                    WasmValType::I32
-                )
-            {
-                let a_const = builder
-                    .ins()
-                    .iconst(I64, environ.tunables().an_constant as i64);
-                let decoded = builder.ins().udiv(val, a_const);
-                val = builder.ins().ireduce(I32, decoded);
-            }
+            // AN-encoding: the operand is already the encoded `A*v` (`I64`) and
+            // the global's storage is widened to match, so it is stored as-is.
+            // Encoding happens only at external boundaries (host-side
+            // `Global::set`).
             environ.translate_global_set(builder, global_index, val)?;
         }
         /********************************* Stack misc ***************************************

@@ -67,6 +67,12 @@ Pick a large odd value (preferably prime), powers of two weaken detection.
   - `#[doc(hidden)]` test-only knobs `Config::an_inject_codeword_fault(u64)` (trampoline boundaries) and `Config::an_inject_conversion_fault(u64)` (conversion-op decode sites)
 - **`engine/serialization.rs`**
   - includes the AN tunables in cwasm compatibility validation
+- **`runtime/externals/global.rs`**
+  - host-boundary global encode/decode: `Global::get` decodes the stored `A·v`, `Global::set` (and instantiation's `set_unchecked`) encodes. `an_constant_for_i32` gates this to wasm-module i32 globals (`Instance`/`Host`), excluding the component flag globals
+- **`runtime/trampoline/global.rs`**
+  - `generate_global_export` encodes the initial value of a host-created (`Global::new`) i32 global
+- **`runtime/vm/vmcontext.rs`**
+  - `VMGlobalDefinition::{from,to}_val_raw` encode/decode the i32 `ValRaw` ↔ storage conversion
 
 ### Environment - `crates/environ`
 
@@ -93,6 +99,9 @@ Pick a large odd value (preferably prime), powers of two weaken detection.
   - implements AN-encoding for the supported operators (see *Per-op behaviour*)
   - mirrors `i32.store{,8,16}` into the shadow
   - decodes/re-encodes the i32 operands around the memory- and table-index builtins (`memory.*`, `table.*`, `call_indirect`)
+  - `global.get`/`global.set` no longer transform the value: storage is encoded, so loads/stores are pass-through
+- **`func_environ.rs`**
+  - `make_global` widens i32 global storage to `I64` under AN; `translate_global_get` emits `iconst.i64 (A·v)` for constant-folded immutable i32 globals
 - **`translate/func_translator.rs`**
   - widens the i32 local IR type under AN
 - **`translate/translation_utils.rs`**
@@ -199,8 +208,8 @@ needing per-use decode.
 | `i32.store8` | decode addr, decode value; wasm store raw byte. **Plus** single byte-RMW on the shadow slot containing the target byte. `i32.store8` always fits in one slot. |
 | `i32.store16` | decode addr, decode value; wasm store raw half. **Plus** two byte-RMWs at `effective_addr` and `effective_addr + 1`. Covers in-slot (`byte_pos in 0..=2`) and cross-slot (`byte_pos == 3`) cases uniformly because each byte-RMW computes its own slot index. |
 | `local.{get,set,tee}` (i32) | type widened to I64 by the sig/locals widening |
-| `global.get` (i32) | i32 globals stay raw `I32` in `VMGlobalDefinition` storage (matches the linear-memory deviation, host-side `Global::get`/`set` keep working). Encode on the way out: `uextend.i64 -> · A`. Imports, defined globals, and constant-folded immutable globals all go through the same encode step. |
-| `global.set` (i32) | decode at storage boundary: `udiv A → ireduce.i32`, then raw `I32` store. Non-i32 globals pass through unchanged. |
+| `global.get` (i32) | i32 globals are stored encoded, so no per-access tranform is needed for the guest. Their `VMGlobalDefinition` storage type is widened to `I64` in `make_global` (the slot is 16 bytes, so there is room). Imports, defined globals, and constant-folded immutable globals all load the encoded form (constant-folded ones emit `iconst.i64 (A·v)` directly). Decoding happens only at external boundaries |
+| `global.set` (i32) | the operand is already the canonical encoded `A·v` (`I64`), so no change is needed. Non-i32 globals pass through unchanged. Encoding/decoding happens only at external boundaries |
 | `i32.extend8_s` / `i32.extend16_s` | stays inside the encoding. Decode (`udiv → ireduce.i32`, no codeword check because of structural invariant, matches `clz`/`ctz`/`popcnt`), sign-extend the low byte/half-word to i32, re-encode via `emit_an_encode_raw_i32` (`uextend.i64 → · A`). |
 | `i32.wrap_i64` | raw i64 → encoded i32. Take low 32 bits (`ireduce.i32`), re-encode. Wasm-spec: no trap. Input is *not* a codeword (raw i64), so no codeword check. Compile emits a one-shot per-module warning ([Conversion warning](#conversion-warning)). |
 | `i64.extend_i32_s` / `i64.extend_i32_u` | encoded i32 → raw i64. Boundary codeword check via `emit_an_conversion_decode_i32` (optionally bumps by `an_inject_conversion_fault` first), then `urem` + `trapnz` against `Trap::AnCodewordInvalid`, then decode `udiv A → ireduce.i32`, then `sextend`/`uextend` to `I64`. Output leaves the AN encoding; warning emitted at compile time. |
@@ -222,7 +231,7 @@ High level overview (see `crates/cranelift/src/translate/an_helpers.rs` for more
 For this, several helper functions have been implemented.
 
 
-### Refused / unsolved features
+### Refused / unsolved / WIP features
 
 
 | Feature | Why it's refused / unsolved | Idea how to solve |
@@ -232,7 +241,7 @@ For this, several helper functions have been implemented.
 | shared/atomic memory, imported memory | refused at compile time | shared memories need atomic-safe shadow stores, imported memories need cross-instance shadow ownership, atomic ops need read-modify-write shadow paths that respect threads-proposal ordering |
 | SIMD | not implemented
 | GC types | not implemented
-| Globals | still stored unencoded
+| wmemcheck | not implemented, should break I think
 
 
 ### Conversion warning
@@ -298,6 +307,7 @@ group with AN off and on:
 | `fib_with_an_and_load_validity_check` | same fib run with `an_load_validity_check(true)` on top of AN |
 | `ops_{without_an,with_an}` | one wat module exporting one function per touched operator: add, sub, mul, divu, remu, divs, rems, addconst, lt_u, ge_u, gt_u, eq, ne, eqz, lt_s/le_s/gt_s/ge_s, and/or/xor/not/mask_merge, shl/shr_u/shr_s/rotl/rotr, clz/ctz/popcnt, max_u, loop_count, digits, memory load/store, mutable i32 global (g_get/g_set/g_inc) plus negative immutable initializer. Shifts/rotations cover 12 value patterns × 14 shift counts (including wraparound > 32). Includes trap assertions for `div_s` (`/0`, `INT_MIN/-1`) and `rem_s` (`/0`, `INT_MIN%-1 → 0`). |
 | `ops_with_an_custom_constants` | re-runs the `ops_*` assertions with several non-default values of `A` (1, 7, 1009, 2²³ − 1) to verify the codegen reads `A` from `Tunables` rather than baking the default in |
+| `global_boundary_{without,with}_an` / `global_import_{without,with}_an` / `global_boundary_various_an_constants` | host-boundary global encode/decode. `global_boundary_*` exports a mutable and an immutable i32 global directly and cross-checks the host view (`Global::get`/`set`) against the guest view (`global.get`/`set`) over a value matrix (incl. negatives, `i32::MIN/MAX`); the host always sees raw values while storage stays encoded. `global_import_*` imports a host-created (`Global::new`) i32 global into the module, exercising the `VMGlobalKind::Host` storage path (host init + `set`/`get` + guest mutation round-trip). `_various` re-runs both under `A ∈ {1, 7, 1009, 2²³ − 1}`. AN-off counterparts confirm identical behavior. |
 | `refuse_float_{param,result,local,global,op}_under_an` | a float in a function signature, global, local, or operator stream must fail compilation under AN with a "floating-point" message |
 | `refuse_imported_memory_under_an` / `refuse_shared_memory_under_an` | each compiles a wat module that violates the supported-feature matrix and asserts the error mentions AN-encoding |
 | `multi_memory_compiles_under_an` / `multi_memory_stores_keep_shadows_consistent` / `multi_memory_tamper_{mem0,mem1}_traps` / `multi_memory_clean_run_passes` | multi-memory module with two defined memories: stores route to each via `memarg.memory`, the host-boundary cross-check visits both shadows, and tampering either memory's raw bytes raises `AnMemoryMismatch` |

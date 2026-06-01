@@ -151,7 +151,15 @@ impl Global {
         unsafe {
             let definition = self.definition(store).as_ref();
             match self._ty(&store).content() {
-                ValType::I32 => Val::from(*definition.as_i32()),
+                ValType::I32 => match self.an_constant_for_i32(&store) {
+                    // AN-encoded storage holds `A * v` in the 64-bit slot;
+                    // decode back to the raw i32 the host expects.
+                    Some(a) => {
+                        let v = (*definition.as_i64() as u64) / a;
+                        Val::from(v as u32 as i32)
+                    }
+                    None => Val::from(*definition.as_i32()),
+                },
                 ValType::I64 => Val::from(*definition.as_i64()),
                 ValType::F32 => Val::F32(*definition.as_u32()),
                 ValType::F64 => Val::F64(*definition.as_u64()),
@@ -255,7 +263,12 @@ impl Global {
         unsafe {
             let definition = self.definition(&store).as_mut();
             match val {
-                Val::I32(i) => *definition.as_i32_mut() = *i,
+                Val::I32(i) => match self.an_constant_for_i32(&store) {
+                    // Encode the raw i32 as `A * v` and widen into the 64-bit
+                    // slot so guest `global.get` observes a canonical codeword.
+                    Some(a) => *definition.as_i64_mut() = a.wrapping_mul(u64::from(*i as u32)) as i64,
+                    None => *definition.as_i32_mut() = *i,
+                },
                 Val::I64(i) => *definition.as_i64_mut() = *i,
                 Val::F32(f) => *definition.as_u32_mut() = *f,
                 Val::F64(f) => *definition.as_u64_mut() = *f,
@@ -431,6 +444,30 @@ impl Global {
     #[cfg(feature = "coredump")]
     pub(crate) fn hash_key(&self, store: &StoreOpaque) -> impl core::hash::Hash + Eq + use<> {
         self.definition(store).as_ptr().addr()
+    }
+
+    /// AN-encoding boundary helper.
+    ///
+    /// When AN-encoding is enabled, an i32 wasm global is stored *encoded* as
+    /// `A * v` widened into the 64-bit slot (see the cranelift `make_global`
+    /// widening). The encoded form is what guest `global.get`/`global.set`
+    /// observe directly; external (host) accesses are the boundary, so they
+    /// must decode on read and encode on write.
+    ///
+    /// Returns `Some(A)` when this global's storage is AN-encoded. Only real
+    /// wasm-module globals (`Instance`/`Host`) use encoded storage. The
+    /// component-internal flag globals (`ComponentFlags`/`TaskMayBlock`) are
+    /// manipulated raw by the runtime trampolines and are excluded. Callers
+    /// must only consult this from an i32 context.
+    fn an_constant_for_i32(&self, store: &StoreOpaque) -> Option<u64> {
+        let tunables = store.engine().tunables();
+        if tunables.an_encoding
+            && matches!(self.kind, VMGlobalKind::Instance(_) | VMGlobalKind::Host(_))
+        {
+            Some(tunables.an_constant)
+        } else {
+            None
+        }
     }
 
     fn definition(&self, store: &StoreOpaque) -> NonNull<VMGlobalDefinition> {
