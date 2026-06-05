@@ -51,7 +51,7 @@ Pick a large odd value (preferably prime), powers of two weaken detection.
   - registers the `an_lut` module
 - **`runtime/vm/instance.rs`**
   - per-instance AN state: LUT pointer slots copied into the `VMContext` on `set_store`, and an `an_enc_shadows` map owning one encoded shadow `Box<[u8]>` per defined memory
-  - the encode / cross-check / range-re-encode / grow routines that keep each shadow in lockstep with raw memory (used by the allocator and the libcalls)
+  - the encode / cross-check / range-re-encode / grow routines that keep each shadow in lockstep with raw memory (used by the allocator and the libcalls). `an_grow_shadow` copies the prior shadow forward into the new (larger) buffer rather than re-encoding from raw, so `memory.grow` stays O(grown-delta) and lazy — see *Resolved: `big-strings.wast` over-allocation*
 - **`runtime/vm/instance/allocator.rs`**
   - after memory initialization, mirrors data-segment / CoW content into each shadow before wasm starts
 - **`runtime/memory.rs`**
@@ -99,9 +99,11 @@ Pick a large odd value (preferably prime), powers of two weaken detection.
   - implements AN-encoding for the supported operators (see *Per-op behaviour*)
   - mirrors `i32.store{,8,16}` into the shadow
   - decodes/re-encodes the i32 operands around the memory- and table-index builtins (`memory.*`, `table.*`, `call_indirect`)
+  - decodes the `br_table` controlling index before selecting a target (it is a raw i32 selector, not an encoded value)
   - `global.get`/`global.set` no longer transform the value: storage is encoded, so loads/stores are pass-through
 - **`func_environ.rs`**
   - `make_global` widens i32 global storage to `I64` under AN; `translate_global_get` emits `iconst.i64 (A·v)` for constant-folded immutable i32 globals
+  - raw host-control globals (component instance flags, `task_may_block`; see `Module::an_raw_globals`) are exempted: `make_global` keeps their native i32 storage, `translate_global_get` encodes the loaded raw value (`uextend`+`imul A`), and `translate_global_set` decodes the operand (`udiv A`+`ireduce`) before storing. This makes a fused adapter's `global.get`/`global.set` on these host-backed slots a raw↔encoded boundary, so the runtime keeps reading/writing them as raw bits
 - **`translate/func_translator.rs`**
   - widens the i32 local IR type under AN
 - **`translate/translation_utils.rs`**
@@ -113,6 +115,11 @@ Pick a large odd value (preferably prime), powers of two weaken detection.
   - emit the boundary codeword check at each decode site, and bracket host calls with the cross-check / resync libcalls
 - **`compiler/component.rs`**
   - the component hostcall trampoline (`translate_hostcall`) gets the same i32 encode/decode + codeword check + cross-check/resync treatment for canon-lowered host imports
+  - the string-transcoder trampoline (`translate_transcode`) decodes its i32 ptr/len/flag args (`len_param`, `first_pass`) and re-encodes its i32 results (`encode_result`); without this the wasm→host `cast_to_pointer` applied `uextend.i64` to an already-encoded i64 arg, which the aarch64 backend rejected (`assert!(inner_bits < out_bits)`), panicking compilation of any component that transcodes strings
+  - the hand-written `translate_resource_drop` trampoline decodes its i32 handle index before the `resource_drop` libcall (otherwise an encoded handle `A*v` reached the host as e.g. "unknown handle index 65521") and encodes the `rep` passed to an AN-compiled destructor
+  - the `UnsafeIntrinsic` trampolines that bypass `translate_hostcall` decode/encode i32 themselves: `translate_load_intrinsic` re-encodes an i32 native-load result, `translate_store_intrinsic` decodes the i32 value before the native store, and `translate_context_intrinsic` encodes on `context.get` / decodes on `context.set` (shared `an_encode_i32_result` / `an_decode_i32_param` helpers). The `Stream*`/`Future*`/`Task*`/`Thread*` trampolines need no special handling — they go through `translate_hostcall`. See *Known limitations*
+- **`crates/environ/src/module.rs`** + **`component/translate/adapt.rs`**
+  - `Module::an_raw_globals` records which imported globals are raw host-control state (`CoreDef::InstanceFlags` / `TaskMayBlock`); populated when an adapter module is translated so the cranelift backend can treat them as a raw↔encoded boundary
 
 ### CLI & tests
 
@@ -238,6 +245,7 @@ For this, several helper functions have been implemented.
 |---|---|---|
 | floating point | f32/f64 types and every float operator are refused at compile time | -
 | i64 support | an encoded i64 would need 128 bit (and even more with operations like mul), but 128 bit support is non-existent | enormous amounts of i64 concatenation hacks |
+|async| not implemented yet| take a look at it
 | shared/atomic memory, imported memory | refused at compile time | shared memories need atomic-safe shadow stores, imported memories need cross-instance shadow ownership, atomic ops need read-modify-write shadow paths that respect threads-proposal ordering |
 | SIMD | not implemented
 | GC types | not implemented
@@ -312,8 +320,12 @@ group with AN off and on:
 | `refuse_imported_memory_under_an` / `refuse_shared_memory_under_an` | each compiles a wat module that violates the supported-feature matrix and asserts the error mentions AN-encoding |
 | `multi_memory_compiles_under_an` / `multi_memory_stores_keep_shadows_consistent` / `multi_memory_tamper_{mem0,mem1}_traps` / `multi_memory_clean_run_passes` | multi-memory module with two defined memories: stores route to each via `memarg.memory`, the host-boundary cross-check visits both shadows, and tampering either memory's raw bytes raises `AnMemoryMismatch` |
 | `load_validity_check_default_off` / `load_validity_check_clean_run_passes` / `load_validity_check_traps_on_{raw_tamper,load8u,load16u_cross_slot}` / `load_validity_check_traps_unaligned_i32_load` / `load_validity_check_various_an_constants` | opt-in per-load check: with `an_load_validity_check(true)`, tampering raw bytes via `Memory::data_mut` between instantiation and a wasm load makes the load raise `AnMemoryMismatch` immediately. Covers `i32.load`/`load8_u`/`load16_u`, aligned + unaligned + cross-slot positions, and several A values. The default-off counterpart confirms the check is gated correctly. |
+| `br_table_{without,with}_an` | a `br_table` with three explicit targets plus a default; confirms non-zero selectors 1/2 select their arm and out-of-range selectors (3, 7) hit the default, under AN-on and AN-off (selector 0 is omitted — `A*0 == 0` makes a missing decode invisible there, see *Test hardening*). Regression guard: the controlling index is a raw i32 selector and must be decoded before `br_table`, otherwise the encoded value (`A*v`) lands out of range and every non-zero index silently falls through to the default. This is the one index-consuming operator the rest of the matrix did not cover. |
 | `table_{size,grow,fill,copy,init}_under_an` / `call_indirect_under_an` / `table_ops_match_without_an` | a wat with a 4-element funcref table exercises each table op under AN-on and confirms behavior matches the AN-off baseline. Without the per-operand decode, encoded i64 operands flowing into `cast_index_to_i64` panic in cranelift. `call_indirect` covers the vtable dispatch case (the hot path for closures / virtual calls in real wasm). |
 | `component_an::component_compiles_{without,with}_an` / `component_an::component_with_an_various_constants` | component-model integration: a component wraps a core module that does an `i32.store` and then calls a host import via canon-lower. The AN cross-check + resync libcalls fire from the component hostcall trampoline using the core caller's vmctx. The "various constants" case re-runs across `A ∈ {1, 7, 1009, 65521, 2^23 − 1}` to confirm the libcalls read `A` from the engine tunables. |
+| `component_an::transcode_component_compiles_{without,with}_an` | compiles a component that transcodes a string between encodings (utf8 → utf16) under AN (constants 1, 7, 65521, 2²³−1). Regression guard for the string-transcoder trampoline: before the fix `uextend.i64` was applied to an already-encoded i64 ptr/len arg, panicking cranelift aarch64 lowering with `assert!(inner_bits < out_bits)`. |
+| `component_an::transcode_string_roundtrip_{without,with}_an` | end-to-end: lowers a host `&str` into a component and reads back its UTF-8 byte length (ASCII `"hello"` → 5; multi-byte `"héllo"` → 6). Exercises the whole string-ABI path under AN: transcoder trampoline arg-decode/result-encode, the realloc call into AN-compiled core wasm, and the raw `may_enter`/`may_leave` instance-flag globals (encode-on-get / decode-on-set). Before the flag fix this trapped "cannot leave component instance". |
+| `component_an::resource_new_drop_{without,with}_an` | end-to-end `resource.new` + `resource.drop` under AN, returning the handle index. Guards `translate_resource_drop`'s hand-written trampoline decoding its i32 handle index; before the fix the encoded handle reached the host as "unknown handle index 65521" (`A·1`). |
 | `refuse_atomic_{load,store,rmw_add,rmw_cmpxchg,fence}_under_an` / `refuse_memory_atomic_{notify,wait32}_under_an` | each compiles a wat module exercising a representative threads-proposal atomic operator and asserts compilation fails with "AN-encoding" in the message |
 | `memory64_with_an_is_allowed_with_warning` | memory64 + AN compiles (warning-only) |
 | `instantiate_data_segment_under_an` | smoke test: AN-encoding shadow init does not panic when a data segment is present at instantiation |
@@ -328,6 +340,7 @@ group with AN off and on:
 | `bulk_memory_copy_keeps_shadow_consistent` | non-overlapping and overlapping `memory.copy`; verifies `memmove`-style overlap handling |
 | `active_data_segment_keeps_shadow_consistent` / `passive_memory_init_keeps_shadow_consistent` | active data segment mirrored into the shadow at instantiation, and `memory.init` of a passive segment kept consistent |
 | `bulk_memory_grow_keeps_shadow_consistent` | `memory.grow` preserves a pre-grow sentinel byte and the freshly grown pages encode as zero |
+| `grow_does_not_resync_shadow_from_raw` / `grow_preserves_shadow_across_repeated_grows` | shadow-grow regression guards: a raw/shadow divergence introduced before a grow must still trap at the next host boundary (i.e. `memory.grow` must not re-encode the shadow from raw — the `big-strings` over-allocation cause), and written data must survive repeated grows with the cross-check still agreeing |
 | `bulk_memory_with_various_an_constants` | bulk-op + cross-check loop across `A` ∈ {1, 7, 1009, 65521, 2^23−1} |
 | `codeword_check::codeword_check_clean_wasm_to_host_args` / `codeword_check_clean_wasm_to_host_multi_args` / `codeword_check_clean_wasm_to_host_no_i32_params` / `codeword_check_clean_host_to_wasm_returns` / `codeword_check_clean_repeated_host_calls` / `codeword_check_clean_various_an_constants` / `codeword_check_no_trap_when_an_off` | boundary codeword check positive coverage. Every wasm/host trampoline shape (one/many i32 args, no-i32, return-only, many calls, every legal `A`) completes without false-positive. AN-off counterpart confirms the check is gated correctly. |
 | `codeword_check::codeword_check_traps_wasm_to_host_args_with_injection` / `codeword_check_traps_host_to_wasm_returns_with_injection` / `codeword_check_traps_various_an_constants` | boundary codeword check negative coverage. With `Config::an_inject_codeword_fault(1)` set, the trampoline bumps the first encoded i32 arg/result by 1 before the modulo check fires; the check is guaranteed to trap as `Trap::AnCodewordInvalid` for any `A > 1`. Covers both directions (wasm→host args, host→wasm returns) and several `A` values. |
@@ -338,6 +351,7 @@ group with AN off and on:
 
 Both AN modes are required to produce identical results (except where a feature
 is refused under AN, in which case the AN-on run must fail to compile).
+
 
 ---
 

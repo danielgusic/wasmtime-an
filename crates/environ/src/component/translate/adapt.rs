@@ -235,7 +235,7 @@ impl<'data> Translator<'_, 'data> {
             // memory.
             self.validator.reset();
             let static_module_index = self.static_modules.next_key();
-            let translation = ModuleEnvironment::new(
+            let mut translation = ModuleEnvironment::new(
                 self.tunables,
                 &mut self.validator,
                 self.types.module_types_builder(),
@@ -266,6 +266,29 @@ impl<'data> Translator<'_, 'data> {
                 .zip(translation.module.imports())
                 .map(|(arg, (_, _, ty))| fact_import_to_core_def(component, arg, ty))
                 .collect::<Vec<_>>();
+
+            // AN-encoding: flag the imported globals that are raw host-control
+            // state (component instance flags + `task_may_block`). These are
+            // written/read as raw bits by the runtime, so under AN the compiler
+            // must treat them as a raw↔encoded boundary rather than widening
+            // their storage. `args` is in import order, parallel to the module's
+            // imports; track the global index space as we go.
+            if self.tunables.an_encoding {
+                let mut raw_globals = Vec::new();
+                let mut next_global = 0u32;
+                for ((_, _, ty), def) in translation.module.imports().zip(&args) {
+                    if !matches!(ty, EntityType::Global(_)) {
+                        continue;
+                    }
+                    let g = GlobalIndex::from_u32(next_global);
+                    next_global += 1;
+                    if matches!(def, dfg::CoreDef::InstanceFlags(_) | dfg::CoreDef::TaskMayBlock) {
+                        raw_globals.push(g);
+                    }
+                }
+                translation.module.an_raw_globals = raw_globals;
+            }
+
             let static_module_index2 = self.static_modules.push(translation);
             assert_eq!(static_module_index, static_module_index2);
             let id = component.adapter_modules.push((static_module_index, args));

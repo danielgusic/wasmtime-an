@@ -39,6 +39,53 @@ fn mul_with_an() -> wasmtime::Result<()> {
     check(true)
 }
 
+// Regression test: `br_table` (the wasm switch / jump table) must decode its
+// controlling index under AN-encoding. Before the fix the encoded value (`A*v`)
+// was handed straight to `br_table`, so every non-zero index landed out of
+// range and fell through to the default target. A Rust `match` over several
+// integer values lowers to `br_table`, so this silently broke ordinary
+// programs (wrong arm taken, no trap).
+const BR_TABLE_WAT: &str = r#"
+(module
+  (func (export "sw") (param i32) (result i32)
+    (block $d (block $c2 (block $c1 (block $c0
+      (br_table $c0 $c1 $c2 $d (local.get 0)))
+      (return (i32.const 100)))
+      (return (i32.const 101)))
+      (return (i32.const 102)))
+    (i32.const 999)))
+"#;
+
+fn run_br_table(an_enabled: bool, sel: i32) -> wasmtime::Result<i32> {
+    let engine = Engine::new(&make_config(an_enabled))?;
+    let module = Module::new(&engine, BR_TABLE_WAT)?;
+    let mut store = Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
+    let sw = instance.get_typed_func::<i32, i32>(&mut store, "sw")?;
+    sw.call(&mut store, sel)
+}
+
+fn br_table_check(an_enabled: bool) -> wasmtime::Result<()> {
+    // Non-zero selectors only: at selector 0 a missing decode is invisible
+    // (`A*0 == 0` still selects arm 0). 1 and 2 land on distinct arms, proving
+    // the selector was decoded; 3 and 7 fall through to the default.
+    assert_eq!(run_br_table(an_enabled, 1)?, 101);
+    assert_eq!(run_br_table(an_enabled, 2)?, 102);
+    assert_eq!(run_br_table(an_enabled, 3)?, 999); // out of range -> default
+    assert_eq!(run_br_table(an_enabled, 7)?, 999);
+    Ok(())
+}
+
+#[test]
+fn br_table_without_an() -> wasmtime::Result<()> {
+    br_table_check(false)
+}
+
+#[test]
+fn br_table_with_an() -> wasmtime::Result<()> {
+    br_table_check(true)
+}
+
 const FIB_WAT: &str = include_str!("../../an_encoding/fib.wat");
 
 fn run_fib(an_enabled: bool, n: u32) -> wasmtime::Result<String> {
@@ -1042,6 +1089,101 @@ fn fault_inject_various_an_constants() -> wasmtime::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// `memory.grow` shadow-maintenance regression tests.
+//
+// Growing an AN memory must (1) preserve the existing encoded shadow and (2)
+// NOT re-encode the shadow from raw. Re-encoding on every grow was an
+// O(memory-size) operation that committed the entire 2x shadow — for a
+// multi-GiB memory (the `big-strings.wast` component test) that turned an
+// otherwise lazy/VM-based grow into a multi-second, multi-GiB spin. It was
+// also a fault-detection hole: re-encoding from raw silently absorbs any
+// raw/shadow divergence the cross-check exists to catch.
+// ---------------------------------------------------------------------------
+
+const GROW_WAT: &str = r#"
+    (module
+        (import "env" "noop" (func $noop))
+        (memory (export "m") 1)
+        (func (export "grow") (param i32) (result i32)
+            (memory.grow (local.get 0)))
+        (func (export "store") (param $addr i32) (param $val i32)
+            (i32.store (local.get $addr) (local.get $val)))
+        (func (export "load") (param $addr i32) (result i32)
+            (i32.load (local.get $addr)))
+        (func (export "f") (result i32)
+            call $noop
+            i32.const 0))
+"#;
+
+fn grow_setup(
+    a: u64,
+) -> wasmtime::Result<(
+    Store<()>,
+    wasmtime::Memory,
+    wasmtime::TypedFunc<i32, i32>,
+    wasmtime::TypedFunc<(i32, i32), ()>,
+    wasmtime::TypedFunc<i32, i32>,
+    wasmtime::TypedFunc<(), i32>,
+)> {
+    let mut config = make_config(true);
+    config.an_constant(a);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, GROW_WAT)?;
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap("env", "noop", |_caller: wasmtime::Caller<'_, ()>| {})?;
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module)?;
+    let memory = instance.get_memory(&mut store, "m").expect("memory export");
+    let grow = instance.get_typed_func::<i32, i32>(&mut store, "grow")?;
+    let st = instance.get_typed_func::<(i32, i32), ()>(&mut store, "store")?;
+    let ld = instance.get_typed_func::<i32, i32>(&mut store, "load")?;
+    let f = instance.get_typed_func::<(), i32>(&mut store, "f")?;
+    Ok((store, memory, grow, st, ld, f))
+}
+
+// Sharp guard: a raw/shadow divergence introduced *before* a grow must still
+// be detected *after* it. If `memory.grow` re-encoded the shadow from raw it
+// would absorb the corruption and the cross-check would (wrongly) pass.
+#[test]
+fn grow_does_not_resync_shadow_from_raw() -> wasmtime::Result<()> {
+    let (mut store, memory, grow, _st, _ld, f) = grow_setup(65521)?;
+    // raw[0..4] == 0 and shadow[0..8] == A*0 == 0 after instantiation. Flip a
+    // raw bit so raw and shadow disagree.
+    memory.data_mut(&mut store)[3] ^= 0x80;
+    // Grow a page. The divergence must survive (shadow copied forward, not
+    // re-encoded from the corrupted raw).
+    grow.call(&mut store, 1)?;
+    expect_an_mismatch_trap(f.call(&mut store, ()), "raw corruption survives grow");
+    Ok(())
+}
+
+// Copy-forward correctness across repeated grows: previously written encoded
+// data stays intact and the shadow stays consistent with raw (cross-check
+// passes) after each grow.
+#[test]
+fn grow_preserves_shadow_across_repeated_grows() -> wasmtime::Result<()> {
+    let (mut store, _memory, grow, st, ld, f) = grow_setup(65521)?;
+    // Sentinel in the last full slot of page 0.
+    let sentinel = 0x1234_5678u32 as i32;
+    st.call(&mut store, (65532, sentinel))?;
+    f.call(&mut store, ())?; // shadow consistent before growing
+    for delta in [1, 7, 64] {
+        let prev_pages = grow.call(&mut store, delta)?;
+        assert!(prev_pages > 0, "grow({delta}) should succeed");
+        // Old data preserved through the grow.
+        assert_eq!(
+            ld.call(&mut store, 65532)?,
+            sentinel,
+            "sentinel lost after grow({delta})"
+        );
+        // Cross-check: the whole (grown) shadow still agrees with raw, i.e. the
+        // copy-forward left it consistent and the new pages encode as zero.
+        f.call(&mut store, ())?;
+    }
+    Ok(())
+}
+
 // Unaligned `i32.store` and cross-slot `i32.store16`. The
 // wat below stores at every byte offset in `0..8`, then triggers a host call
 // so the cross-check runs against the shadow. If the unaligned path ever
@@ -1085,16 +1227,18 @@ fn unaligned_setup(
 
 #[test]
 fn unaligned_i32_store_every_offset() -> wasmtime::Result<()> {
-    // For each byte offset `a` in 0..8, store an i32 then load it back via
+    // For each address `a` in 16..24, store an i32 then load it back via
     // four byte loads to verify the raw bytes are correct, and trigger a
-    // host call so the cross-check confirms the shadow matches raw.
+    // host call so the cross-check confirms the shadow matches raw. The base
+    // is slot-aligned and non-zero, so `a % 4` still walks every byte position
+    // (incl. the cross-slot byte_pos==3) while avoiding address 0.
     let (mut store, instance) = unaligned_setup(65521)?;
     let store_i32 =
         instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_i32")?;
     let load_i32_8 = instance.get_typed_func::<i32, i32>(&mut store, "load_i32_8")?;
 
     let value: i32 = 0x12_34_56_78;
-    for a in 0i32..8 {
+    for a in 16i32..24 {
         store_i32.call(&mut store, (a, value))?;
         for i in 0..4 {
             let got = load_i32_8.call(&mut store, a + i)?;
@@ -1110,16 +1254,16 @@ fn unaligned_i32_store_every_offset() -> wasmtime::Result<()> {
 
 #[test]
 fn cross_slot_i32_store16_every_offset() -> wasmtime::Result<()> {
-    // `i32.store16` at byte_pos == 3 spans two shadow slots. Cover every
-    // position 0..8 to exercise both in-slot (0,1,2,4,5,6) and cross-slot
-    // (3,7) cases.
+    // `i32.store16` at byte_pos == 3 spans two shadow slots. Walk addresses
+    // 16..24 (slot-aligned, non-zero base) so `a % 4` exercises both in-slot
+    // (byte_pos 0,1,2) and cross-slot (byte_pos 3, addresses 19 and 23) cases.
     let (mut store, instance) = unaligned_setup(65521)?;
     let store_i32_16 =
         instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_i32_16")?;
     let load_i32_8 = instance.get_typed_func::<i32, i32>(&mut store, "load_i32_8")?;
 
     let value: i32 = 0xab_cd; // low half-word
-    for a in 0i32..8 {
+    for a in 16i32..24 {
         store_i32_16.call(&mut store, (a, value))?;
         for i in 0..2 {
             let got = load_i32_8.call(&mut store, a + i)?;
@@ -1144,24 +1288,26 @@ fn unaligned_store_then_aligned_store_same_slot() -> wasmtime::Result<()> {
         instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_i32")?;
     let load_i32 = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
 
-    // Write 0xAAAABBBB at addr 1 (unaligned). Bytes:
-    //   raw[1]=BB raw[2]=BB raw[3]=AA raw[4]=AA
-    // Slot 0 ends at byte 3; slot 1 starts at byte 4.
-    store_i32.call(&mut store, (1, 0xAAAA_BBBBu32 as i32))?;
+    // Work on the slot pair at bytes [16,20)/[20,24) — non-zero addresses
+    // throughout so a missing address decode can't pass on `A*0 == 0`.
+    // Write 0xAAAABBBB at addr 17 (unaligned). Bytes:
+    //   raw[17]=BB raw[18]=BB raw[19]=AA raw[20]=AA
+    // Slot [16,20) ends at byte 19; slot [20,24) starts at byte 20.
+    store_i32.call(&mut store, (17, 0xAAAA_BBBBu32 as i32))?;
 
-    // Now write 0x11223344 at addr 0 (aligned).
-    //   raw[0]=44 raw[1]=33 raw[2]=22 raw[3]=11
-    // Slot 0 becomes 0x11223344.
-    store_i32.call(&mut store, (0, 0x1122_3344))?;
+    // Now write 0x11223344 at addr 16 (aligned).
+    //   raw[16]=44 raw[17]=33 raw[18]=22 raw[19]=11
+    // Slot [16,20) becomes 0x11223344.
+    store_i32.call(&mut store, (16, 0x1122_3344))?;
 
-    // Aligned load of slot 0 should see 0x11223344.
-    let v0 = load_i32.call(&mut store, 0)?;
-    assert_eq!(v0 as u32, 0x1122_3344, "slot 0 after overwrite");
+    // Aligned load of slot [16,20) should see 0x11223344.
+    let v0 = load_i32.call(&mut store, 16)?;
+    assert_eq!(v0 as u32, 0x1122_3344, "aligned slot after overwrite");
 
-    // Aligned load of slot 1 should still see the AA bytes (well, the high
-    // byte of the first store: raw[4] = AA, raw[5..8] = 0).
-    let v4 = load_i32.call(&mut store, 4)?;
-    assert_eq!(v4 as u32, 0x0000_00AA, "slot 1 high byte preserved");
+    // Aligned load of the next slot should still see the AA byte left by the
+    // first store: raw[20] = AA, raw[21..24] = 0.
+    let v4 = load_i32.call(&mut store, 20)?;
+    assert_eq!(v4 as u32, 0x0000_00AA, "next slot high byte preserved");
     Ok(())
 }
 
@@ -1232,21 +1378,22 @@ fn bulk_memory_fill_keeps_shadow_consistent() -> wasmtime::Result<()> {
     let fill = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "fill")?;
     let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
 
-    // Cover aligned fill, unaligned fill, byte-level fill that crosses
-    // multiple slots, and a non-zero fill byte. Each `fill` call ends with
+    // Cover aligned fill, unaligned fill that crosses multiple slots, and a
+    // non-zero fill byte. Every address operand is non-zero so a missing
+    // address decode can't hide behind `A*0 == 0`. Each `fill` call ends with
     // a host call so the cross-check fires.
-    fill.call(&mut store, (0, 0xAB, 16))?;
-    for i in 0..16 {
+    fill.call(&mut store, (16, 0xAB, 16))?;
+    for i in 16..32 {
         assert_eq!(load_byte.call(&mut store, i)? as u32, 0xAB, "fill1 byte {i}");
     }
-    fill.call(&mut store, (3, 0xCD, 10))?; // straddles slot boundary
-    for i in 0..3 {
+    fill.call(&mut store, (19, 0xCD, 10))?; // straddles slot boundary
+    for i in 16..19 {
         assert_eq!(load_byte.call(&mut store, i)? as u32, 0xAB, "fill2 untouched {i}");
     }
-    for i in 3..13 {
+    for i in 19..29 {
         assert_eq!(load_byte.call(&mut store, i)? as u32, 0xCD, "fill2 byte {i}");
     }
-    for i in 13..16 {
+    for i in 29..32 {
         assert_eq!(load_byte.call(&mut store, i)? as u32, 0xAB, "fill2 untouched {i}");
     }
     Ok(())
@@ -1259,9 +1406,11 @@ fn bulk_memory_copy_keeps_shadow_consistent() -> wasmtime::Result<()> {
     let copy = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "copy")?;
     let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
 
-    // Pre-fill source region, copy to disjoint dst, verify.
-    fill.call(&mut store, (0, 0x11, 8))?;
-    copy.call(&mut store, (64, 0, 8))?;
+    // Pre-fill source region, copy to disjoint dst, verify. Every address
+    // operand is non-zero so a missing src/dst decode can't pass on
+    // `A*0 == 0`.
+    fill.call(&mut store, (16, 0x11, 8))?;
+    copy.call(&mut store, (64, 16, 8))?;
     for i in 0..8 {
         assert_eq!(load_byte.call(&mut store, 64 + i)? as u32, 0x11, "copy byte {i}");
     }
@@ -1291,13 +1440,10 @@ fn bulk_memory_copy_keeps_shadow_consistent() -> wasmtime::Result<()> {
 
 #[test]
 fn active_data_segment_keeps_shadow_consistent() -> wasmtime::Result<()> {
-    // Active data segment in `BULK_WAT` places "DATAseg" at addr 200; the
-    // segment is laid down at instantiation. Verify the bytes round-trip
-    // through wasm-side i32 loads and that the host-boundary cross-check
-    // (run via `load_byte`'s wat — wait, `load_byte` has no host call).
-    // The cross-check fires inside any `fill`/`copy` call. Issue a no-op
-    // fill of length 0 to force a host-boundary visit without disturbing
-    // raw bytes.
+    // Active data segment in `BULK_WAT` places "DATAseg" at addr 200, laid
+    // down at instantiation. Verify the bytes round-trip through wasm-side
+    // loads, and that the segment's shadow agrees with raw at the host
+    // boundary.
     let (mut store, instance) = bulk_setup(65521)?;
     let fill = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "fill")?;
     let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
@@ -1307,9 +1453,11 @@ fn active_data_segment_keeps_shadow_consistent() -> wasmtime::Result<()> {
         let got = load_byte.call(&mut store, 200 + i as i32)? as u8;
         assert_eq!(got, want, "active data segment byte {i}");
     }
-    // Length-zero fill at the segment offset is a no-op for raw and shadow
-    // both, but it routes through the `call $noop` cross-check.
-    fill.call(&mut store, (200, 0, 0))?;
+    // `load_byte` makes no host call, so drive the cross-check explicitly with
+    // a `fill` of a scratch region disjoint from the segment. Its trailing
+    // `call $noop` cross-checks the whole memory — including addr 200 — so a
+    // divergence in the segment's shadow would trap here.
+    fill.call(&mut store, (16, 0x00, 4))?;
     Ok(())
 }
 
@@ -1343,11 +1491,13 @@ fn passive_memory_init_keeps_shadow_consistent() -> wasmtime::Result<()> {
     let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
 
     // Cover three placements: aligned (slot start), unaligned (mid-slot), and
-    // straddling a slot boundary. Each call ends in a host-boundary
-    // cross-check via `call $noop`.
-    let expected = b"PASSIVE";
-    for &dst in &[0i32, 5, 13] {
-        do_init.call(&mut store, (dst, 0, expected.len() as i32))?;
+    // straddling a slot boundary. dst and src are non-zero throughout so a
+    // missing decode of either can't hide behind `A*0 == 0`; src=1 also proves
+    // the segment offset was decoded (it selects "ASSIVE", not "PASSIVE").
+    // Each call ends in a host-boundary cross-check via `call $noop`.
+    let expected = b"ASSIVE";
+    for &dst in &[8i32, 5, 13] {
+        do_init.call(&mut store, (dst, 1, expected.len() as i32))?;
         for (i, &want) in expected.iter().enumerate() {
             let got = load_byte.call(&mut store, dst + i as i32)? as u8;
             assert_eq!(got, want, "passive init dst={dst} byte {i}");
@@ -1427,7 +1577,7 @@ const TABLE_WAT: &str = r#"
         (func (export "grow") (param $delta i32) (result i32)
             ref.null func local.get $delta table.grow $t)
         (func (export "fill") (param $dst i32) (param $len i32)
-            local.get $dst ref.null func local.get $len table.fill $t)
+            local.get $dst ref.func $f2 local.get $len table.fill $t)
         (func (export "copy") (param $dst i32) (param $src i32) (param $len i32)
             local.get $dst local.get $src local.get $len table.copy $t $t)
         (func (export "call_idx") (param $i i32) (result i32)
@@ -1473,7 +1623,13 @@ fn table_grow_under_an() -> wasmtime::Result<()> {
 fn table_fill_under_an() -> wasmtime::Result<()> {
     let (mut store, instance) = table_setup(true)?;
     let fill = instance.get_typed_func::<(i32, i32), ()>(&mut store, "fill")?;
-    fill.call(&mut store, (1, 2))?;
+    let call_idx = instance.get_typed_func::<i32, i32>(&mut store, "call_idx")?;
+    // Fill slots [2, 4) with $f2. Non-zero `dst`/`len` so a missing decode of
+    // either operand can't pass via `A*0 == 0`. Calling the filled slots back
+    // confirms the fill landed where requested, not merely that it didn't trap.
+    fill.call(&mut store, (2, 2))?;
+    assert_eq!(call_idx.call(&mut store, 2)?, 300);
+    assert_eq!(call_idx.call(&mut store, 3)?, 300);
     Ok(())
 }
 
@@ -1481,7 +1637,13 @@ fn table_fill_under_an() -> wasmtime::Result<()> {
 fn table_copy_under_an() -> wasmtime::Result<()> {
     let (mut store, instance) = table_setup(true)?;
     let copy = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "copy")?;
-    copy.call(&mut store, (1, 0, 2))?;
+    let call_idx = instance.get_typed_func::<i32, i32>(&mut store, "call_idx")?;
+    // Copy $f1 from slot 1 into the (initially null) slot 3. All three operands
+    // are non-zero so a missing `dst`/`src`/`len` decode can't slip through on
+    // `A*0 == 0`. Asserting `call_idx(3) == 200` proves `src` selected slot 1
+    // ($f1), not slot 0 ($f0 -> 100), and that the copy reached slot 3.
+    copy.call(&mut store, (3, 1, 1))?;
+    assert_eq!(call_idx.call(&mut store, 3)?, 200);
     Ok(())
 }
 
@@ -1489,7 +1651,9 @@ fn table_copy_under_an() -> wasmtime::Result<()> {
 fn call_indirect_under_an() -> wasmtime::Result<()> {
     let (mut store, instance) = table_setup(true)?;
     let call_idx = instance.get_typed_func::<i32, i32>(&mut store, "call_idx")?;
-    assert_eq!(call_idx.call(&mut store, 0)?, 100);
+    // Indices are deliberately non-zero: at index 0 a missing index decode is
+    // invisible (`A*0 == 0`). Distinct results per index prove the encoded
+    // index was decoded before the table dispatch.
     assert_eq!(call_idx.call(&mut store, 1)?, 200);
     assert_eq!(call_idx.call(&mut store, 2)?, 300);
     Ok(())
@@ -1506,8 +1670,8 @@ fn table_ops_match_without_an() -> wasmtime::Result<()> {
     assert_eq!(size.call(&mut store, ())?, 4);
     assert_eq!(grow.call(&mut store, 2)?, 4);
     assert_eq!(size.call(&mut store, ())?, 6);
-    assert_eq!(call_idx.call(&mut store, 0)?, 100);
     assert_eq!(call_idx.call(&mut store, 1)?, 200);
+    assert_eq!(call_idx.call(&mut store, 2)?, 300);
     Ok(())
 }
 
@@ -1517,7 +1681,8 @@ const TABLE_INIT_WAT: &str = r#"
         (table $t 4 funcref)
         (func $g0 (result i32) i32.const 11)
         (func $g1 (result i32) i32.const 22)
-        (elem $e func $g0 $g1)
+        (func $g2 (result i32) i32.const 33)
+        (elem $e func $g0 $g1 $g2)
         (func (export "init") (param $dst i32) (param $src i32) (param $len i32)
             local.get $dst local.get $src local.get $len table.init $t $e)
         (func (export "drop_elem") elem.drop $e)
@@ -1535,9 +1700,13 @@ fn table_init_under_an() -> wasmtime::Result<()> {
     let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
     let init = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "init")?;
     let call_at = instance.get_typed_func::<i32, i32>(&mut store, "call_at")?;
-    init.call(&mut store, (0, 0, 2))?;
-    assert_eq!(call_at.call(&mut store, 0)?, 11);
+    // Init table[1..3] from the passive segment starting at src=1 ($g1, $g2).
+    // dst/src/len are all non-zero, so a missing decode of any of them can't
+    // hide behind `A*0 == 0`. The asserted values prove src=1 selected $g1/$g2
+    // (not $g0 -> 11) and that dst placed them at slots 1 and 2.
+    init.call(&mut store, (1, 1, 2))?;
     assert_eq!(call_at.call(&mut store, 1)?, 22);
+    assert_eq!(call_at.call(&mut store, 2)?, 33);
     Ok(())
 }
 
@@ -1607,13 +1776,16 @@ fn multi_memory_stores_keep_shadows_consistent() -> wasmtime::Result<()> {
     let load_m0 = instance.get_typed_func::<i32, i32>(&mut store, "load_m0")?;
     let load_m1 = instance.get_typed_func::<i32, i32>(&mut store, "load_m1")?;
 
-    store_m0.call(&mut store, (0, 0x1111_2222u32 as i32))?;
-    store_m1.call(&mut store, (0, 0x3333_4444u32 as i32))?;
+    // Non-zero addresses throughout so a missing address decode can't pass on
+    // `A*0 == 0`; distinct values per (memory, address) prove both the address
+    // decode and the per-memory routing.
+    store_m0.call(&mut store, (8, 0x1111_2222u32 as i32))?;
+    store_m1.call(&mut store, (8, 0x3333_4444u32 as i32))?;
     store_m0.call(&mut store, (16, 0x5555_6666u32 as i32))?;
     store_m1.call(&mut store, (16, 0x7777_8888u32 as i32))?;
 
-    assert_eq!(load_m0.call(&mut store, 0)? as u32, 0x1111_2222);
-    assert_eq!(load_m1.call(&mut store, 0)? as u32, 0x3333_4444);
+    assert_eq!(load_m0.call(&mut store, 8)? as u32, 0x1111_2222);
+    assert_eq!(load_m1.call(&mut store, 8)? as u32, 0x3333_4444);
     assert_eq!(load_m0.call(&mut store, 16)? as u32, 0x5555_6666);
     assert_eq!(load_m1.call(&mut store, 16)? as u32, 0x7777_8888);
     Ok(())
@@ -1703,10 +1875,11 @@ fn load_validity_check_default_off() -> wasmtime::Result<()> {
     // but a load by itself does not). This documents the default behavior.
     let (mut store, instance, mem) = load_check_setup(65521, false)?;
     let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
-    mem.data_mut(&mut store)[0] = 0x42;
+    mem.data_mut(&mut store)[8] = 0x42;
     // Load without an intervening host call returns the tampered raw byte
-    // without raising AnMemoryMismatch (default-off path).
-    let v = load.call(&mut store, 0)?;
+    // without raising AnMemoryMismatch (default-off path). Non-zero address so
+    // a missing address decode can't pass on `A*0 == 0`.
+    let v = load.call(&mut store, 8)?;
     assert_eq!(v as u32, 0x42);
     Ok(())
 }
@@ -1729,10 +1902,10 @@ fn load_validity_check_clean_run_passes() -> wasmtime::Result<()> {
     let instance = linker.instantiate(&mut store, &module)?;
     let store_fn = instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_i32")?;
     let load_fn = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
-    store_fn.call(&mut store, (0, 0x12345678))?;
-    assert_eq!(load_fn.call(&mut store, 0)? as u32, 0x12345678);
-    // Load at byte offset 4 (a zero slot) — must not trap.
-    let _ = load_fn.call(&mut store, 4)?;
+    store_fn.call(&mut store, (8, 0x12345678))?;
+    assert_eq!(load_fn.call(&mut store, 8)? as u32, 0x12345678);
+    // Load at byte offset 12 (a zero slot) — must not trap.
+    let _ = load_fn.call(&mut store, 12)?;
     Ok(())
 }
 
@@ -1743,8 +1916,9 @@ fn load_validity_check_traps_on_raw_tamper() -> wasmtime::Result<()> {
     // call in between needed.
     let (mut store, instance, mem) = load_check_setup(65521, true)?;
     let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
-    mem.data_mut(&mut store)[3] = 0x80;
-    let res = load.call(&mut store, 0);
+    // Non-zero load address so a missing address decode can't pass on `A*0 == 0`.
+    mem.data_mut(&mut store)[11] = 0x80;
+    let res = load.call(&mut store, 8);
     expect_an_mismatch_trap(res, "raw tamper + i32.load");
     Ok(())
 }
@@ -1755,8 +1929,10 @@ fn load_validity_check_traps_on_load8u() -> wasmtime::Result<()> {
     // slot must surface at the load.
     let (mut store, instance, mem) = load_check_setup(65521, true)?;
     let load8 = instance.get_typed_func::<i32, i32>(&mut store, "load_i32_8u")?;
-    mem.data_mut(&mut store)[2] ^= 0x55;
-    let res = load8.call(&mut store, 0);
+    // Tamper a different byte (10) in the same slot as the non-zero loaded
+    // address (8); the slot-level check still surfaces it.
+    mem.data_mut(&mut store)[10] ^= 0x55;
+    let res = load8.call(&mut store, 8);
     expect_an_mismatch_trap(res, "raw tamper + i32.load8_u");
     Ok(())
 }
@@ -1795,8 +1971,8 @@ fn load_validity_check_various_an_constants() -> wasmtime::Result<()> {
     for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
         let (mut store, instance, mem) = load_check_setup(a, true)?;
         let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
-        mem.data_mut(&mut store)[0] = 0x55;
-        let res = load.call(&mut store, 0);
+        mem.data_mut(&mut store)[8] = 0x55;
+        let res = load.call(&mut store, 8);
         expect_an_mismatch_trap(res, &format!("validity check with A={a}"));
     }
     Ok(())
@@ -1943,6 +2119,176 @@ mod component_an {
             assert_eq!(v, 0x1122_3344, "A={a}");
         }
         Ok(())
+    }
+
+    // A component that transcodes a string between encodings (utf8 -> utf16).
+    // Crossing encodings makes wasmtime synthesize a string-transcoder
+    // trampoline. Under AN its ptr/len wasm args arrive encoded (`A*v`, widened
+    // to I64) and its results must be re-encoded; before the fix the trampoline
+    // applied `uextend.i64` to an already-i64 arg, which the aarch64 backend
+    // rejected with `assert!(inner_bits < out_bits)` — i.e. compiling the
+    // component panicked. This guards that compilation succeeds under AN.
+    //
+    // NOTE: this is intentionally compile-only — it isolates the cranelift
+    // lowering panic. End-to-end string lifting/lowering under AN (including the
+    // `may_enter`/`may_leave` instance-flag globals that once trapped "cannot
+    // leave component instance") is covered separately by
+    // `transcode_string_roundtrip_*`.
+    const TRANSCODE_COMPONENT_WAT: &str = r#"
+        (component
+          (component $c
+            (core module $m
+              (func (export "") (param i32 i32) unreachable)
+              (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                unreachable)
+              (memory (export "memory") 1))
+            (core instance $m (instantiate $m))
+            (func (export "a") (param "a" string)
+              (canon lift (core func $m "")
+                (realloc (func $m "realloc")) (memory $m "memory")
+                string-encoding=utf16)))
+          (component $c2
+            (import "a" (func $f (param "a" string)))
+            (core module $libc (memory (export "memory") 1))
+            (core instance $libc (instantiate $libc))
+            (core func $f (canon lower (func $f)
+              string-encoding=utf8 (memory $libc "memory")))
+            (core module $m
+              (import "" "" (func $f (param i32 i32)))
+              (func (export "f") (call $f (i32.const 0) (i32.const 4))))
+            (core instance $m (instantiate $m
+              (with "" (instance (export "" (func $f))))))
+            (func (export "f") (canon lift (core func $m "f"))))
+          (instance $c (instantiate $c))
+          (instance $c2 (instantiate $c2 (with "a" (func $c "a"))))
+          (export "f" (func $c2 "f")))
+    "#;
+
+    #[test]
+    fn transcode_component_compiles_without_an() -> wasmtime::Result<()> {
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config)?;
+        Component::new(&engine, TRANSCODE_COMPONENT_WAT)?;
+        Ok(())
+    }
+
+    #[test]
+    fn transcode_component_compiles_with_an() -> wasmtime::Result<()> {
+        for &a in &[1u64, 7, 65521, 8_388_607] {
+            let mut config = Config::new();
+            config.wasm_component_model(true);
+            config.an_encoding(true);
+            config.an_constant(a);
+            let engine = Engine::new(&config)?;
+            // Must not panic in cranelift lowering of the transcoder trampoline.
+            Component::new(&engine, TRANSCODE_COMPONENT_WAT)
+                .unwrap_or_else(|e| panic!("compile failed under AN (A={a}): {e:?}"));
+        }
+        Ok(())
+    }
+
+    // End-to-end: lower a string from the host into a component under AN. This
+    // exercises the whole string-ABI path that the inner_bits / "cannot leave"
+    // bugs lived on: the canonical-ABI transcoder trampoline (decode i32 ptr/len
+    // args, re-encode i32 results), the realloc call into AN-compiled core wasm,
+    // and the `may_enter`/`may_leave` instance-flag globals (raw host storage,
+    // encode-on-get / decode-on-set under AN). The core `strlen` simply returns
+    // the byte length the ABI computed, so a correct result proves the bytes
+    // were transcoded into core memory and the length round-tripped.
+    const STRLEN_WAT: &str = r#"
+        (component
+          (core module $m
+            (memory (export "memory") 1)
+            ;; trivial bump allocator: small test strings fit at offset 16
+            (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+              i32.const 16)
+            (func (export "strlen") (param i32 i32) (result i32)
+              local.get 1))
+          (core instance $i (instantiate $m))
+          (func (export "strlen") (param "s" string) (result u32)
+            (canon lift (core func $i "strlen") (memory $i "memory")
+              (realloc (func $i "realloc")) string-encoding=utf8)))
+    "#;
+
+    fn strlen_check(an_on: bool) -> wasmtime::Result<()> {
+        let engine = make_engine(an_on)?;
+        let component = Component::new(&engine, STRLEN_WAT)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component)?;
+        let strlen = instance.get_typed_func::<(&str,), (u32,)>(&mut store, "strlen")?;
+
+        // ASCII: byte length == char count.
+        let (n,) = strlen.call(&mut store, ("hello",))?;
+        assert_eq!(n, 5, "an_on={an_on}");
+
+        // Multi-byte UTF-8: "é" is two bytes, so byte length is 6.
+        let (n,) = strlen.call(&mut store, ("héllo",))?;
+        assert_eq!(n, 6, "an_on={an_on}");
+        Ok(())
+    }
+
+    #[test]
+    fn transcode_string_roundtrip_without_an() -> wasmtime::Result<()> {
+        strlen_check(false)
+    }
+
+    #[test]
+    fn transcode_string_roundtrip_with_an() -> wasmtime::Result<()> {
+        strlen_check(true)
+    }
+
+    // End-to-end resource new/drop under AN. `resource.new` goes through the
+    // generic hostcall trampoline (which decodes its i32 rep), but `resource.drop`
+    // uses a hand-written trampoline (`translate_resource_drop`) that must decode
+    // the i32 handle index itself — before the fix the handle arrived encoded
+    // (`A*1`) and the libcall reported "unknown handle index 65521".
+    const RESOURCE_WAT: &str = r#"
+        (component
+          (type $r (resource (rep i32)))
+          (core func $new (canon resource.new $r))
+          (core func $drop (canon resource.drop $r))
+          (core module $m
+            (import "" "new" (func $new (param i32) (result i32)))
+            (import "" "drop" (func $drop (param i32)))
+            (func (export "run") (param i32) (result i32)
+              ;; create a resource with the given rep, then drop its handle,
+              ;; returning the handle index (observably non-zero on success)
+              (local $h i32)
+              (local.set $h (call $new (local.get 0)))
+              (call $drop (local.get $h))
+              (local.get $h)))
+          (core instance $i (instantiate $m
+            (with "" (instance
+              (export "new" (func $new))
+              (export "drop" (func $drop))))))
+          (func (export "run") (param "rep" u32) (result u32)
+            (canon lift (core func $i "run"))))
+    "#;
+
+    fn resource_check(an_on: bool) -> wasmtime::Result<()> {
+        let engine = make_engine(an_on)?;
+        let component = Component::new(&engine, RESOURCE_WAT)?;
+        let linker = Linker::new(&engine);
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component)?;
+        let run = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "run")?;
+        // A successful new+drop hands back the (non-zero) handle index. Before
+        // the AN fix this trapped with "unknown handle index 65521".
+        let (h,) = run.call(&mut store, (42,))?;
+        assert_ne!(h, 0, "an_on={an_on}");
+        Ok(())
+    }
+
+    #[test]
+    fn resource_new_drop_without_an() -> wasmtime::Result<()> {
+        resource_check(false)
+    }
+
+    #[test]
+    fn resource_new_drop_with_an() -> wasmtime::Result<()> {
+        resource_check(true)
     }
 }
 

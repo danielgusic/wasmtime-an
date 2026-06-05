@@ -533,6 +533,11 @@ pub fn translate_operator(
                 }
             };
             let val = environ.stacks.pop1();
+            // AN-encoding: the controlling value arrives encoded (`A*v`, widened
+            // to I64). `br_table` needs the raw i32 index to select a target, so
+            // decode it first — otherwise every non-zero index lands out of
+            // range and falls through to the default target.
+            let val = an_decode_i32_operand(builder, environ, val);
             let mut data = Vec::with_capacity(targets.len() as usize);
             if jump_args_count == 0 {
                 // No jump arguments
@@ -1034,18 +1039,10 @@ pub fn translate_operator(
         Operator::I32Const { value } => {
             if environ.tunables().an_encoding {
                 // Emit the canonical encoded form `A*v` as an i64 immediate.
-                //
-                // We work in u64 here so the math operates on the wasm i32
-                // bit pattern, not on its signed interpretation. Reinterpret
-                // i32 → u32 (`cast_unsigned`), zero-extend u32 → u64
-                // (`u64::from`), then multiply by A.
-                //
-                // `wrapping_mul` is defensive: with the setter-enforced bound
-                // `A < 2^31` and a 32-bit input the product is always
-                // < 2^31 * 2^32 = 2^63, so it never actually wraps. The final
-                // `as i64` is a pure bit-pattern reinterpret for the
-                // `iconst` API (which takes its immediate as `i64`); no value
-                // change happens.
+                // Work in u64 so the multiply uses the unsigned i32 bit
+                // pattern; the `A < 2^31` bound keeps the product below 2^63
+                // (so it never wraps), and the final `as i64` is a bit-pattern
+                // reinterpret for `iconst`.
                 let raw = u64::from(value.cast_unsigned());
                 let encoded = raw.wrapping_mul(environ.tunables().an_constant);
                 environ
@@ -4192,18 +4189,14 @@ fn translate_load(
     environ.before_load(builder, mem_op_size, wasm_index, memarg.offset);
 
     // AN-encoding load-side validity check (opt-in via
-    // `Tunables.an_load_validity_check`): assert that the encoded shadow
-    // slot(s) the load touches still match the raw bytes BEFORE we pull the
-    // value from raw. Any divergence — shadow flip, raw flip, or a code path
-    // that left the shadow stale — surfaces here as
-    // `Trap::AnMemoryMismatch`, at the load, instead of at the next host
-    // call boundary.
+    // `Tunables.an_load_validity_check`): assert the encoded shadow slot(s)
+    // match the raw bytes BEFORE the raw load, so a divergence surfaces here as
+    // `Trap::AnMemoryMismatch` at the load rather than at the next host
+    // boundary.
     //
-    // Only fires for i32-family loads (the only ones whose underlying memory
-    // is mirrored into the shadow today). i64/f32/f64/v128 loads use the raw
-    // path; their bytes still belong to a slot whose shadow we COULD check,
-    // but the existing dual-buffer design does not maintain shadow
-    // consistency for non-i32 stores, so a check here would false-positive.
+    // Only i32-family loads are checked: the dual-buffer design does not keep
+    // the shadow consistent for non-i32 stores, so checking other loads would
+    // false-positive.
     if environ.tunables().an_encoding
         && environ.tunables().an_load_validity_check
         && result_ty == I32
@@ -4270,13 +4263,11 @@ fn translate_store(
     environ: &mut FuncEnvironment<'_>,
 ) -> WasmResult<()> {
     let mut val = environ.stacks.pop1();
-    // Hold on to the encoded operand for the AN-encoding shadow store below.
-    // For non-AN paths this is unused; for AN i32 stores it is `A*v` and is
-    // written into the encoded shadow without round-tripping through the
-    // decode/encode pipeline.
+    // The AN shadow store below writes the encoded `A*v` directly, so keep the
+    // operand before it is decoded for the raw store.
     let encoded_val = val;
     if environ.tunables().an_encoding && wasm_val_is_i32 {
-        // val is encoded I64 = A*v with v ∈ [0, 2^32). Decode to raw I32.
+        // Decode the encoded operand to a raw i32 for the native store.
         let an = builder
             .ins()
             .iconst(I64, environ.tunables().an_constant as i64);
@@ -4293,11 +4284,9 @@ fn translate_store(
 
     environ.before_store(builder, mem_op_size, wasm_index, memarg.offset);
 
-    // AN-encoding: non-i32 stores (i64/f32/f64 family) must also keep the
-    // encoded shadow in sync, otherwise the next host-boundary cross-check
-    // sees a divergence and traps. The shadow encodes raw bytes 4 at a
-    // time, so we decompose the non-i32 store into one or two raw i32
-    // sub-stores, each routed through the same raw-plus-shadow path as
+    // AN-encoding: non-i32 stores must also update the shadow, or the next
+    // host-boundary cross-check traps. `translate_non_i32_store_an` decomposes
+    // them into raw i32 sub-stores routed through the same shadow path as
     // `i32.store{,8,16}`.
     if environ.tunables().an_encoding && !wasm_val_is_i32 {
         translate_non_i32_store_an(
@@ -4310,17 +4299,11 @@ fn translate_store(
         .ins()
         .Store(opcode, val_ty, flags, Offset32::new(0), val, base);
 
-    // AN-encoding: mirror the i32 store family into the encoded shadow so
-    // the host-call-entry cross-check sees a consistent
-    // `decode(enc_slot) == u32_le(raw_slot)` invariant across the whole
-    // memory.
-    //
-    // - `ir::Opcode::Store` (full i32.store): aligned at runtime → direct
-    //   8-byte write of the encoded operand into `enc[2*effective_addr]`;
-    //   unaligned → 4-byte decomposed byte-RMW. Dispatched at runtime on
-    //   `byte_pos = effective_addr & 3`.
-    // - `ir::Opcode::Istore8` / `Istore16`: decomposed into 1 / 2 byte-RMWs,
-    //   each computing its own slot index so cross-slot cases fall out.
+    // AN-encoding: mirror the i32 store into the encoded shadow so the
+    // host-boundary cross-check sees `decode(enc_slot) == u32_le(raw_slot)`
+    // across the whole memory. Aligned full stores write the encoded operand
+    // directly; subword and unaligned stores decompose into per-slot byte-RMWs
+    // (each computing its own slot index, so cross-slot cases fall out).
     if environ.tunables().an_encoding && wasm_val_is_i32 {
         if let Some(enc_base) = emit_an_enc_base_pointer(
             builder,

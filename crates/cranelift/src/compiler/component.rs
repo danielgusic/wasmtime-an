@@ -926,17 +926,14 @@ impl<'a> TrampolineCompiler<'a> {
         let vmctx = params[0];
 
         // AN-encoding boundary (wasm → host, component path): each wasm `i32`
-        // param arrives widened to `I64` holding `A*v`. The host (whether
-        // a canon-lowered import or a wasmtime libcall) expects raw `i32`.
-        // For each i32 param: assert the codeword is valid
-        // (`val % A == 0`) and then decode via `udiv` + `ireduce`. Mirrors
-        // the core-wasm `compile_wasm_to_array_trampoline` decode hook.
+        // param arrives widened to `I64` holding `A*v`, but the host expects
+        // raw `i32`. For every i32 param, assert the codeword (`val % A == 0`)
+        // and decode via `udiv` + `ireduce`, mirroring the core-wasm
+        // `compile_wasm_to_array_trampoline` hook.
         //
-        // Test-only fault injection (`an_inject_codeword_fault`) bumps the
-        // first encoded i32 wasm param by the configured offset right
-        // before the check fires. Gated on `HostCallee::Lowering` so the
-        // component-runtime libcalls (resource bookkeeping, async task
-        // plumbing, etc.) don't false-trap during normal component flow.
+        // `an_inject_codeword_fault` (test-only) perturbs the first i32 param
+        // before the check. It is gated on `HostCallee::Lowering` so the
+        // component-runtime libcalls don't false-trap during normal flow.
         let mut wasm_params_owned: Vec<ir::Value> = params[2..].to_vec();
         if self.compiler.tunables().an_encoding {
             let a = self.compiler.tunables().an_constant;
@@ -1009,23 +1006,19 @@ impl<'a> TrampolineCompiler<'a> {
 
         // AN-encoding host-boundary cross-check (component path).
         //
-        // When wasm-in-a-component calls a host import the dispatch flows
-        // through this hostcall trampoline rather than the core
-        // `compile_wasm_to_array_trampoline` path. Without an explicit hook
-        // here the existing AN cross-check / resync libcalls (which are
-        // wired into the core path) would never fire for components, and
-        // a wasm-side store followed by a host import could let raw/shadow
-        // diverge undetected.
+        // A wasm-in-a-component host import dispatches through this hostcall
+        // trampoline, not the core `compile_wasm_to_array_trampoline` path, so
+        // the AN cross-check / resync libcalls wired into that path would never
+        // fire for components — letting a wasm store + host import diverge raw
+        // and shadow undetected.
         //
-        // Only the `HostCallee::Lowering` arm corresponds to a wasm→host
-        // boundary at user-defined imports; the other `HostCallee::Libcall`
-        // arms are component-runtime helpers (resource bookkeeping, async
-        // task plumbing, transcoders, …) which don't escape to embedder-
-        // supplied host code and so do not need the cross-check.
+        // Only `HostCallee::Lowering` is a wasm→host boundary at a user import;
+        // the other `HostCallee::Libcall` arms are component-runtime helpers
+        // that don't reach embedder code, so they need no cross-check.
         //
-        // The libcalls take a *core wasm* `VMContext`. `caller_vmctx`
-        // (`params[1]`) is exactly that — the core module instance that
-        // emitted the call.
+        // The libcalls take a core-wasm `VMContext`: `caller_vmctx`
+        // (`params[1]`) is exactly that — the core instance that emitted the
+        // call.
         let an_lowering = matches!(host_callee, HostCallee::Lowering(_))
             && self.compiler.tunables().an_encoding;
         if an_lowering {
@@ -1203,7 +1196,17 @@ impl<'a> TrampolineCompiler<'a> {
                 .ins()
                 .iconst(ir::types::I32, i64::from(resource.as_u32())),
         );
-        host_args.push(args[2]);
+        // AN-encoding: the wasm handle index arrives encoded (`A*v`, widened to
+        // I64). The host `resource_drop` libcall expects the raw i32 handle, so
+        // decode it. (`ResourceNew`/`ResourceRep` go through `translate_hostcall`
+        // which decodes already; this custom path must do it itself.)
+        let handle = if self.compiler.tunables().an_encoding {
+            let decoded = self.an_decode_i32_param(args[2]);
+            self.builder.ins().ireduce(ir::types::I32, decoded)
+        } else {
+            args[2]
+        };
+        host_args.push(handle);
 
         let call = self.call_libcall(vmctx, host::resource_drop, &host_args);
 
@@ -1361,6 +1364,19 @@ impl<'a> TrampolineCompiler<'a> {
         if has_destructor {
             let rep = self.builder.ins().ushr_imm(should_run_destructor, 1);
             let rep = self.builder.ins().ireduce(ir::types::I32, rep);
+            // AN-encoding: the destructor is AN-compiled core wasm, so its i32
+            // `rep` parameter must be the encoded `A*v` (widened to I64) — the
+            // same form `wasm_call_signature` widens the dtor signature to below.
+            let rep = if self.compiler.tunables().an_encoding {
+                let zext = self.builder.ins().uextend(ir::types::I64, rep);
+                let an = self
+                    .builder
+                    .ins()
+                    .iconst(ir::types::I64, self.compiler.tunables().an_constant as i64);
+                self.builder.ins().imul(zext, an)
+            } else {
+                rep
+            };
             let index = self.types[resource].unwrap_concrete_ty();
             // NB: despite the vmcontext storing nullable funcrefs for function
             // pointers we know this is statically never null due to the
@@ -1713,10 +1729,25 @@ impl<'a> TrampolineCompiler<'a> {
                     vmstore_context,
                     i32::from(offset),
                 );
+                // AN-encoding: the store-context slot holds a raw i32; encode it
+                // as the widened `I64` (`A*v`) the wasm caller expects.
+                let context = if self.compiler.tunables().an_encoding {
+                    self.an_encode_i32_result(context)
+                } else {
+                    context
+                };
                 self.abi_store_results(&[context]);
             }
             UnsafeIntrinsic::ContextSetI32_0 | UnsafeIntrinsic::ContextSetI32_1 => {
-                let new_context = params[2];
+                let mut new_context = params[2];
+                // AN-encoding: the wasm operand arrives encoded (`A*v`, widened
+                // to `I64`); decode it to a raw i32 before storing into the raw
+                // i32 store-context slot (otherwise an 8-byte encoded value
+                // would clobber the slot and read back as a non-codeword).
+                if self.compiler.tunables().an_encoding {
+                    let decoded = self.an_decode_i32_param(new_context);
+                    new_context = self.builder.ins().ireduce(ir::types::I32, decoded);
+                }
                 self.builder.ins().store(
                     MemFlags::trusted(),
                     new_context,
@@ -2027,7 +2058,14 @@ impl TrampolineCompiler<'_> {
                 args.push(self.len_param(1, from64));
                 args.push(self.ptr_param(2, to64, to_base));
                 args.push(self.len_param(3, to64));
-                let first_pass = self.builder.func.dfg.block_params(self.block0)[6];
+                let mut first_pass = self.builder.func.dfg.block_params(self.block0)[6];
+                // AN-encoding: this i32 wasm flag arrives encoded (`A*v`, widened
+                // to I64). Decode and narrow back to the raw i32 the libcall
+                // signature expects.
+                if self.compiler.tunables().an_encoding {
+                    let decoded = self.an_decode_i32_param(first_pass);
+                    first_pass = self.builder.ins().ireduce(ir::types::I32, decoded);
+                }
                 args.push(first_pass);
             }
 
@@ -2074,7 +2112,8 @@ impl TrampolineCompiler<'_> {
             | Transcode::Utf8ToCompactUtf16
             | Transcode::Utf16ToCompactUtf16 => {
                 self.raise_if_transcode_trapped(results[0]);
-                raw_results.push(self.cast_from_pointer(results[0], to64));
+                let r = self.encode_result(results[0], to64);
+                raw_results.push(r);
             }
 
             Transcode::Latin1ToUtf8
@@ -2082,8 +2121,10 @@ impl TrampolineCompiler<'_> {
             | Transcode::Utf8ToLatin1
             | Transcode::Utf16ToLatin1 => {
                 self.raise_if_transcode_trapped(results[0]);
-                raw_results.push(self.cast_from_pointer(results[0], from64));
-                raw_results.push(self.cast_from_pointer(results[1], to64));
+                let r0 = self.encode_result(results[0], from64);
+                let r1 = self.encode_result(results[1], to64);
+                raw_results.push(r0);
+                raw_results.push(r1);
             }
         };
 
@@ -2093,7 +2134,53 @@ impl TrampolineCompiler<'_> {
     // Helper function to cast an input parameter to the host pointer type.
     fn len_param(&mut self, param: usize, is64: bool) -> ir::Value {
         let val = self.builder.func.dfg.block_params(self.block0)[2 + param];
+        // AN-encoding boundary (wasm → host): an i32 wasm param (`!is64`)
+        // arrives widened to `I64` holding `A*v`. The host transcode libcall
+        // wants the raw pointer/length, so decode it. The decoded value
+        // already occupies the full `I64` (`v ∈ [0, 2^32)`) and so is exactly
+        // the zero-extended pointer-width form `cast_to_pointer` would
+        // otherwise produce — no further extension is needed. `i64` params
+        // (memory64) are not encoded and pass straight through.
+        if self.compiler.tunables().an_encoding && !is64 {
+            return self.an_decode_i32_param(val);
+        }
         self.cast_to_pointer(val, is64)
+    }
+
+    // Decode one AN-encoded i32 wasm param (`A*v`, widened to `I64`) to its
+    // raw value as an `I64`, asserting the codeword is valid first. Mirrors the
+    // wasm→host decode in `translate_hostcall`.
+    fn an_decode_i32_param(&mut self, val: ir::Value) -> ir::Value {
+        let a = self.compiler.tunables().an_constant;
+        let an_const = self.builder.ins().iconst(ir::types::I64, a as i64);
+        crate::translate::emit_an_codeword_validity_check(&mut self.builder, a, val);
+        self.builder.ins().udiv(val, an_const)
+    }
+
+    // Encode a raw `I32` value as the widened `I64` (`A*v`) the wasm caller
+    // expects under AN-encoding. Mirrors `an_decode_i32_param` and the
+    // host→wasm result-encode in `translate_hostcall`. Used by the hand-written
+    // intrinsic trampolines (native loads, `context.get`) whose i32 results
+    // never flow through `translate_hostcall`.
+    fn an_encode_i32_result(&mut self, raw_i32: ir::Value) -> ir::Value {
+        let a = self.compiler.tunables().an_constant;
+        let an_const = self.builder.ins().iconst(ir::types::I64, a as i64);
+        let widened = self.builder.ins().uextend(ir::types::I64, raw_i32);
+        self.builder.ins().imul(widened, an_const)
+    }
+
+    // Re-encode an i32 host result as the widened `I64` (`A*v`) the wasm caller
+    // expects under AN-encoding; `i64` results (memory64) pass through. Used for
+    // the transcode results that flow back into wasm.
+    fn encode_result(&mut self, val: ir::Value, is64: bool) -> ir::Value {
+        let raw = self.cast_from_pointer(val, is64);
+        if self.compiler.tunables().an_encoding && !is64 {
+            let a = self.compiler.tunables().an_constant;
+            let an_const = self.builder.ins().iconst(ir::types::I64, a as i64);
+            let widened = self.builder.ins().uextend(ir::types::I64, raw);
+            return self.builder.ins().imul(widened, an_const);
+        }
+        raw
     }
 
     // Helper function to interpret an input parameter as a pointer into
@@ -2186,6 +2273,14 @@ impl TrampolineCompiler<'_> {
             value = self.builder.ins().uextend(wasm_clif_ty, value);
         }
 
+        // AN-encoding (native/host → wasm): an i32 result must be re-encoded as
+        // the widened `I64` (`A*v`) the wasm caller's signature expects. i64
+        // results are outside the encoding and pass through. This hand-written
+        // trampoline bypasses `translate_hostcall`, so it must encode itself.
+        if self.compiler.tunables().an_encoding && wasm_ty == WasmValType::I32 {
+            value = self.an_encode_i32_result(value);
+        }
+
         self.abi_store_results(&[value]);
         Ok(())
     }
@@ -2208,6 +2303,16 @@ impl TrampolineCompiler<'_> {
             64 => pointer,
             p => bail!("unsupported architecture: no support for {p}-bit pointers"),
         };
+
+        // AN-encoding (wasm → native/host): an i32 value arrives encoded
+        // (`A*v`, widened to `I64`); decode it to a raw `I32` before narrowing
+        // to the native store width below. i64 values are outside the encoding
+        // and pass through. This hand-written trampoline bypasses
+        // `translate_hostcall`, so it must decode itself.
+        if self.compiler.tunables().an_encoding && wasm_ty == WasmValType::I32 {
+            let decoded = self.an_decode_i32_param(value);
+            value = self.builder.ins().ireduce(ir::types::I32, decoded);
+        }
 
         // Truncate the value, if necessary. For example, with
         // `u8-native-store` we will be given an `i32` from Wasm (because

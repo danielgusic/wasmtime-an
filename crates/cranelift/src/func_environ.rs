@@ -1411,15 +1411,25 @@ impl FuncEnvironment<'_> {
         }
 
         let (gv, offset) = self.get_global_location(func, index);
+        // AN-encoding: an i32 global is normally stored encoded as `A*v`, which
+        // does not fit in 32 bits, so widen its storage type to `I64` (the
+        // `VMGlobalDefinition` slot is 16 bytes, so there is room). This matches
+        // the operand-stack representation, so the loaded value is already a
+        // canonical encoded i32 with no per-access transform.
+        //
+        // Exception: raw host-control globals (component flags, `task_may_block`)
+        // keep their native un-widened storage because the runtime reads/writes
+        // them as raw bits. For those, `translate_global_get/set` perform the
+        // encode/decode per access instead (see `Module::an_raw_globals`).
+        let ty = if self.tunables().an_encoding && self.module.is_an_raw_global(index) {
+            super::value_type(self.isa, ty)
+        } else {
+            super::wasm_stack_value_type(self.isa, self.tunables(), ty)
+        };
         GlobalVariable::Memory {
             gv,
             offset: offset.into(),
-            // AN-encoding: an i32 global is stored encoded as `A*v`, which does
-            // not fit in 32 bits, so widen its storage type to `I64` (the
-            // `VMGlobalDefinition` slot is 16 bytes, so there is room). This
-            // matches the operand-stack representation, so the loaded value is
-            // already a canonical encoded i32 with no per-access transform.
-            ty: super::wasm_stack_value_type(self.isa, self.tunables(), ty),
+            ty,
         }
     }
 
@@ -2980,9 +2990,8 @@ impl FuncEnvironment<'_> {
         match self.get_or_create_global(builder.func, global_index) {
             GlobalVariable::Constant { value } => match value {
                 // AN-encoding: a constant-folded immutable i32 global must enter
-                // the operand stack already encoded as `A*v` in `I64`, the same
-                // form a memory-backed global would load. Treat the constant's
-                // bits as the canonical `v in [0, 2^32)` (zero-extend) and
+                // the operand stack already encoded as `A*v` in `I64`, like a
+                // memory-backed global would load. Zero-extend the constant and
                 // multiply by `A`.
                 GlobalConstValue::I32(x) if self.tunables().an_encoding => {
                     let encoded =
@@ -3014,7 +3023,20 @@ impl FuncEnvironment<'_> {
                 }
                 // Put globals in the "table" abstract heap category as well.
                 flags.set_alias_region(Some(ir::AliasRegion::Table));
-                Ok(builder.ins().load(ty, flags, addr, offset))
+                let loaded = builder.ins().load(ty, flags, addr, offset);
+                // AN-encoding: a raw host-control global stores its un-encoded
+                // i32 value. Bring it onto the operand stack as an encoded
+                // `A*v` (I64) so the rest of the AN-compiled function sees a
+                // canonical encoded operand.
+                if self.tunables().an_encoding && self.module.is_an_raw_global(global_index) {
+                    let zext = builder.ins().uextend(ir::types::I64, loaded);
+                    let an = builder
+                        .ins()
+                        .iconst(ir::types::I64, self.tunables().an_constant as i64);
+                    Ok(builder.ins().imul(zext, an))
+                } else {
+                    Ok(loaded)
+                }
             }
             GlobalVariable::Custom => {
                 let global_ty = self.module.globals[global_index];
@@ -3065,6 +3087,19 @@ impl FuncEnvironment<'_> {
                 }
                 // Put globals in the "table" abstract heap category as well.
                 flags.set_alias_region(Some(ir::AliasRegion::Table));
+                // AN-encoding: a raw host-control global expects its un-encoded
+                // i32 value. Decode the encoded `A*v` (I64) operand back to raw
+                // i32 before storing, keeping the runtime's raw view intact.
+                let val = if self.tunables().an_encoding && self.module.is_an_raw_global(global_index)
+                {
+                    let an = builder
+                        .ins()
+                        .iconst(ir::types::I64, self.tunables().an_constant as i64);
+                    let decoded = builder.ins().udiv(val, an);
+                    builder.ins().ireduce(ir::types::I32, decoded)
+                } else {
+                    val
+                };
                 debug_assert_eq!(ty, builder.func.dfg.value_type(val));
                 builder.ins().store(flags, val, addr, offset);
                 self.update_global(builder, global_index, val);

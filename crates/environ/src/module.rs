@@ -375,6 +375,16 @@ pub struct Module {
 
     /// WebAssembly exception and control tags.
     pub tags: TryPrimaryMap<TagIndex, Tag>,
+
+    /// AN-encoding: imported globals whose backing storage is raw (un-encoded)
+    /// host control state rather than an AN-encoded `A*v` slot. Today these are
+    /// the component instance flags (`may_enter`/`may_leave`) and the
+    /// `task_may_block` global, exposed to fused-adapter modules as imported
+    /// i32 globals but written/read as raw bits by the runtime. Under AN such a
+    /// global is a raw↔encoded boundary: its storage is not widened, and the
+    /// compiler encodes on `global.get` / decodes on `global.set`. Empty for
+    /// ordinary modules (and always empty when AN-encoding is off).
+    pub an_raw_globals: Vec<GlobalIndex>,
 }
 
 /// Initialization routines for creating an instance, encompassing imports,
@@ -422,7 +432,15 @@ impl Module {
             globals: Default::default(),
             global_initializers: Default::default(),
             tags: Default::default(),
+            an_raw_globals: Default::default(),
         }
+    }
+
+    /// Returns whether `global` is a raw (un-encoded) host-control global under
+    /// AN-encoding. See [`Module::an_raw_globals`].
+    #[inline]
+    pub fn is_an_raw_global(&self, global: GlobalIndex) -> bool {
+        self.an_raw_globals.contains(&global)
     }
 
     /// Convert a `DefinedFuncIndex` into a `FuncIndex`.
@@ -713,6 +731,7 @@ impl TypeTrace for Module {
             globals,
             global_initializers: _,
             tags,
+            an_raw_globals: _,
         } = self;
 
         for t in types.values().copied() {
@@ -765,6 +784,7 @@ impl TypeTrace for Module {
             globals,
             global_initializers: _,
             tags,
+            an_raw_globals: _,
         } = self;
 
         for t in types.values_mut() {

@@ -700,16 +700,16 @@ impl Instance {
 
     /// Re-allocate the AN-encoding shadow for a defined memory whose raw
     /// buffer has grown via `memory.grow`. Allocates a fresh
-    /// `2 * new_raw_size` `Box<[u8]>`, swaps it in, updates the
-    /// `vmctx_an_enc_memory_base` slot, and re-encodes the whole memory
-    /// from raw.
+    /// `2 * new_raw_size` `Box<[u8]>`, copies the previous shadow's
+    /// already-encoded bytes into it, swaps it in, and updates the
+    /// `vmctx_an_enc_memory_base` slot.
     ///
     /// No-op when the memory has no shadow allocated (AN off, shared, or
     /// imported).
     pub(crate) fn an_grow_shadow(
         mut self: Pin<&mut Self>,
         memory_index: DefinedMemoryIndex,
-        a: u64,
+        _a: u64,
     ) {
         if self.an_enc_shadows[memory_index].is_none() {
             return;
@@ -718,7 +718,30 @@ impl Instance {
         let new_size = raw_len
             .checked_mul(usize::try_from(wasmtime_environ::ENC_MEM_GROWTH_FACTOR).unwrap())
             .expect("AN shadow size overflowed usize on memory.grow");
-        let new_shadow: Box<[u8]> = vec![0u8; new_size].into_boxed_slice();
+        let mut new_shadow: Box<[u8]> = vec![0u8; new_size].into_boxed_slice();
+
+        // `memory.grow` only appends fresh zero pages; every pre-existing raw
+        // byte keeps its offset, so the old shadow is still a valid encoding of
+        // those bytes. Copy them verbatim into the new buffer and leave the
+        // rest zero: the grown raw pages are zero and `A * 0 == 0`, so their
+        // shadow slots are correctly zero straight from the fresh allocation.
+        //
+        // This deliberately avoids re-encoding the whole memory from raw on
+        // every grow. That re-encode was O(raw_len): for a multi-GiB memory it
+        // read every raw byte and wrote every shadow byte, committing both
+        // buffers and turning an otherwise lazy / VM-based `memory.grow` into a
+        // multi-second, multi-GiB spin (e.g. the `big-strings` component test).
+        // Copying only touches the old shadow (the bytes already resident),
+        // leaving the freshly mapped tail untouched and lazily zero-backed.
+        //
+        // It also keeps the encoded shadow as the source of truth: re-encoding
+        // from raw would silently "heal" any raw corruption that the
+        // host-boundary cross-check is supposed to detect.
+        if let Some(old_shadow) = self.an_enc_shadows[memory_index].as_deref() {
+            let n = old_shadow.len().min(new_shadow.len());
+            new_shadow[..n].copy_from_slice(&old_shadow[..n]);
+        }
+
         let base_ptr = NonNull::new(new_shadow.as_ptr() as *mut u8)
             .expect("AN shadow grow allocation produced a null pointer");
         self.as_mut().an_enc_shadows_mut()[memory_index] = Some(new_shadow);
@@ -735,13 +758,6 @@ impl Instance {
                 .vmctx_plus_offset_raw(offsets.vmctx_an_enc_memory_base(memory_index));
             slot.write(Some(VmPtr::from(base_ptr)));
         }
-
-        // Re-encode the whole memory from raw. The newly grown pages on the
-        // raw side are zero, and `A * 0 == 0`, so the corresponding shadow
-        // slots are already zero from the fresh allocation; this call only
-        // matters because the *pre-existing* shadow contents lived in the
-        // now-freed buffer.
-        self.as_mut().an_encode_full_memory_from_raw(memory_index, a);
     }
 
     /// AN-encoding cross-check for a single defined memory.
