@@ -136,6 +136,18 @@ pub struct ComponentInstance {
     /// `Store` that this component belongs to.
     instances: TryPrimaryMap<RuntimeInstanceIndex, InstanceId>,
 
+    /// AN-encoding identity of each extracted runtime memory: the public
+    /// `Memory` handle (defining core instance + defined memory index),
+    /// recorded alongside `set_runtime_memory`'s raw definition pointer.
+    ///
+    /// The canonical-ABI lowering paths use this to re-encode the AN-encoding
+    /// shadow for exactly the byte ranges the host writes into guest memory
+    /// (`LowerContext` writes happen on the host side of the boundary, so the
+    /// JIT store-mirroring cannot see them). `None` for shared memories
+    /// (refused under AN-encoding, no shadow exists) and for slots not yet
+    /// extracted.
+    an_runtime_memories: TryPrimaryMap<RuntimeMemoryIndex, Option<crate::Memory>>,
+
     /// Storage for the type information about resources within this component
     /// instance.
     resource_types: Arc<TryPrimaryMap<ResourceIndex, ResourceType>>,
@@ -338,11 +350,19 @@ impl ComponentInstance {
                 .unwrap(),
         )?;
 
+        let num_runtime_memories = component.env_component().num_runtime_memories;
+        let mut an_runtime_memories =
+            TryPrimaryMap::with_capacity(num_runtime_memories.try_into().unwrap())?;
+        for _ in 0..num_runtime_memories {
+            an_runtime_memories.push(None)?;
+        }
+
         let mut ret = OwnedInstance::new(ComponentInstance {
             id,
             offsets,
             instance_states,
             instances,
+            an_runtime_memories,
             component: component.clone(),
             resource_types,
             imports: imports.clone(),
@@ -528,6 +548,34 @@ impl ComponentInstance {
             debug_assert!((*storage).as_ptr() as usize == INVALID_PTR);
             *storage = ptr.into();
         }
+    }
+
+    /// Records the AN-encoding identity (public `Memory` handle) of the
+    /// runtime memory at `idx`, alongside the raw pointer stored by
+    /// [`Self::set_runtime_memory`]. Only called for unshared memories;
+    /// shared memories (which can never have an AN-encoding shadow) leave
+    /// the slot `None`.
+    pub fn set_an_runtime_memory_identity(
+        self: Pin<&mut Self>,
+        idx: RuntimeMemoryIndex,
+        memory: crate::Memory,
+    ) {
+        // SAFETY: plain field with no pinning requirements.
+        unsafe {
+            self.get_unchecked_mut().an_runtime_memories[idx] = Some(memory);
+        }
+    }
+
+    /// Returns the AN-encoding identity recorded for runtime memory `idx`,
+    /// if any.
+    pub fn an_runtime_memory_identity(&self, idx: RuntimeMemoryIndex) -> Option<crate::Memory> {
+        self.an_runtime_memories[idx]
+    }
+
+    /// Iterates over the AN-encoding identities of every extracted runtime
+    /// memory of this component instance.
+    pub fn an_runtime_memory_identities(&self) -> impl Iterator<Item = crate::Memory> + '_ {
+        self.an_runtime_memories.values().filter_map(|m| *m)
     }
 
     /// Same as `set_runtime_memory` but for realloc function pointers.

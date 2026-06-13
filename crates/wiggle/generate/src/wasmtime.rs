@@ -117,21 +117,47 @@ fn generate_func(
     let body = quote! {
         let export = caller.get_export("memory");
         let fuel = wiggle::wasmtime_crate::AsContextMut::as_context_mut(&mut caller).hostcall_fuel();
+        // Keep a copy of the memory handle so the AN-encoding shadow can be
+        // re-encoded for host-written ranges after the hostcall body runs.
+        let an_memory = match &export {
+            Some(wiggle::wasmtime_crate::Extern::Memory(m)) => Some(*m),
+            _ => None,
+        };
         let (mut mem, ctx) = match &export {
             Some(wiggle::wasmtime_crate::Extern::Memory(m)) => {
-                let (mem, ctx) = m.data_and_store_mut(&mut caller);
+                // When this memory has an AN-encoding shadow, record every
+                // host write range in the `GuestMemory` view (the untracked
+                // accessor skips the whole-dirty mark that `data_and_store_mut`
+                // would set); the ranges are re-encoded below.
+                let an_track = m.an_tracking_enabled(&caller);
+                let (mem, ctx) = m.an_untracked_data_and_store_mut(&mut caller);
                 let ctx = get_cx(ctx);
                 ctx.set_hostcall_fuel(fuel);
-                (wiggle::GuestMemory::Unshared(mem), ctx)
+                let mem = if an_track {
+                    wiggle::GuestMemory::unshared_an_tracked(mem)
+                } else {
+                    wiggle::GuestMemory::unshared(mem)
+                };
+                (mem, ctx)
             }
             Some(wiggle::wasmtime_crate::Extern::SharedMemory(m)) => {
                 let ctx = get_cx(caller.data_mut());
                 ctx.set_hostcall_fuel(fuel);
-                (wiggle::GuestMemory::Shared(m.data()), ctx)
+                (wiggle::GuestMemory::shared(m.data()), ctx)
             }
             _ => wiggle::error::bail!("missing required memory export"),
         };
-        Ok(<#ret_ty>::from(#abi_func(ctx, &mut mem #(, #arg_names)*) #await_ ?))
+        let result = #abi_func(ctx, &mut mem #(, #arg_names)*) #await_;
+        // Bring the AN-encoding shadow back in sync for exactly the ranges
+        // the host wrote. This must run on the error path too: writes may
+        // have landed before the error. No-op when tracking is off.
+        let an_dirty = mem.an_take_dirty();
+        if let Some(m) = an_memory {
+            for r in an_dirty {
+                m.an_resync_range(&mut caller, r.start as usize, (r.end - r.start) as usize);
+            }
+        }
+        Ok(<#ret_ty>::from(result?))
     };
 
     match asyncness {

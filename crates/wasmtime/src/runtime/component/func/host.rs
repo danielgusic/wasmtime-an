@@ -441,9 +441,11 @@ where
             // return pointer, located after the parameters, is initialized
             // by wasm and safe to read.
             let ptr = unsafe { rest[0].assume_init_ref() };
+            // Bounds validation only (no write): use the untracked accessor
+            // so this doesn't record a whole-memory AN-shadow resync.
             Destination::Memory(validate_inbounds_dynamic(
                 &result_tys.abi,
-                lower.as_slice_mut(),
+                lower.as_slice_mut_untracked(),
                 ptr,
             )?)
         };
@@ -483,7 +485,9 @@ where
             // should be safe to use.
             let ptr = unsafe { rest[0].assume_init_ref() };
             let result_tys = &lower.types[fty.results];
-            validate_inbounds_dynamic(&result_tys.abi, lower.as_slice_mut(), ptr)?
+            // Bounds validation only (no write): untracked accessor, see the
+            // sync path above.
+            validate_inbounds_dynamic(&result_tys.abi, lower.as_slice_mut_untracked(), ptr)?
         } else {
             // If there's no return pointer then `R` should have an
             // empty flat representation. In this situation pretend the return
@@ -587,7 +591,13 @@ where
             unsafe {
                 flags.set_may_leave(false);
             }
-            Self::lower_result(lower, ty, ret, dst)?;
+            let result = Self::lower_result(lower, ty, ret, dst);
+            // Wasm resumes after this hostcall: re-encode the AN-encoding
+            // shadow for everything the result lowering wrote into guest
+            // memory. Run on the error path too — partial writes may have
+            // landed.
+            lower.an_flush_dirty();
+            result?;
             unsafe {
                 flags.set_may_leave(true);
             }

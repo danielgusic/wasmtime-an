@@ -17,7 +17,7 @@
 //!
 //! ```text
 //!   P_lo = imul.i64(A*n, A*m)              // low 64 of A^2*n*m
-//!   P_hi = umulhi.i64(A*n, A*m)            // high; P = (P_hi, P_lo) fits in <96 bits
+//!   P_hi = umulhi.i64(A*n, A*m)            // high; P = (P_hi, P_lo) < 2^110 (A < 2^23)
 //!   (Q_hi, Q_lo) = udiv_u128_by_u64_const(P_hi, P_lo, A)   // Q = A*n*m
 //!   result       = umod_u128_by_u64_const_to_i64(Q_hi, Q_lo, A*2^32)
 //! ```
@@ -295,14 +295,16 @@ pub(crate) fn emit_an_shr_u_i32(
 /// Load the base pointer of the AN-encoding shadow for a wasm memory.
 ///
 /// The returned `I64` value is the runtime address of the first byte of the
-/// shadow buffer for `memory_index`, read from the per-memory `VMContext`
-/// slot written by `Instance::set_an_enc_shadows`. JIT'd store code adds an
-/// in-shadow offset (`raw_addr * ENC_MEM_GROWTH_FACTOR` plus an in-slot byte
-/// position) and writes the encoded value.
+/// shadow buffer for `memory_index`. For a defined memory it is read from
+/// the per-memory `VMContext` slot written by `Instance::set_an_enc_shadows`;
+/// for an imported memory it is read through one extra indirection — the
+/// `VMMemoryImport::an_enc_base_slot` pointer into the *owning* instance's
+/// slot. JIT'd store code adds an in-shadow offset
+/// (`raw_addr * ENC_MEM_GROWTH_FACTOR` plus an in-slot byte position) and
+/// writes the encoded value.
 ///
-/// Returns `None` when AN-encoding is off, when the memory is imported (no
-/// shadow allocated), or when the memory has no defined-memory index for any
-/// other reason. Callers must skip the shadow write in that case.
+/// Returns `None` only when AN-encoding is off. Callers must skip the
+/// shadow write in that case.
 pub(crate) fn emit_an_enc_base_pointer(
     builder: &mut FunctionBuilder,
     environ: &mut FuncEnvironment<'_>,
@@ -311,21 +313,49 @@ pub(crate) fn emit_an_enc_base_pointer(
     if !environ.tunables().an_encoding {
         return None;
     }
-    let def_idx = environ.module.defined_memory_index(memory_index)?;
+
+    let vmctx_gv = environ.vmctx(&mut builder.func);
+    let vmctx_val = builder.ins().global_value(I64, vmctx_gv);
+
+    let Some(def_idx) = environ.module.defined_memory_index(memory_index) else {
+        // Imported memory: the shadow lives on the owning instance.
+        // `VMMemoryImport::an_enc_base_slot` points at the owner's enc-base
+        // slot; that pointer is written once at instantiation and never
+        // changes, so loading it is `readonly`. The slot's *contents* (the
+        // shadow base) change whenever the owner's memory grows, so the
+        // second load must NOT be readonly (see the defined-memory case
+        // below for why).
+        //
+        // Under AN-encoding every non-shared memory has a shadow (shared
+        // memories are refused at compile time), so the slot pointer is
+        // never null here.
+        let import_off = environ.offsets.vmctx_vmmemory_import(memory_index)
+            + u32::from(environ.offsets.vmmemory_import_an_enc_base_slot());
+        let import_off = i32::try_from(import_off)
+            .expect("VMContext offset for AN enc-base slot pointer does not fit in i32");
+        let mut readonly_mem = MemFlags::trusted();
+        readonly_mem.set_readonly();
+        let slot_ptr = builder.ins().load(
+            I64,
+            readonly_mem,
+            vmctx_val,
+            ir::immediates::Offset32::new(import_off),
+        );
+        return Some(builder.ins().load(I64, MemFlags::trusted(), slot_ptr, 0));
+    };
 
     let offset_u32 = environ.offsets.vmctx_an_enc_memory_base(def_idx);
     let offset_i32 = i32::try_from(offset_u32)
         .expect("VMContext offset for AN enc-memory base does not fit in i32");
 
-    let vmctx_gv = environ.vmctx(&mut builder.func);
-    let vmctx_val = builder.ins().global_value(I64, vmctx_gv);
-    // The slot is written once at instance set_store time and never mutated
-    // afterwards, so reads are safely treated as readonly + trusted.
-    let mut readonly_mem = MemFlags::trusted();
-    readonly_mem.set_readonly();
+    // NOT readonly: `an_grow_shadow` re-allocates the shadow buffer and
+    // rewrites this slot on every successful `memory.grow`, so the load must
+    // be re-issued after any call that may grow memory. A `readonly` flag
+    // here would let GVN/LICM reuse a stale base pointer across a grow,
+    // turning subsequent shadow stores into writes to freed memory.
     Some(builder.ins().load(
         I64,
-        readonly_mem,
+        MemFlags::trusted(),
         vmctx_val,
         ir::immediates::Offset32::new(offset_i32),
     ))

@@ -267,7 +267,7 @@ wasmtime_option_group! {
         /// Enable AN-encoding (widened i32 → i64, A·v representation).
         pub an_encoding: Option<bool>,
 
-        /// AN-encoding constant `A` (default 65521). Must be in `1..2^31`.
+        /// AN-encoding constant `A` (default 65521). Must be in `1..2^23`.
         pub an_constant: Option<u64>,
 
         /// Opt in to AN-encoding's per-load shadow-validity check. Adds an

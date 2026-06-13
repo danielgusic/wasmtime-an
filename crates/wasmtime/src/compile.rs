@@ -76,13 +76,12 @@ fn validate_an_encoding_constraints(
 
     let module = &translation.module;
 
-    if module.num_imported_memories > 0 {
-        bail!(
-            "AN-encoding does not support imported linear memories. \
-             Found {} imported memory(s).",
-            module.num_imported_memories
-        );
-    }
+    // Imported (non-shared) memories are supported: the importing instance
+    // mirrors stores through the owning instance's shadow via the
+    // `VMMemoryImport::an_enc_base_slot` indirection, the bulk-memory
+    // libcalls resolve the owner for their re-encode, and the host-boundary
+    // cross-check walks imported memories too. Shared memories (imported or
+    // defined) are refused below.
 
     let mut saw_memory64 = false;
     for (_, mem) in module.memories.iter() {
@@ -537,6 +536,13 @@ pub(crate) fn build_component_artifacts<T: FinishedObject>(
     let (component, mut module_translations) = translator
         .translate(binary)
         .context("failed to parse WebAssembly module")?;
+
+    // AN-encoding: apply the same refusals to every core module inside the
+    // component (floats, atomics, shared memories, memory64 warning) that
+    // `build_module_artifacts` applies to plain core modules.
+    for (_, translation) in module_translations.iter() {
+        validate_an_encoding_constraints(translation, tunables, types.module_types_builder())?;
+    }
 
     let compile_inputs = CompileInputs::for_component(
         engine,

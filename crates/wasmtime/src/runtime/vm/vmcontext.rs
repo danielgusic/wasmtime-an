@@ -268,6 +268,21 @@ pub struct VMMemoryImport {
 
     /// The index of the memory in the containing `vmctx`.
     pub index: DefinedMemoryIndex,
+
+    /// AN-encoding: pointer to the *owning* instance's enc-base slot for
+    /// this memory (`VMOffsets::vmctx_an_enc_memory_base(index)` inside
+    /// `vmctx` above).
+    ///
+    /// This is a pointer to the slot, not to the shadow itself: the shadow
+    /// buffer is re-allocated (and the slot rewritten) on every successful
+    /// `memory.grow`, while the slot address is stable for the owning
+    /// instance's lifetime. JIT'd code in the importing instance mirrors
+    /// stores through one extra indirection: load this pointer (immutable
+    /// after instantiation), then load the current shadow base through it.
+    ///
+    /// `None` when AN-encoding is off or the memory is shared (no shadow
+    /// exists; shared memories are refused under AN-encoding anyway).
+    pub an_enc_base_slot: Option<VmPtr<u8>>,
 }
 
 // SAFETY: the above structure is repr(C) and only contains `VmSafe` fields.
@@ -299,6 +314,10 @@ mod test_vmmemory_import {
         assert_eq!(
             offset_of!(VMMemoryImport, index),
             usize::from(offsets.vmmemory_import_index())
+        );
+        assert_eq!(
+            offset_of!(VMMemoryImport, an_enc_base_slot),
+            usize::from(offsets.vmmemory_import_an_enc_base_slot())
         );
     }
 }
@@ -614,7 +633,9 @@ impl VMGlobalDefinition {
             match wasm_ty {
                 // AN-encoding: an i32 global is stored encoded as `A * v` in the
                 // 64-bit slot. A `ValRaw` carries the raw value, so encode at this
-                // boundary (mirrors host-side `Global::set`).
+                // boundary (mirrors host-side `Global::set`). NB: `from_val_raw` /
+                // `to_val_raw` currently have no callers; the AN handling here is
+                // kept so any future `ValRaw`-based global access stays correct.
                 WasmValType::I32 => {
                     let tunables = store.engine().tunables();
                     if tunables.an_encoding {

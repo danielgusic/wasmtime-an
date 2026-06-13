@@ -389,12 +389,71 @@ impl Memory {
         buffer: &[u8],
     ) -> Result<(), MemoryAccessError> {
         let mut context = store.as_context_mut();
-        self.data_mut(&mut context)
+        // Deliberately bypass `data_mut` (which would mark the memory
+        // whole-dirty for the AN-encoding shadow): the written range is
+        // known exactly, so the shadow is brought back in sync right below
+        // with a range re-encode instead.
+        self.data_mut_untracked(&mut context)
             .get_mut(offset..)
             .and_then(|s| s.get_mut(..buffer.len()))
             .ok_or(MemoryAccessError { _private: () })?
             .copy_from_slice(buffer);
+        self.an_resync_range(&mut context, offset, buffer.len());
         Ok(())
+    }
+
+    /// Re-encodes the AN-encoding shadow of this memory from raw bytes for
+    /// exactly `[offset, offset + len)` (rounded outward to the containing
+    /// 4-byte slots). No-op when no shadow is allocated (AN-encoding off, or
+    /// this memory is shared).
+    ///
+    /// `#[doc(hidden)]`: used by `Memory::write` and by the wiggle-generated
+    /// WASI preview1 hostcall wrappers to bring the shadow back in sync
+    /// after a tracked host write; embedders should not call this directly.
+    #[doc(hidden)]
+    pub fn an_resync_range(&self, mut store: impl AsContextMut, offset: usize, len: usize) {
+        let mut context = store.as_context_mut();
+        let a = context.engine().tunables().an_constant;
+        self.instance
+            .get_mut(&mut context.0)
+            .an_encode_range_from_raw(self.index, offset, len, a);
+    }
+
+    /// Whether host writes to this memory need AN-encoding write tracking,
+    /// i.e. whether an encoded shadow is allocated for it.
+    ///
+    /// `#[doc(hidden)]`: used by the wiggle-generated WASI preview1 hostcall
+    /// wrappers to decide whether the `GuestMemory` view should record
+    /// written ranges.
+    #[doc(hidden)]
+    pub fn an_tracking_enabled(&self, store: impl AsContext) -> bool {
+        store.as_context()[self.instance].an_has_shadow(self.index)
+    }
+
+    /// If the host pointer range `[ptr, ptr + len)` lies inside this
+    /// memory's current allocation, re-encodes the AN-encoding shadow for
+    /// that range and returns `true`; returns `false` otherwise.
+    ///
+    /// Used by the component-model transcode libcalls, which receive raw
+    /// destination pointers (computed by the fused-adapter trampolines from
+    /// a runtime memory's base) rather than memory indices.
+    pub(crate) fn an_resync_if_contains_ptr(
+        &self,
+        store: &mut StoreOpaque,
+        ptr: usize,
+        len: usize,
+    ) -> bool {
+        let definition = self.instance.get(store).memory(self.index);
+        let base = definition.base.as_ptr() as usize;
+        let mem_len = definition.current_length();
+        if ptr < base || ptr.saturating_add(len) > base.saturating_add(mem_len) {
+            return false;
+        }
+        let a = store.engine().tunables().an_constant;
+        self.instance
+            .get_mut(store)
+            .an_encode_range_from_raw(self.index, ptr - base, len, a);
+        true
     }
 
     /// Returns this memory as a native Rust slice.
@@ -423,6 +482,25 @@ impl Memory {
     ///
     /// Panics if this memory doesn't belong to `store`.
     pub fn data_mut<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContextMut<'a, T>>,
+    ) -> &'a mut [u8] {
+        let mut store = store.into();
+        // The caller may write anywhere in raw memory through the returned
+        // borrow, invisibly to the AN-encoding shadow. Mark the memory
+        // whole-dirty so the next host-boundary resync re-encodes it from
+        // raw. No-op when no shadow is allocated (AN-encoding off).
+        self.instance
+            .get_mut(&mut store.0)
+            .an_mark_whole_dirty(self.index);
+        self.data_mut_untracked(store)
+    }
+
+    /// Like [`Memory::data_mut`] but does *not* mark the memory whole-dirty
+    /// for AN-encoding shadow maintenance. Internal-only: every caller must
+    /// bring the shadow back in sync itself (e.g. [`Memory::write`]
+    /// re-encodes exactly the written range).
+    fn data_mut_untracked<'a, T: 'static>(
         &self,
         store: impl Into<StoreContextMut<'a, T>>,
     ) -> &'a mut [u8] {
@@ -490,6 +568,27 @@ impl Memory {
             let mut store = store.into();
             let data = &mut *(store.data_mut() as *mut T);
             (self.data_mut(store), data)
+        }
+    }
+
+    /// Like [`Memory::data_and_store_mut`] but does *not* mark the memory
+    /// whole-dirty for AN-encoding shadow maintenance.
+    ///
+    /// `#[doc(hidden)]`: used by the wiggle-generated WASI preview1 hostcall
+    /// wrappers, which instead record every written byte range through the
+    /// `GuestMemory` view and re-encode the shadow for exactly those ranges
+    /// after the hostcall body completes. Any other caller must bring the
+    /// shadow back in sync itself.
+    #[doc(hidden)]
+    pub fn an_untracked_data_and_store_mut<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContextMut<'a, T>>,
+    ) -> (&'a mut [u8], &'a mut T) {
+        // SAFETY: same disjoint-borrow argument as `data_and_store_mut`.
+        unsafe {
+            let mut store = store.into();
+            let data = &mut *(store.data_mut() as *mut T);
+            (self.data_mut_untracked(store), data)
         }
     }
 

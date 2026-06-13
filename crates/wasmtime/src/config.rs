@@ -2516,7 +2516,35 @@ impl Config {
         features &= !self.disabled_features;
         features |= self.enabled_features;
 
+        // AN-encoding only transforms the scalar-integer subset of wasm.
+        // Force-disable proposals whose operators would otherwise flow
+        // encoded i32 values into raw sinks (or vice versa) without any
+        // translation support: SIMD (vector shift counts / splats consume
+        // wasm i32), the GC proposal (i31ref and i32 struct/array fields),
+        // exceptions (i32 payloads), and stack switching. The validator then
+        // refuses such modules at translation time. Applied last so an
+        // explicit user enable cannot re-add them (Config::validate reports
+        // that conflict as an error). Threads/atomics are refused separately
+        // with AN-specific diagnostics in `validate_an_encoding_constraints`.
+        if self.tunables.an_encoding.unwrap_or(false) {
+            features &= !Self::an_unsupported_features();
+        }
+
         features
+    }
+
+    /// Wasm proposals that AN-encoding has no translation support for; see
+    /// the comment in [`Config::features`]. Kept in one place so the
+    /// feature-mask and the explicit-enable conflict check in
+    /// [`Config::validate`] cannot drift apart.
+    fn an_unsupported_features() -> WasmFeatures {
+        WasmFeatures::SIMD
+            | WasmFeatures::RELAXED_SIMD
+            | WasmFeatures::GC
+            | WasmFeatures::EXCEPTIONS
+            | WasmFeatures::LEGACY_EXCEPTIONS
+            | WasmFeatures::STACK_SWITCHING
+            | WasmFeatures::SHARED_EVERYTHING_THREADS
     }
 
     /// Returns the configured compiler target for this `Config`.
@@ -2547,6 +2575,25 @@ impl Config {
 
     pub(crate) fn validate(&self) -> Result<(Tunables, WasmFeatures)> {
         let features = self.features();
+
+        // `Config::features` silently masks AN-unsupported proposals out of
+        // the *default* feature set, but an explicit user enable is a
+        // configuration conflict and deserves a first-class error rather
+        // than a silent downgrade.
+        if self.tunables.an_encoding.unwrap_or(false) {
+            let conflict = self.enabled_features & Self::an_unsupported_features();
+            if !conflict.is_empty() {
+                for flag in WasmFeatures::FLAGS.iter() {
+                    if !conflict.contains(*flag.value()) {
+                        continue;
+                    }
+                    bail!(
+                        "AN-encoding does not support the explicitly enabled wasm_{} feature",
+                        flag.name().to_lowercase()
+                    );
+                }
+            }
+        }
 
         // First validate that the selected compiler backend and configuration
         // supports the set of `features` that are enabled. This will help
@@ -2661,6 +2708,18 @@ impl Config {
                 .compiler_config
                 .as_ref()
                 .is_some_and(|c| c.strategy == Some(Strategy::Winch));
+        }
+
+        // AN-encoding is implemented entirely in the Cranelift wasm-to-CLIF
+        // translation. Winch has its own code generator that ignores the AN
+        // tunables, so it would silently emit *unencoded* code against a
+        // runtime that allocates shadows, stores i32 globals encoded, and
+        // widens signatures — refuse the combination outright.
+        if tunables.an_encoding && tunables.winch_callable {
+            bail!(
+                "AN-encoding requires the Cranelift compilation strategy; \
+                 Winch does not implement the AN transformation"
+            );
         }
 
         tunables.collector = if features.gc_types() {

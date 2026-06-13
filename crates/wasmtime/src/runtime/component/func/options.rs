@@ -50,6 +50,17 @@ pub struct LowerContext<'a, T: 'static> {
 
     /// Whether to allow `options.realloc` to be used when lowering.
     allow_realloc: bool,
+
+    /// Byte ranges of guest linear memory written by host-side lowering
+    /// through this context, recorded for AN-encoding shadow maintenance.
+    ///
+    /// Host-side lowering writes raw bytes that the JIT store-mirroring
+    /// cannot see, so the encoded shadow must be re-encoded for exactly
+    /// these ranges before control re-enters wasm. Ranges are recorded by
+    /// [`LowerContext::get`] / [`LowerContext::slice_mut`] (exact) and
+    /// [`LowerContext::as_slice_mut`] (whole memory, conservative), and
+    /// drained by [`LowerContext::an_flush_dirty`].
+    an_dirty: Vec<core::ops::Range<usize>>,
 }
 
 #[doc(hidden)]
@@ -73,6 +84,7 @@ impl<'a, T: 'static> LowerContext<'a, T> {
             types: component.types(),
             instance,
             allow_realloc: true,
+            an_dirty: Vec::new(),
         }
     }
 
@@ -97,6 +109,7 @@ impl<'a, T: 'static> LowerContext<'a, T> {
             types: component.types(),
             instance,
             allow_realloc: false,
+            an_dirty: Vec::new(),
         }
     }
 
@@ -117,12 +130,102 @@ impl<'a, T: 'static> LowerContext<'a, T> {
 
     /// Returns a view into memory as a mutable slice of bytes.
     ///
+    /// The caller may write anywhere through the returned borrow, so the
+    /// whole memory is conservatively recorded as host-written for
+    /// AN-encoding shadow maintenance. Lowering paths that know their exact
+    /// range should use [`LowerContext::slice_mut`] or
+    /// [`LowerContext::get`] instead.
+    ///
     /// # Panics
     ///
     /// This will panic if memory has not been configured for this lowering
     /// (e.g. it wasn't present during the specification of canonical options).
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
+        self.an_record_write(0, usize::MAX);
+        self.as_slice_mut_untracked()
+    }
+
+    /// Like [`LowerContext::as_slice_mut`] but records nothing for the
+    /// AN-encoding shadow. For read-only uses (bounds validation) and for
+    /// callers that record their exact written range themselves.
+    pub(crate) fn as_slice_mut_untracked(&mut self) -> &mut [u8] {
         self.instance.options_memory_mut(self.store.0, self.options)
+    }
+
+    /// Returns a mutable view of `len` bytes of memory at `offset`,
+    /// recording the range as host-written for AN-encoding shadow
+    /// maintenance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + len` is out of bounds (same as the slicing
+    /// expression `&mut as_slice_mut()[offset..][..len]` it replaces) or if
+    /// memory has not been configured for this lowering.
+    pub fn slice_mut(&mut self, offset: usize, len: usize) -> &mut [u8] {
+        self.an_record_write(offset, len);
+        &mut self.as_slice_mut_untracked()[offset..][..len]
+    }
+
+    /// Records `[offset, offset + len)` of the configured memory as
+    /// host-written, for AN-encoding shadow maintenance.
+    ///
+    /// Ranges coalesce with the most recently recorded range when they
+    /// touch (lowering mostly writes sequentially) and the list is bounded:
+    /// on overflow everything collapses into one bounding range.
+    /// Over-approximation is harmless for correctness (the resync
+    /// re-encodes from raw, which is idempotent).
+    fn an_record_write(&mut self, offset: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = offset.saturating_add(len);
+        if let Some(last) = self.an_dirty.last_mut() {
+            if offset <= last.end && end >= last.start {
+                last.start = last.start.min(offset);
+                last.end = last.end.max(end);
+                return;
+            }
+        }
+        const MAX_DIRTY_RANGES: usize = 128;
+        if self.an_dirty.len() >= MAX_DIRTY_RANGES {
+            let mut start = offset;
+            let mut max_end = end;
+            for r in &self.an_dirty {
+                start = start.min(r.start);
+                max_end = max_end.max(r.end);
+            }
+            self.an_dirty.clear();
+            self.an_dirty.push(start..max_end);
+            return;
+        }
+        self.an_dirty.push(offset..end);
+    }
+
+    /// Re-encodes the AN-encoding shadow of the configured memory for every
+    /// recorded host-written range, then clears the record.
+    ///
+    /// Must run before control re-enters wasm (a `realloc` call, the lifted
+    /// call itself, resuming the caller after a hostcall): the boundary
+    /// cross-check and the opt-in per-load validity check both compare the
+    /// shadow against raw bytes, and host-side lowering writes raw bytes
+    /// the JIT store-mirroring cannot see. No-op when nothing was recorded
+    /// or when the memory has no AN-encoding shadow (AN-encoding off).
+    ///
+    /// Ranges past the end of memory are clamped by the re-encode itself,
+    /// so the conservative whole-memory record (`0..usize::MAX`) from
+    /// [`LowerContext::as_slice_mut`] simply re-encodes everything.
+    pub(crate) fn an_flush_dirty(&mut self) {
+        if self.an_dirty.is_empty() {
+            return;
+        }
+        let ranges = core::mem::take(&mut self.an_dirty);
+        let memory = match self.instance.an_options_memory(self.store.0, self.options) {
+            Some(m) => m,
+            None => return,
+        };
+        for r in ranges {
+            memory.an_resync_range(&mut self.store, r.start, r.end - r.start);
+        }
     }
 
     /// Invokes the memory allocation function (which is style after `realloc`)
@@ -140,6 +243,11 @@ impl<'a, T: 'static> LowerContext<'a, T> {
         new_size: usize,
     ) -> Result<usize> {
         assert!(self.allow_realloc);
+
+        // Control re-enters wasm: anything lowered so far must be visible in
+        // the AN-encoding shadow before guest code runs (the opt-in per-load
+        // validity check reads the shadow at every i32 load).
+        self.an_flush_dirty();
 
         let (component, store) = self.instance.component_and_store_mut(self.store.0);
         let instance = self.instance.id().get(store);
@@ -172,7 +280,7 @@ impl<'a, T: 'static> LowerContext<'a, T> {
         let result = usize::try_from(result)?;
 
         if self
-            .as_slice_mut()
+            .as_slice_mut_untracked()
             .get_mut(result..)
             .and_then(|s| s.get_mut(..new_size))
             .is_none()
@@ -194,6 +302,9 @@ impl<'a, T: 'static> LowerContext<'a, T> {
     /// This will panic if memory has not been configured for this lowering
     /// (e.g. it wasn't present during the specification of canonical options).
     pub fn get<const N: usize>(&mut self, offset: usize) -> &mut [u8; N] {
+        // The returned array is always a write destination (lifting reads go
+        // through `LiftContext`), so record it for the AN-encoding shadow.
+        self.an_record_write(offset, N);
         // FIXME: this bounds check shouldn't actually be necessary, all
         // callers of `ComponentType::store` have already performed a bounds
         // check so we're guaranteed that `offset..offset+N` is in-bounds. That
@@ -204,7 +315,9 @@ impl<'a, T: 'static> LowerContext<'a, T> {
         // For now I figure we can leave in this bounds check and if it becomes
         // an issue we can optimize further later, probably with judicious use
         // of `unsafe`.
-        self.as_slice_mut()[offset..].first_chunk_mut().unwrap()
+        self.as_slice_mut_untracked()[offset..]
+            .first_chunk_mut()
+            .unwrap()
     }
 
     /// Lowers an `own` resource into the guest, converting the `rep` specified

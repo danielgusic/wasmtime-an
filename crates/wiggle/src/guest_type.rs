@@ -102,6 +102,11 @@ macro_rules! integer_primitives {
                 let atomic_value_ref: &$ty_atomic =
                     unsafe { &*(host_ptr.get().cast::<$ty_atomic>()) };
                 atomic_value_ref.store(val, Ordering::Relaxed);
+                // Every primitive write funnels through here (floats and
+                // guest pointers delegate to their integer counterparts), so
+                // this one record covers all typed writes for the AN-encoding
+                // shadow resync.
+                mem.an_record_write(offset, Self::guest_size());
                 Ok(())
             }
         }

@@ -269,8 +269,10 @@ fn lower<T: func::Lower + Send + 'static, B: WriteBuffer<T>, U: 'static>(
     if address % usize::try_from(T::ALIGN32)? != 0 {
         bail!("read pointer not aligned");
     }
+    // Bounds validation only (no write): untracked accessor so this doesn't
+    // record a whole-memory AN-shadow resync.
     lower
-        .as_slice_mut()
+        .as_slice_mut_untracked()
         .get_mut(address..)
         .and_then(|b| b.get_mut(..T::SIZE32 * count))
         .ok_or_else(|| crate::format_err!("read pointer out of bounds of memory"))?;
@@ -278,6 +280,10 @@ fn lower<T: func::Lower + Send + 'static, B: WriteBuffer<T>, U: 'static>(
     if let Some(ty) = ty.payload(lower.types) {
         T::linear_store_list_to_memory(lower, *ty, address, &buffer.remaining()[..count])?;
     }
+
+    // Wasm may resume after this: re-encode the AN-encoding shadow for the
+    // ranges the lowering above wrote.
+    lower.an_flush_dirty();
 
     if let Some(old_thread) = old_thread {
         store.0.set_thread(old_thread)?;
@@ -3356,9 +3362,10 @@ impl Instance {
                     // thread context after the copy is complete.
                     let old_thread = store.set_thread(read_caller_thread)?;
                     let lower = &mut LowerContext::new(store.as_context_mut(), read_options, self);
+                    // Bounds validation only (no write): untracked accessor.
                     let ptr = func::validate_inbounds_dynamic(
                         read_abi,
-                        lower.as_slice_mut(),
+                        lower.as_slice_mut_untracked(),
                         &ValRaw::u32(read_address.try_into()?),
                     )?;
                     let ty = match read_payload_ty {
@@ -3366,6 +3373,9 @@ impl Instance {
                         None => bail_bug!("expected read payload type to be present"),
                     };
                     val.store(lower, *ty, ptr)?;
+                    // Re-encode the AN-encoding shadow for the lowered range
+                    // before wasm resumes.
+                    lower.an_flush_dirty();
                     store.set_thread(old_thread)?;
                 }
             }
@@ -3442,6 +3452,9 @@ impl Instance {
                         value.store(lower, *read_payload_ty, ptr)?;
                         ptr += usize::try_from(read_abi.size32)?;
                     }
+                    // Re-encode the AN-encoding shadow for the lowered ranges
+                    // before wasm resumes.
+                    lower.an_flush_dirty();
                     store.set_thread(old_thread)?;
                 }
             }
@@ -4321,8 +4334,9 @@ impl Instance {
         // Note that the "8" here is the size of a WIT `string` in linear
         // memory, the ptr+length. This'll need to be updated when `memory64`
         // comes along. (FIXME(#4311))
+        // Bounds validation only (no write): untracked accessor.
         let offset = lower_cx
-            .as_slice_mut()
+            .as_slice_mut_untracked()
             .get(debug_msg_address..)
             .and_then(|b| b.get(..8))
             .map(|_| debug_msg_address)
@@ -4330,6 +4344,9 @@ impl Instance {
         debug_msg
             .as_str()
             .linear_lower_to_memory(lower_cx, InterfaceType::String, offset)?;
+        // Re-encode the AN-encoding shadow for the lowered string before
+        // wasm resumes.
+        lower_cx.an_flush_dirty();
 
         Ok(())
     }

@@ -849,6 +849,11 @@ impl Func {
         let mut cx = LowerContext::new(store.as_context_mut(), options_idx, self.instance);
         let param_ty = InterfaceType::Tuple(cx.types[ty].params);
         let result = lower(&mut cx, param_ty);
+        // The lifted call runs next: re-encode the AN-encoding shadow for
+        // everything the lowering wrote into guest memory (raw host-side
+        // writes the JIT store-mirroring cannot see). Run on the error path
+        // too — partial writes may have landed.
+        cx.an_flush_dirty();
         unsafe { flags.set_may_leave(true) };
         result
     }

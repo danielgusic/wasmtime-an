@@ -467,17 +467,61 @@ impl Instance {
         store: &StoreOpaque,
         options: OptionsIndex,
     ) -> Option<NonNull<vm::VMMemoryDefinition>> {
+        let memory = self.options_memory_runtime_index(store, options)?;
+        Some(self.id.get(store).runtime_memory(memory))
+    }
+
+    fn options_memory_runtime_index(
+        &self,
+        store: &StoreOpaque,
+        options: OptionsIndex,
+    ) -> Option<RuntimeMemoryIndex> {
         let instance = self.id.get(store);
         let options = &instance.component().env_component().options[options];
-        let memory = match options.data_model {
-            CanonicalOptionsDataModel::Gc { .. } => return None,
-            CanonicalOptionsDataModel::LinearMemory(o) => match o.memory {
-                Some(m) => m,
-                None => return None,
-            },
-        };
+        match options.data_model {
+            CanonicalOptionsDataModel::Gc { .. } => None,
+            CanonicalOptionsDataModel::LinearMemory(o) => o.memory,
+        }
+    }
 
-        Some(instance.runtime_memory(memory))
+    /// Returns the AN-encoding identity (public `Memory` handle) of the
+    /// memory configured in the given canonical options, when one exists.
+    /// Used by the lowering paths to re-encode the AN-encoding shadow for
+    /// host-written byte ranges.
+    pub(crate) fn an_options_memory(
+        &self,
+        store: &StoreOpaque,
+        options: OptionsIndex,
+    ) -> Option<crate::Memory> {
+        let idx = self.options_memory_runtime_index(store, options)?;
+        self.id.get(store).an_runtime_memory_identity(idx)
+    }
+
+    /// Re-encodes the AN-encoding shadow for `byte_len` bytes at the host
+    /// pointer `ptr`, which is expected to point into one of this
+    /// component's extracted runtime memories.
+    ///
+    /// The transcode libcalls receive raw destination pointers (computed by
+    /// the fused-adapter trampolines from a runtime memory's base), so the
+    /// owning memory is found by scanning the recorded identities — a
+    /// component has very few runtime memories. No-op when no memory
+    /// contains the range or no shadow is allocated (AN-encoding off).
+    pub(crate) fn an_resync_transcode_dst(
+        &self,
+        store: &mut StoreOpaque,
+        ptr: usize,
+        byte_len: usize,
+    ) {
+        if byte_len == 0 {
+            return;
+        }
+        let memories: alloc::vec::Vec<crate::Memory> =
+            self.id.get(store).an_runtime_memory_identities().collect();
+        for memory in memories {
+            if memory.an_resync_if_contains_ptr(store, ptr, byte_len) {
+                return;
+            }
+        }
     }
 
     pub(crate) fn options_memory<'a>(
@@ -940,7 +984,14 @@ impl<'a> Instantiator<'a> {
 
     fn extract_memory(&mut self, store: &mut StoreOpaque, memory: &ExtractMemory) {
         let import = match lookup_vmexport(store, self.id, &memory.export) {
-            crate::runtime::vm::Export::Memory(memory) => memory.vmimport(store),
+            crate::runtime::vm::Export::Memory(m) => {
+                // Record the memory's identity for AN-encoding shadow
+                // maintenance: the canonical-ABI lowering paths re-encode
+                // the shadow for host-written ranges through this handle.
+                self.instance_mut(store)
+                    .set_an_runtime_memory_identity(memory.index, m);
+                m.vmimport(store)
+            }
             crate::runtime::vm::Export::SharedMemory(_, import) => import,
             _ => unreachable!(),
         };

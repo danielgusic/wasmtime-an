@@ -889,10 +889,17 @@ impl<P: PtrSize> VMOffsets<P> {
         2 * self.pointer_size()
     }
 
+    /// The offset of the `an_enc_base_slot` field (AN-encoding: pointer to
+    /// the owning instance's enc-base slot; see `VMMemoryImport`).
+    #[inline]
+    pub fn vmmemory_import_an_enc_base_slot(&self) -> u8 {
+        3 * self.pointer_size()
+    }
+
     /// Return the size of `VMMemoryImport`.
     #[inline]
     pub fn size_of_vmmemory_import(&self) -> u8 {
-        3 * self.pointer_size()
+        4 * self.pointer_size()
     }
 }
 

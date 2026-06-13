@@ -1846,6 +1846,14 @@ impl StoreOpaque {
         )
     }
 
+    /// AN-encoding: ids of every instance in this store, *including* dummy
+    /// instances (which back host-created memories and own AN shadows too).
+    /// Used by the host-boundary libcalls to sweep whole-dirty flags
+    /// store-wide before cross-checking.
+    pub fn an_all_instance_ids(&self) -> Vec<InstanceId> {
+        self.instances.iter().map(|(id, _)| id).collect()
+    }
+
     /// Get all instances (ignoring dummy instances) within this store.
     pub fn all_instances<'a>(&'a mut self) -> impl ExactSizeIterator<Item = Instance> + 'a {
         let instances = self

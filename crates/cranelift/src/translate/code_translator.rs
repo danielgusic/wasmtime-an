@@ -2049,7 +2049,13 @@ pub fn translate_operator(
             // memory64 the operands are raw i64 and pass through.
             dst_pos = an_decode_if_i32_index(builder, environ, dst_index, dst_pos);
             src_pos = an_decode_if_i32_index(builder, environ, src_index, src_pos);
+            // `len`'s wasm type is the *smaller* of the two memories' index
+            // types (wasm spec), i.e. i32 unless both sides are memory64.
+            // Try both gates; the decode helper is a no-op on an
+            // already-decoded (I32-typed) value, so when both memories are
+            // i32-indexed the second call does nothing.
             len = an_decode_if_i32_index(builder, environ, dst_index, len);
+            len = an_decode_if_i32_index(builder, environ, src_index, len);
             environ.translate_memory_copy(builder, src_index, dst_index, dst_pos, src_pos, len)?;
         }
         Operator::MemoryFill { mem } => {
@@ -2134,9 +2140,12 @@ pub fn translate_operator(
             // index type. Decode each in its own context.
             dest = an_decode_if_i32_table_index(builder, environ, dst_table, dest);
             src = an_decode_if_i32_table_index(builder, environ, src_table, src);
-            // `len` is the smaller of the two index types per the wasm spec;
-            // when both tables are i32 it is an encoded i32 under AN.
+            // `len`'s wasm type is the *smaller* of the two tables' index
+            // types per the wasm spec, i.e. i32 unless both tables are
+            // i64-indexed. Try both gates; the decode helper is a no-op on
+            // an already-decoded (I32-typed) value.
             len = an_decode_if_i32_table_index(builder, environ, dst_table, len);
+            len = an_decode_if_i32_table_index(builder, environ, src_table, len);
             environ.translate_table_copy(builder, dst_table, src_table, dest, src, len)?;
         }
         Operator::TableFill { table } => {
@@ -4188,15 +4197,28 @@ fn translate_load(
 
     environ.before_load(builder, mem_op_size, wasm_index, memarg.offset);
 
+    let (load, dfg) = builder
+        .ins()
+        .Load(opcode, result_ty, flags, Offset32::new(0), base);
+    let raw = dfg.first_result(load);
+
     // AN-encoding load-side validity check (opt-in via
     // `Tunables.an_load_validity_check`): assert the encoded shadow slot(s)
-    // match the raw bytes BEFORE the raw load, so a divergence surfaces here as
+    // match the raw bytes, so a divergence surfaces here as
     // `Trap::AnMemoryMismatch` at the load rather than at the next host
     // boundary.
     //
-    // Only i32-family loads are checked: the dual-buffer design does not keep
-    // the shadow consistent for non-i32 stores, so checking other loads would
-    // false-positive.
+    // Emitted AFTER the raw load on purpose: the raw load carries the
+    // memory's bounds enforcement (explicit check or guard-page fault), so
+    // an out-of-bounds access traps there first and the shadow — a plain
+    // heap allocation with no guard pages — is never indexed out of bounds.
+    // The check still fires before the loaded value is encoded/pushed, so
+    // detection semantics are unchanged.
+    //
+    // Only i32-family loads are checked for now. Non-i32 stores are mirrored
+    // into the shadow too (see `translate_non_i32_store_an`), so extending
+    // the check to i64/v128 loads would be sound — it is just not implemented
+    // yet; i32 is the protected domain.
     if environ.tunables().an_encoding
         && environ.tunables().an_load_validity_check
         && result_ty == I32
@@ -4229,11 +4251,6 @@ fn translate_load(
             );
         }
     }
-
-    let (load, dfg) = builder
-        .ins()
-        .Load(opcode, result_ty, flags, Offset32::new(0), base);
-    let raw = dfg.first_result(load);
 
     // AN-encoding: i32-family loads return a raw I32 from raw linear memory.
     // The wasm operand stack expects an encoded I64 (`A*v`). Zero-extend then

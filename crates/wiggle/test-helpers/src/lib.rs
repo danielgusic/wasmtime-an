@@ -60,7 +60,7 @@ impl HostMemory {
     }
 
     pub fn guest_memory(&mut self) -> GuestMemory<'_> {
-        GuestMemory::Unshared(&mut self.buffer.cell)
+        GuestMemory::unshared(&mut self.buffer.cell)
     }
 
     pub fn base(&self) -> *const u8 {
