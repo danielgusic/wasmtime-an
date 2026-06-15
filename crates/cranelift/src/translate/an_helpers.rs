@@ -286,6 +286,8 @@ pub(crate) fn emit_an_shr_u_i32(
     k_mod: Value,
 ) -> Value {
     let a = environ.tunables().an_constant;
+    // Codeword check on the value operand before this decoding divide.
+    emit_an_codeword_validity_check(builder, a, enc_v);
     let a_const = builder.ins().iconst(I64, a as i64);
     let shift_div = builder.ins().ishl(a_const, k_mod);
     let q = builder.ins().udiv(enc_v, shift_div);
@@ -727,6 +729,9 @@ pub(crate) fn emit_an_bitwise_i32(
         ir::immediates::Offset32::new(table_offset.into()),
     );
 
+    // Codeword check on both operands before the decoding divides.
+    emit_an_codeword_validity_check(builder, a, arg1);
+    emit_an_codeword_validity_check(builder, a, arg2);
     // Decode once per operand, it is emitted as reciprocal multiply by cranelift automatically
     let a_const = builder.ins().iconst(I64, a as i64);
     let n = builder.ins().udiv(arg1, a_const);

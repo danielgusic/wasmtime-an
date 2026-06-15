@@ -241,14 +241,13 @@ The implementation lives in
 Codeword-validity (`val % A == 0`) is checked at the wasm/host trampoline
 boundaries (both directions — core-wasm trampolines in `compiler.rs` and the
 component-model `translate_hostcall` path in `compiler/component.rs`) and at
-the `i64.extend_i32_s/u` conversion decode sites. See *New traps* below.
+the `i64.extend_i32_s/u` conversion decode sites. Additionally, it is checked in every operand that requires a decode (e.g. `clz`, `and`, subword/unaligned `i32.store`, ...) See *New traps* below.
 
-**In op decoding:** Currently unchecked. Op-internal decode sites use a plain floor
-`udiv` with no `% A` check (`i32.and/or/xor` operands, shift/rotate counts,
-`clz`/`ctz`/`popcnt`, `i32.extend8/16_s`, address decodes in loads/stores,
-the byte-RMW slot decode, the `i32.div_u` re-encode). A codeword corrupted
-between a boundary and such a site is silently floor-divided into a valid
-codeword of a wrong value. 
+Residual: this catches a non-codeword operand, not a transient hitting the
+divide *output* of a valid codeword (the egraph re-merges any second
+in-register decode, so that needs a memory read-back verify — see below).
+
+Errors occuring during the decoding operation are not detected. (ok?)
 
 Memory validity checks are checked in the same place. At every boundary, every defined memory in the whole store is checked in full. The post-call resync is dirty-driven, see *Dirty-driven resync* above.
 
@@ -277,6 +276,8 @@ validity check at every wasm/host trampoline decode site. Specifically:
   on every encoded i32 param before decode.
 - every `i64.extend_i32_s/u` conversion decode site emits the check before
   taking the i32 out of the encoding.
+- every op-internal decode site (see *Validity checks → In op decoding*)
+  emits the check on the encoded operand before the decoding `udiv`.
 
 
 

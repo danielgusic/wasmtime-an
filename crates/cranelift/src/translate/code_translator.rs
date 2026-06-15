@@ -76,7 +76,8 @@ use crate::bounds_checks::{BoundsCheck, bounds_check_and_compute_addr};
 use crate::func_environ::{Extension, FuncEnvironment};
 use crate::translate::TargetEnvironment;
 use crate::translate::an_helpers::{
-    AnBitwiseOp, emit_an_bitwise_i32, emit_an_conversion_decode_i32, emit_an_enc_base_pointer,
+    AnBitwiseOp, emit_an_bitwise_i32, emit_an_codeword_validity_check,
+    emit_an_conversion_decode_i32, emit_an_enc_base_pointer,
     emit_an_enc_offset_from_effective_addr, emit_an_encode_raw_i32, emit_an_load_validity_check,
     emit_an_multi_byte_decomposed_store, emit_an_shl_i32, emit_an_shr_u_i32, encode_wasm_i32_bool,
     encode_wasm_i32_raw, udiv_u128_by_u64_const, umod_u128_by_u64_const_to_i64,
@@ -1075,6 +1076,7 @@ pub fn translate_operator(
                 let a_const = builder
                     .ins()
                     .iconst(I64, environ.tunables().an_constant as i64);
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg);
                 let v = builder.ins().udiv(arg, a_const);
                 let v32 = builder.ins().ireduce(I32, v);
                 let c32 = builder.ins().clz(v32);
@@ -1091,6 +1093,7 @@ pub fn translate_operator(
                 let a_const = builder
                     .ins()
                     .iconst(I64, environ.tunables().an_constant as i64);
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg);
                 let v = builder.ins().udiv(arg, a_const);
                 let v32 = builder.ins().ireduce(I32, v);
                 let c32 = builder.ins().ctz(v32);
@@ -1107,6 +1110,7 @@ pub fn translate_operator(
                 let a_const = builder
                     .ins()
                     .iconst(I64, environ.tunables().an_constant as i64);
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg);
                 let v = builder.ins().udiv(arg, a_const);
                 let v32 = builder.ins().ireduce(I32, v);
                 let p32 = builder.ins().popcnt(v32);
@@ -1321,6 +1325,7 @@ pub fn translate_operator(
                 let a_const = builder
                     .ins()
                     .iconst(I64, environ.tunables().an_constant as i64);
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, val);
                 let v_i64 = builder.ins().udiv(val, a_const);
                 let v_i32 = builder.ins().ireduce(I32, v_i64);
                 let v_i8 = builder.ins().ireduce(I8, v_i32);
@@ -1338,6 +1343,7 @@ pub fn translate_operator(
                 let a_const = builder
                     .ins()
                     .iconst(I64, environ.tunables().an_constant as i64);
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, val);
                 let v_i64 = builder.ins().udiv(val, a_const);
                 let v_i32 = builder.ins().ireduce(I32, v_i64);
                 let v_i16 = builder.ins().ireduce(I16, v_i32);
@@ -1426,6 +1432,7 @@ pub fn translate_operator(
                 let a_const = builder
                     .ins()
                     .iconst(I64, environ.tunables().an_constant as i64);
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg2);
                 let k_dec = builder.ins().udiv(arg2, a_const);
                 let k_mod = builder.ins().band_imm(k_dec, 31);
                 emit_an_shl_i32(builder, environ, arg1, k_mod)
@@ -1450,6 +1457,7 @@ pub fn translate_operator(
                 let aw = builder.ins().iconst(I64, a << 32);
                 let half = builder.ins().iconst(I64, a << 31);
 
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg2);
                 let k_dec = builder.ins().udiv(arg2, a_const);
                 let k_mod = builder.ins().band_imm(k_dec, 31);
 
@@ -1474,6 +1482,7 @@ pub fn translate_operator(
                 let a_const = builder
                     .ins()
                     .iconst(I64, environ.tunables().an_constant as i64);
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg2);
                 let k_dec = builder.ins().udiv(arg2, a_const);
                 let k_mod = builder.ins().band_imm(k_dec, 31);
                 emit_an_shr_u_i32(builder, environ, arg1, k_mod)
@@ -1494,6 +1503,7 @@ pub fn translate_operator(
                 let a_const = builder
                     .ins()
                     .iconst(I64, environ.tunables().an_constant as i64);
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg2);
                 let k_dec = builder.ins().udiv(arg2, a_const);
                 let k_mod = builder.ins().band_imm(k_dec, 31);
                 let thirty_two = builder.ins().iconst(I64, 32);
@@ -1515,6 +1525,7 @@ pub fn translate_operator(
                 let a_const = builder
                     .ins()
                     .iconst(I64, environ.tunables().an_constant as i64);
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg2);
                 let k_dec = builder.ins().udiv(arg2, a_const);
                 let k_mod = builder.ins().band_imm(k_dec, 31);
                 let thirty_two = builder.ins().iconst(I64, 32);
@@ -1595,6 +1606,10 @@ pub fn translate_operator(
                 let half = builder.ins().iconst(I64, a << 31);         // A * 2^31
                 let neg_one_enc = builder.ins().iconst(I64, (a << 32) - a); // A*(2^32-1)
 
+                // Codeword check on both operands before the decoding divide.
+                emit_an_codeword_validity_check(builder, a as u64, arg1);
+                emit_an_codeword_validity_check(builder, a as u64, arg2);
+
                 // INT_MIN/-1 trap: wasm requires INTEGER_OVERFLOW here.
                 let is_min = builder.ins().icmp(IntCC::Equal, arg1, half);
                 let is_neg_one = builder.ins().icmp(IntCC::Equal, arg2, neg_one_enc);
@@ -1641,6 +1656,9 @@ pub fn translate_operator(
             let (arg1, arg2) = environ.stacks.pop2();
             let mut result = environ.translate_udiv(builder, arg1, arg2);
             if environ.tunables().an_encoding && matches!(op, Operator::I32DivU) {
+                // Codeword check on both operands before the decoding divide.
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg1);
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg2);
                 // (A*n) / (A*m) = n/m (i64 udiv naturally cancels the A scale).
                 // Re-encode by multiplying the raw quotient by A. Quotient is
                 // bounded by max(n) < 2^32, so `quotient * A < A*2^32`, which is canonical.
@@ -1662,6 +1680,10 @@ pub fn translate_operator(
                 let a = environ.tunables().an_constant as i64;
                 let aw = builder.ins().iconst(I64, a << 32);
                 let half = builder.ins().iconst(I64, a << 31);
+
+                // Codeword check on both operands before the decoding divide.
+                emit_an_codeword_validity_check(builder, a as u64, arg1);
+                emit_an_codeword_validity_check(builder, a as u64, arg2);
 
                 let s1 = builder
                     .ins()
@@ -1691,6 +1713,13 @@ pub fn translate_operator(
         }
         Operator::I32RemU | Operator::I64RemU => {
             let (arg1, arg2) = environ.stacks.pop2();
+            if environ.tunables().an_encoding && matches!(op, Operator::I32RemU) {
+                // urem(A*n, A*m) = A*(n%m) stays encoded; validate the operand
+                // codewords so a corrupted non-multiple-of-A can't launder
+                // through.
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg1);
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg2);
+            }
             let result = environ.translate_urem(builder, arg1, arg2);
             environ.stacks.push1(result);
         }
@@ -4284,6 +4313,10 @@ fn translate_store(
     // operand before it is decoded for the raw store.
     let encoded_val = val;
     if environ.tunables().an_encoding && wasm_val_is_i32 {
+        // Codeword check on the operand before decoding. The same `encoded_val`
+        // feeds the raw-store decode here and the shadow decode below, so one
+        // check covers both.
+        emit_an_codeword_validity_check(builder, environ.tunables().an_constant, val);
         // Decode the encoded operand to a raw i32 for the native store.
         let an = builder
             .ins()
@@ -5518,6 +5551,8 @@ fn an_decode_i32_operand(
     if ty == I32 {
         return val;
     }
+    // Codeword check on the operand before decoding (A*v -> v).
+    emit_an_codeword_validity_check(builder, environ.tunables().an_constant, val);
     let a = builder
         .ins()
         .iconst(I64, environ.tunables().an_constant as i64);
