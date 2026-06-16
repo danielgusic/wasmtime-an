@@ -65,6 +65,15 @@ mod runtime;
 /// update path is not wired and they would either leave the shadow stale or
 /// panic in cranelift the same way bulk-memory ops did before the per-op
 /// decode fix landed.
+///
+/// Reference types (externref, funcref-as-value, and the GC/exn/cont
+/// families) are refused as *value* types — in function signatures, globals,
+/// and locals. They are opaque host handles, not integers, so there is
+/// nothing to AN-encode and the shadow / boundary cross-check has no path for
+/// them. `funcref` *tables* are the one exception: they are core MVP
+/// (`call_indirect` dispatch), carry no encodable payload, and every working
+/// linear-memory module (including trait-object dispatch) needs them, so they
+/// stay allowed; any non-`funcref` table element type is still refused.
 fn validate_an_encoding_constraints(
     translation: &ModuleTranslation<'_>,
     tunables: &Tunables,
@@ -107,8 +116,10 @@ fn validate_an_encoding_constraints(
     // f32/f64, and the conversion-decode path
     // (`emit_an_conversion_decode_i32`) only handles i32↔float as a one-way
     // exit (never re-entering AN protection). The refusal below catches
-    // floats at three layers: function signatures, globals, locals, and
-    // operators. Any one is enough to fail; we report the first hit.
+    // floats at four layers: function signatures, globals, locals, and
+    // operators. Any one is enough to fail; we report the first hit. The
+    // reference-type refusal rides the same signature/global/local layers
+    // (plus a table-element check), see `wasm_val_type_ref_name`.
 
     // 1) Function signatures (params + results).
     for (def_func_index, func_type) in module.functions.iter() {
@@ -128,6 +139,20 @@ fn validate_an_encoding_constraints(
                 def_func_index.as_u32()
             );
         }
+        if let Some(where_) = first_ref_in_slice(wasm_func_ty.params()) {
+            bail!(
+                "AN-encoding does not support reference types as values. Found \
+                 `{where_}` in params of function {}.",
+                def_func_index.as_u32()
+            );
+        }
+        if let Some(where_) = first_ref_in_slice(wasm_func_ty.results()) {
+            bail!(
+                "AN-encoding does not support reference types as values. Found \
+                 `{where_}` in results of function {}.",
+                def_func_index.as_u32()
+            );
+        }
     }
 
     // 2) Globals.
@@ -137,6 +162,28 @@ fn validate_an_encoding_constraints(
                 "AN-encoding does not support floating-point types. Global \
                  {} has type `{name}`.",
                 idx.as_u32()
+            );
+        }
+        if let Some(name) = wasm_val_type_ref_name(&global.wasm_ty) {
+            bail!(
+                "AN-encoding does not support reference types as values. Global \
+                 {} has type `{name}`.",
+                idx.as_u32()
+            );
+        }
+    }
+
+    // 2b) Tables. `funcref` tables back `call_indirect` and carry no
+    // encodable payload, so they're allowed; every other reference element
+    // type (externref and the GC/exn/cont families) is the reference-types /
+    // GC surface AN does not protect.
+    for (idx, table) in module.tables.iter() {
+        if table.ref_type.heap_type.top() != wasmtime_environ::WasmHeapTopType::Func {
+            bail!(
+                "AN-encoding does not support reference types other than funcref. \
+                 Table {} has element type `{}`.",
+                idx.as_u32(),
+                table.ref_type
             );
         }
     }
@@ -158,6 +205,13 @@ fn validate_an_encoding_constraints(
                 bail!(
                     "AN-encoding does not support floating-point types. \
                      Function {func_index} declares a local of type `{name}`."
+                );
+            }
+            if matches!(ty, wasmparser::ValType::Ref(_)) {
+                let func_index = module.func_index(def_func_index).as_u32();
+                bail!(
+                    "AN-encoding does not support reference types as values. \
+                     Function {func_index} declares a local of type `{ty}`."
                 );
             }
         }
@@ -216,6 +270,24 @@ fn wasm_val_type_float_name(ty: &wasmtime_environ::WasmValType) -> Option<&'stat
 /// Return the first float wasm type name found in `tys`, or `None`.
 fn first_float_in_slice(tys: &[wasmtime_environ::WasmValType]) -> Option<&'static str> {
     tys.iter().find_map(wasm_val_type_float_name)
+}
+
+/// Return the printed reference type (`"externref"`, `"funcref"`, …) if the
+/// given `WasmValType` is a reference *value* type, otherwise `None`.
+/// Reference values are opaque host handles with no integer encoding, so they
+/// are refused under AN-encoding wherever they appear as a value (signatures,
+/// globals, locals). `funcref` *tables* are handled separately and stay
+/// allowed; this only fires on reference *values*.
+fn wasm_val_type_ref_name(ty: &wasmtime_environ::WasmValType) -> Option<String> {
+    match ty {
+        wasmtime_environ::WasmValType::Ref(r) => Some(r.to_string()),
+        _ => None,
+    }
+}
+
+/// Return the first reference value type found in `tys`, or `None`.
+fn first_ref_in_slice(tys: &[wasmtime_environ::WasmValType]) -> Option<String> {
+    tys.iter().find_map(wasm_val_type_ref_name)
 }
 
 /// Return the type name if the wasmparser `ValType` is a float, otherwise

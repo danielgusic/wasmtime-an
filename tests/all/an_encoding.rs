@@ -783,6 +783,93 @@ fn refuse_float_op_under_an() {
     assert_an_float_refusal(wat, "f32.const operator");
 }
 
+// Reference types as *values* (externref, funcref-as-value, …) are opaque
+// host handles with no integer encoding, so they are refused wherever they
+// appear as a value: signatures, globals, locals. `funcref` *tables* are the
+// exception (core `call_indirect` dispatch) and stay allowed; any other table
+// element type is refused. Each test asserts the error mentions AN-encoding
+// and reference types.
+fn assert_an_ref_refusal(wat: &str, label: &str) {
+    let err = compile_with_config(&make_config(true), wat)
+        .expect_err(&format!("{label}: expected reference-type refusal under AN"));
+    let s = format!("{err:#}");
+    assert!(
+        s.contains("AN-encoding") && s.contains("reference type"),
+        "{label}: error did not mention reference-type refusal: {s}",
+    );
+}
+
+#[test]
+fn refuse_externref_param_under_an() {
+    let wat = r#"
+        (module
+            (func (export "f") (param externref) (result i32) i32.const 0))
+    "#;
+    assert_an_ref_refusal(wat, "externref param");
+}
+
+#[test]
+fn refuse_externref_result_under_an() {
+    let wat = r#"
+        (module
+            (func (export "f") (result externref) ref.null extern))
+    "#;
+    assert_an_ref_refusal(wat, "externref result");
+}
+
+#[test]
+fn refuse_externref_local_under_an() {
+    let wat = r#"
+        (module
+            (func (export "f") (result i32)
+                (local externref)
+                i32.const 0))
+    "#;
+    assert_an_ref_refusal(wat, "externref local");
+}
+
+#[test]
+fn refuse_externref_global_under_an() {
+    let wat = r#"
+        (module
+            (global $g externref (ref.null extern))
+            (func (export "f") (result i32) i32.const 0))
+    "#;
+    assert_an_ref_refusal(wat, "externref global");
+}
+
+#[test]
+fn refuse_externref_table_under_an() {
+    // Non-funcref table element type: the reference-types / GC surface AN
+    // does not protect. Refused even though the table itself carries no
+    // encodable payload.
+    let wat = r#"
+        (module
+            (table 1 externref)
+            (func (export "f") (result i32) i32.const 0))
+    "#;
+    assert_an_ref_refusal(wat, "externref table");
+}
+
+// The carve-out: `funcref` tables back `call_indirect` (all dynamic dispatch,
+// incl. Rust trait objects) and must keep compiling under AN. Broader
+// end-to-end coverage lives in the `table_*` tests; this guards the exact
+// boundary that the reference-type refusal must not cross.
+#[test]
+fn funcref_table_compiles_under_an() -> wasmtime::Result<()> {
+    let wat = r#"
+        (module
+            (table 2 funcref)
+            (type $t (func (result i32)))
+            (func $a (result i32) i32.const 1)
+            (elem (i32.const 0) $a)
+            (func (export "call") (param i32) (result i32)
+                (call_indirect (type $t) (local.get 0))))
+    "#;
+    let _ = compile_with_config(&make_config(true), wat)?;
+    Ok(())
+}
+
 #[test]
 fn imported_memory_compiles_under_an() -> wasmtime::Result<()> {
     // Imported (non-shared) memories are supported: the importing instance
@@ -3696,6 +3783,19 @@ fn explicit_simd_enable_conflicts_with_an() {
     let mut config = make_config(true);
     config.wasm_simd(true);
     let err = Engine::new(&config).expect_err("explicit SIMD + AN must be a config error");
+    let s = format!("{err:#}");
+    assert!(s.contains("AN-encoding"), "error should mention AN-encoding: {s}");
+}
+
+// Component-model async (futures/streams) host-lowering only partially syncs
+// the AN shadow and the full async path set is unaudited, so explicitly
+// enabling it alongside AN is a configuration conflict at engine build rather
+// than a partial guarantee.
+#[test]
+fn explicit_component_model_async_conflicts_with_an() {
+    let mut config = make_config(true);
+    config.wasm_component_model_async(true);
+    let err = Engine::new(&config).expect_err("component-model-async + AN must be a config error");
     let s = format!("{err:#}");
     assert!(s.contains("AN-encoding"), "error should mention AN-encoding: {s}");
 }

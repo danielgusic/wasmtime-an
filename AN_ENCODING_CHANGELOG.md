@@ -56,8 +56,8 @@ One line per file: what changed relative to upstream wasmtime. *(new)* = added f
 - **`runtime/externals/global.rs`** — host-boundary i32 global encode/decode (`Global::get`/`set`), gated to wasm i32 globals.
 - **`runtime/trampoline/global.rs`** — encodes the initial value of a host-created (`Global::new`) i32 global.
 - **`runtime/vm/vmcontext.rs`** — `VMGlobalDefinition::{from,to}_val_raw` encode/decode i32 `ValRaw` ↔ storage.
-- **`compile.rs`** — `validate_an_encoding_constraints` (core modules + component cores): refuse shared memory / float / atomics, warn on memory64 + i32↔i64; SIMD/GC/exceptions/stack-switching refused via the `config.rs` feature mask.
-- **`config.rs`** — `an_encoding`/`an_constant`/`an_load_validity_check` setters, test fault-inject knobs, the AN feature mask, Winch refusal.
+- **`compile.rs`** — `validate_an_encoding_constraints` (core modules + component cores): refuse shared memory / float / atomics / reference-type *values* (signatures, globals, locals) / non-`funcref` tables, warn on memory64 + i32↔i64; SIMD/GC/exceptions/stack-switching/component-async refused via the `config.rs` feature mask. `funcref` tables stay allowed (`call_indirect` dispatch).
+- **`config.rs`** — `an_encoding`/`an_constant`/`an_load_validity_check` setters, test fault-inject knobs, the AN feature mask (incl. `CM_ASYNC`/`CM_ASYNC_STACKFUL`), Winch refusal.
 - **`engine/serialization.rs`** — AN tunables included in cwasm compatibility validation.
 
 ### Wiggle — `crates/wiggle`
@@ -145,7 +145,7 @@ brought back to `A·v with v ∈ [0, 2³²)`. This is what lets compares,
 addresses, and host-call args work directly on the encoded form without
 needing per-use decode.
 
-### Supported features
+### Supported and unsupported features
 
 | Feature | Status under AN-encoding |
 |---|---|
@@ -154,11 +154,15 @@ needing per-use decode.
 | tables, `call_indirect` | i32 index/length operands decoded around the builtin |
 | `i64` | allowed, but outside of encoding, warning emitted |
 | imported (non-shared) memories | stores mirror through the owner's shadow via `VMMemoryImport::an_enc_base_slot` |
+|floats|**refused** at compile time
+|SIMD|**refused** at compile time
 | shared (atomic) memories, atomic operators | **refused** at compile time |
-| SIMD / GC proposal / exceptions / stack switching | **refused** via the feature mask under AN |
-| Winch strategy | **refused** at config validation |
-
-**Note**: See *Refused / unsolved features below*
+| reference types as *values* (externref, funcref-as-value, …) in signatures / globals / locals | **refused** at compile time (opaque host handles, no integer encoding) |
+| non-`funcref` table element types (externref / GC / exn / cont tables) | **refused** at compile time |
+| component-model async (futures / streams) | **refused** via the feature mask under AN |
+| GC / exceptions / stack switching proposals | **refused** via the feature mask under AN |
+| Winch | **refused** at config validation |
+|wmemcheck| nothing implemented yet, so probably breaks
 
 ### Per-op behaviour
 
@@ -212,18 +216,7 @@ High level overview (see `crates/cranelift/src/translate/an_helpers.rs` for more
 For this, several helper functions have been implemented.
 
 
-### Refused / unsolved / WIP features
 
-
-| Feature | Curren treatment | Notes |
-|---|---|---|
-| floating point | f32/f64 types and every float operator are refused at compile time | -
-| i64 support | an encoded i64 would need 128 bit (and even more with operations like mul), but 128 bit support is non-existent | enormous amounts of i64 concatenation hacks |
-|async| not implemented yet| take a look at it
-| shared/atomic memory | refused at compile time | shared memories need atomic-safe shadow stores, atomic ops need read-modify-write shadow paths that respect threads-proposal ordering |
-| SIMD | refused | vector ops consume/produce raw i32 (shift counts, splats, extracts) with no AN translation
-| GC types | refused  | `ref.i31` / `i31.get_*` and i32 struct/array fields cross the encoding with no translation
-| wmemcheck | not implemented, should break I think
 
 
 ### Conversion warning
@@ -243,15 +236,9 @@ boundaries (both directions — core-wasm trampolines in `compiler.rs` and the
 component-model `translate_hostcall` path in `compiler/component.rs`) and at
 the `i64.extend_i32_s/u` conversion decode sites. Additionally, it is checked in every operand that requires a decode (e.g. `clz`, `and`, subword/unaligned `i32.store`, ...) See *New traps* below.
 
-Residual: this catches a non-codeword operand, not a transient hitting the
-divide *output* of a valid codeword (the egraph re-merges any second
-in-register decode, so that needs a memory read-back verify — see below).
-
 Errors occuring during the decoding operation are not detected. (ok?)
 
 Memory validity checks are checked in the same place. At every boundary, every defined memory in the whole store is checked in full. The post-call resync is dirty-driven, see *Dirty-driven resync* above.
-
-Always-on when `Tunables.an_encoding` is set.
 
 ### New traps
 

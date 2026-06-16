@@ -2545,6 +2545,8 @@ impl Config {
             | WasmFeatures::LEGACY_EXCEPTIONS
             | WasmFeatures::STACK_SWITCHING
             | WasmFeatures::SHARED_EVERYTHING_THREADS
+            | WasmFeatures::CM_ASYNC
+            | WasmFeatures::CM_ASYNC_STACKFUL
     }
 
     /// Returns the configured compiler target for this `Config`.
