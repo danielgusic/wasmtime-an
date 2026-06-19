@@ -1026,6 +1026,8 @@ macro_rules! forward_string_lifts {
             fn linear_lift_from_flat(cx: &mut LiftContext<'_>, ty: InterfaceType, src: &Self::Lower) -> Result<Self> {
                 let s = <WasmStr as Lift>::linear_lift_from_flat(cx, ty, src)?;
                 let encoding = cx.options().string_encoding;
+                // Verify-at-use: cross-check the string's bytes before decode.
+                cx.memory_checked(s.ptr, s.encoded_byte_len(encoding))?;
                 Ok(s.to_str_from_memory(encoding, cx.memory())?.into())
             }
 
@@ -1033,6 +1035,8 @@ macro_rules! forward_string_lifts {
             fn linear_lift_from_memory(cx: &mut LiftContext<'_>, ty: InterfaceType, bytes: &[u8]) -> Result<Self> {
                 let s = <WasmStr as Lift>::linear_lift_from_memory(cx, ty, bytes)?;
                 let encoding = cx.options().string_encoding;
+                // Verify-at-use: cross-check the string's bytes before decode.
+                cx.memory_checked(s.ptr, s.encoded_byte_len(encoding))?;
                 Ok(s.to_str_from_memory(encoding, cx.memory())?.into())
             }
         }
@@ -1178,6 +1182,10 @@ macro_rules! integers {
             where
                 Self: Sized,
             {
+                // Verify-at-use: cross-check the list's bytes against the
+                // encoded shadow before reading them into the host.
+                let byte_size = list.len * mem::size_of::<Self>();
+                cx.memory_checked(list.ptr, byte_size)?;
                 dst.extend(list._as_le_slice(cx.memory())
                            .iter()
                            .map(|i| Self::from_le(*i)));
@@ -1291,9 +1299,10 @@ macro_rules! floats {
             }
 
             fn linear_lift_list_from_memory(cx: &mut LiftContext<'_>, list: &WasmList<Self>) -> Result<Vec<Self>> where Self: Sized {
-                // See comments in `WasmList::get` for the panicking indexing
+                // See comments in `WasmList::get` for the panicking indexing.
+                // Verify-at-use: cross-check the list's bytes before reading.
                 let byte_size = list.len * mem::size_of::<Self>();
-                let bytes = &cx.memory()[list.ptr..][..byte_size];
+                let bytes = cx.memory_checked(list.ptr, byte_size)?;
 
                 // The canonical ABI requires that everything is aligned to its
                 // own size, so this should be an aligned array.
@@ -1750,6 +1759,19 @@ impl WasmStr {
         let store = store.into().0;
         let memory = self.instance.options_memory(store, self.options);
         let encoding = self.instance.options(store, self.options).string_encoding;
+        // Verify-at-use: cross-check the string's bytes against the encoded
+        // shadow before decoding them. `to_str` is the lazy/store-based read
+        // path (the `cx`-based path goes through `LiftContext::memory_checked`).
+        let (shadow, a) = self.instance.an_options_shadow(store, self.options);
+        if !crate::component::func::an_subslice_consistent(
+            memory,
+            shadow,
+            a,
+            self.ptr,
+            self.encoded_byte_len(encoding),
+        ) {
+            return Err(crate::Trap::AnMemoryMismatch.into());
+        }
         self.to_str_from_memory(encoding, memory)
     }
 
@@ -1794,6 +1816,24 @@ impl WasmStr {
         Ok(encoding_rs::mem::decode_latin1(
             &memory[self.ptr..][..self.len],
         ))
+    }
+
+    /// Number of raw bytes this string occupies in linear memory for the given
+    /// encoding (the range `[ptr, ptr + encoded_byte_len)` that a decode will
+    /// read). Mirrors the byte-length computation in [`WasmStr::new`]; used by
+    /// the AN-encoding lifting read-verify to cross-check exactly those bytes.
+    fn encoded_byte_len(&self, encoding: StringEncoding) -> usize {
+        match encoding {
+            StringEncoding::Utf8 => self.len,
+            StringEncoding::Utf16 => self.len * 2,
+            StringEncoding::CompactUtf16 => {
+                if self.len & UTF16_TAG == 0 {
+                    self.len
+                } else {
+                    (self.len ^ UTF16_TAG) * 2
+                }
+            }
+        }
     }
 }
 
@@ -2010,7 +2050,11 @@ impl<T: Lift> WasmList<T> {
         // (and wasm memory can only grow). This could theoretically be
         // unchecked indexing if we're confident enough and it's actually a perf
         // issue one day.
-        let bytes = &cx.memory()[self.ptr + index * T::SIZE32..][..T::SIZE32];
+        // Verify-at-use: cross-check this element's bytes before lifting.
+        let bytes = match cx.memory_checked(self.ptr + index * T::SIZE32, T::SIZE32) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
         Some(T::linear_lift_from_memory(cx, self.elem, bytes))
     }
 
@@ -2049,8 +2093,44 @@ macro_rules! raw_wasm_list_accessors {
             /// Panics if the `store` provided is not the one from which this
             /// slice originated.
             pub fn as_le_slice<'a, T: 'static>(&self, store: impl Into<StoreContext<'a, T>>) -> &'a [$i] {
-                let memory = self.instance.options_memory(store.into().0, self.options);
+                let store = store.into().0;
+                let memory = self.instance.options_memory(store, self.options);
+                // Verify-at-use: cross-check the list's bytes against the
+                // encoded shadow before exposing them. This accessor is
+                // infallible (`-> &[$i]`), so like `Memory::data` a detected
+                // corruption can only panic here; embedders that need to handle
+                // the mismatch as a `Trap::AnMemoryMismatch` should use the
+                // fallible `WasmList::try_as_le_slice` twin instead.
+                let (shadow, a) = self.instance.an_options_shadow(store, self.options);
+                let byte_size = self.len * mem::size_of::<$i>();
+                if !crate::component::func::an_subslice_consistent(
+                    memory, shadow, a, self.ptr, byte_size,
+                ) {
+                    panic!(
+                        "AN-encoding: WasmList::as_le_slice over a raw/shadow mismatch (AnMemoryMismatch)"
+                    );
+                }
                 self._as_le_slice(memory)
+            }
+
+            /// Fallible counterpart to [`WasmList::as_le_slice`].
+            ///
+            /// Behaves exactly like [`WasmList::as_le_slice`] but, when the
+            /// AN-encoding verify-at-use cross-check detects a raw/shadow
+            /// mismatch over the list's bytes, returns
+            /// `Err(`[`Trap`][crate::Trap]`::AnMemoryMismatch)` instead of
+            /// panicking. With AN-encoding off (or no shadow) this never fails.
+            pub fn try_as_le_slice<'a, T: 'static>(&self, store: impl Into<StoreContext<'a, T>>) -> crate::Result<&'a [$i]> {
+                let store = store.into().0;
+                let memory = self.instance.options_memory(store, self.options);
+                let (shadow, a) = self.instance.an_options_shadow(store, self.options);
+                let byte_size = self.len * mem::size_of::<$i>();
+                if !crate::component::func::an_subslice_consistent(
+                    memory, shadow, a, self.ptr, byte_size,
+                ) {
+                    return Err(crate::Trap::AnMemoryMismatch.into());
+                }
+                Ok(self._as_le_slice(memory))
             }
 
             fn _as_le_slice<'a>(&self, all_of_memory: &'a [u8]) -> &'a [$i] {
@@ -2343,11 +2423,12 @@ where
     for i in 0..len {
         let entry_base = ptr + (i * usize::try_from(map.entry_abi.size32)?);
 
-        let key_bytes = &cx.memory()[entry_base..][..K::SIZE32];
+        // Verify-at-use: cross-check each entry's key/value bytes before lift.
+        let key_bytes = cx.memory_checked(entry_base, K::SIZE32)?;
         let key = K::linear_lift_from_memory(cx, map.key, key_bytes)?;
 
         let value_bytes =
-            &cx.memory()[entry_base + usize::try_from(map.value_offset32)?..][..V::SIZE32];
+            cx.memory_checked(entry_base + usize::try_from(map.value_offset32)?, V::SIZE32)?;
         let value = V::linear_lift_from_memory(cx, map.value, value_bytes)?;
 
         result.insert(key, value)?;

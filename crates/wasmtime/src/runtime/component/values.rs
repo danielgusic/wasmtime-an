@@ -972,11 +972,9 @@ fn load_list(cx: &mut LiftContext<'_>, ty: TypeListIndex, ptr: usize, len: usize
     Ok(Val::List(
         (0..len)
             .map(|index| {
-                Val::load(
-                    cx,
-                    elem,
-                    &cx.memory()[ptr + (index * element_size)..][..element_size],
-                )
+                // Verify-at-use: cross-check this element's bytes before lift.
+                let bytes = cx.memory_checked(ptr + (index * element_size), element_size)?;
+                Val::load(cx, elem, bytes)
             })
             .collect::<Result<_>>()?,
     ))
@@ -1012,12 +1010,11 @@ fn load_map(cx: &mut LiftContext<'_>, ty: TypeMapIndex, ptr: usize, len: usize) 
     let mut map = Vec::with_capacity(len);
     for index in 0..len {
         let tuple_ptr = ptr + (index * tuple_size);
-        let key = Val::load(cx, key_ty, &cx.memory()[tuple_ptr..][..key_size])?;
-        let value = Val::load(
-            cx,
-            value_ty,
-            &cx.memory()[tuple_ptr + value_offset..][..value_size],
-        )?;
+        // Verify-at-use: cross-check each entry's key/value bytes before lift.
+        let key_bytes = cx.memory_checked(tuple_ptr, key_size)?;
+        let key = Val::load(cx, key_ty, key_bytes)?;
+        let value_bytes = cx.memory_checked(tuple_ptr + value_offset, value_size)?;
+        let value = Val::load(cx, value_ty, value_bytes)?;
         map.push((key, value));
     }
 

@@ -141,6 +141,21 @@ impl<'a, T: 'static> LowerContext<'a, T> {
     /// This will panic if memory has not been configured for this lowering
     /// (e.g. it wasn't present during the specification of canonical options).
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
+        // Verify-at-use: this hands out an opaque whole-memory mutable borrow
+        // and records the whole memory dirty, so the next `an_flush_dirty`
+        // re-encodes everything from raw — which would silently launder any
+        // pre-existing raw/shadow divergence. Cross-check the whole memory
+        // once before the borrow (the analogue of `Memory::data_mut`'s
+        // pre-borrow check). Infallible accessor (`-> &mut [u8]`), so like
+        // `Memory::data_mut` a detected corruption can only panic here.
+        if !self
+            .instance
+            .an_options_whole_consistent(self.store.0, self.options)
+        {
+            panic!(
+                "AN-encoding: LowerContext::as_slice_mut over a raw/shadow mismatch (AnMemoryMismatch)"
+            );
+        }
         self.an_record_write(0, usize::MAX);
         self.as_slice_mut_untracked()
     }
@@ -205,11 +220,13 @@ impl<'a, T: 'static> LowerContext<'a, T> {
     /// recorded host-written range, then clears the record.
     ///
     /// Must run before control re-enters wasm (a `realloc` call, the lifted
-    /// call itself, resuming the caller after a hostcall): the boundary
-    /// cross-check and the opt-in per-load validity check both compare the
-    /// shadow against raw bytes, and host-side lowering writes raw bytes
-    /// the JIT store-mirroring cannot see. No-op when nothing was recorded
-    /// or when the memory has no AN-encoding shadow (AN-encoding off).
+    /// call itself, resuming the caller after a hostcall): under verify-at-use
+    /// the guest's mandatory per-load check compares the shadow against raw
+    /// bytes at every i32 load, and host-side lowering writes raw bytes the
+    /// JIT store-mirroring cannot see, so the shadow must be re-encoded for
+    /// those ranges first or the next guest load false-traps. No-op when
+    /// nothing was recorded or when the memory has no AN-encoding shadow
+    /// (AN-encoding off).
     ///
     /// Ranges past the end of memory are clamped by the re-encode itself,
     /// so the conservative whole-memory record (`0..usize::MAX`) from
@@ -245,8 +262,8 @@ impl<'a, T: 'static> LowerContext<'a, T> {
         assert!(self.allow_realloc);
 
         // Control re-enters wasm: anything lowered so far must be visible in
-        // the AN-encoding shadow before guest code runs (the opt-in per-load
-        // validity check reads the shadow at every i32 load).
+        // the AN-encoding shadow before guest code runs (the mandatory
+        // per-load validity check reads the shadow at every i32 load).
         self.an_flush_dirty();
 
         let (component, store) = self.instance.component_and_store_mut(self.store.0);
@@ -406,6 +423,33 @@ impl<'a, T: 'static> LowerContext<'a, T> {
     }
 }
 
+/// AN-encoding verify-at-use cross-check for a `[offset, offset + len)` range
+/// of `memory` against its encoded `shadow` (`enc_slot == A * u32_le(raw_slot)`
+/// per touched 4-byte slot). Returns `true` when consistent or when no shadow
+/// is present (AN-encoding off). Shared by [`LiftContext::memory_checked`] and
+/// the store-based lazy lifting accessors (`WasmStr::to_str`,
+/// `WasmList::as_le_slice`) which hold the raw + shadow slices directly. Reuses
+/// the single slot-compare implementation on `vm::Instance`.
+pub(crate) fn an_subslice_consistent(
+    memory: &[u8],
+    shadow: Option<&[u8]>,
+    a: u64,
+    offset: usize,
+    len: usize,
+) -> bool {
+    match shadow {
+        None => true,
+        Some(shadow) => crate::runtime::vm::Instance::an_cross_check_range_parts(
+            shadow,
+            memory.as_ptr(),
+            memory.len(),
+            offset,
+            len,
+            a,
+        ),
+    }
+}
+
 /// Contextual information used when lifting a type from a component into the
 /// host.
 ///
@@ -421,6 +465,16 @@ pub struct LiftContext<'a> {
     pub types: &'a Arc<ComponentTypes>,
 
     memory: &'a [u8],
+
+    /// AN-encoding shadow of `memory` (the same options memory), or `None`
+    /// when AN-encoding is off / no shadow is allocated. Used by
+    /// [`LiftContext::memory_checked`] to cross-check every lifted range
+    /// against the encoded shadow before the bytes reach the host
+    /// (verify-at-use on the read side). The shadow is runtime-internal and is
+    /// never exposed to embedder code.
+    an_shadow: Option<&'a [u8]>,
+    /// The AN-encoding constant `A` (meaningful only when `an_shadow` is set).
+    an_a: u64,
 
     instance: Pin<&'a mut ComponentInstance>,
     instance_handle: Instance,
@@ -456,6 +510,11 @@ impl<'a> LiftContext<'a> {
         // at this time.
         let memory =
             instance_handle.options_memory(unsafe { &*(store as *const StoreOpaque) }, options);
+        // Capture the encoded shadow + constant for verify-at-use on the read
+        // side. Lifting never writes, and the host→wasm entry heal already ran,
+        // so the shadow is consistent here; no whole-dirty handling is needed.
+        let (an_shadow, an_a) = instance_handle
+            .an_options_shadow(unsafe { &*(store as *const StoreOpaque) }, options);
         let (task_state, host_table, host_resource_data, instance) =
             store.lift_context_parts(instance_handle);
         let (component, instance) = instance.component_and_self();
@@ -463,6 +522,8 @@ impl<'a> LiftContext<'a> {
         LiftContext {
             store_id,
             memory,
+            an_shadow,
+            an_a,
             options,
             types: component.types(),
             instance,
@@ -493,6 +554,24 @@ impl<'a> LiftContext<'a> {
     /// operation.
     pub fn memory(&self) -> &'a [u8] {
         self.memory
+    }
+
+    /// Verify-at-use read accessor: cross-checks the bytes of
+    /// `[offset, offset + len)` against the AN-encoding shadow before handing
+    /// them out, then returns that subslice of linear memory. Every component
+    /// lifting site that reads a value out of guest memory must go through
+    /// this (instead of indexing [`LiftContext::memory`] directly) so a
+    /// raw/shadow divergence — a fault not produced by a tracked write — is
+    /// caught where the bytes are consumed rather than silently lifted into
+    /// the host.
+    ///
+    /// No-op cross-check when AN-encoding is off (`an_shadow == None`): just
+    /// the slice. Mismatch → `Trap::AnMemoryMismatch`.
+    pub fn memory_checked(&self, offset: usize, len: usize) -> Result<&'a [u8]> {
+        if !an_subslice_consistent(self.memory, self.an_shadow, self.an_a, offset, len) {
+            return Err(crate::Trap::AnMemoryMismatch.into());
+        }
+        Ok(&self.memory[offset..][..len])
     }
 
     /// Returns an identifier for the store from which this `LiftContext` was

@@ -464,8 +464,9 @@ pub(crate) fn emit_an_enc_offset_from_effective_addr(
 ///
 /// For each touched slot the check asserts:
 /// `enc_slot == A * u32_le(raw_slot)`. Any mismatch raises
-/// [`crate::TRAP_AN_MEMORY_MISMATCH`] immediately, at the load site, rather
-/// than waiting for the next host-call boundary cross-check.
+/// [`crate::TRAP_AN_MEMORY_MISMATCH`] immediately, at the load site. This is
+/// the guest-read half of verify-at-use and is mandatory under AN — it is the
+/// sole guard on guest reads, with no host-boundary cross-check behind it.
 ///
 /// `raw_base_addr_i64` is the address `prepare_addr` produced for the load
 /// (raw heap base + effective wasm byte address, with `memarg.offset`

@@ -2296,21 +2296,6 @@ impl Config {
         self
     }
 
-    /// Opt-in to AN-encoding's load-side validity check.
-    ///
-    /// When `true` (and `an_encoding(true)` is also set), every i32 load
-    /// emits an inline assertion that the encoded shadow slot(s) it touches
-    /// satisfy `slot % A == 0 && slot / A == u32_le(raw_slot)`. Any
-    /// divergence raises `Trap::AnMemoryMismatch` immediately at the load
-    /// site, rather than at the next host-call boundary.
-    ///
-    /// Cost is significant for load-heavy programs (≥ one extra `udiv` per
-    /// touched shadow slot per load), so this is off by default.
-    pub fn an_load_validity_check(&mut self, enable: bool) -> &mut Self {
-        self.tunables.an_load_validity_check = Some(enable);
-        self
-    }
-
     /// Test-only AN-encoding boundary codeword fault injection.
     ///
     /// When `offset != 0` AND `an_encoding(true)` is set, the wasm/host

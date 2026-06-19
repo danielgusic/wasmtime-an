@@ -340,7 +340,6 @@ impl Metadata<'_> {
 
             an_encoding,
             an_constant,
-            an_load_validity_check,
             an_inject_codeword_fault,
             an_inject_conversion_fault,
         } = self.tunables;
@@ -432,11 +431,6 @@ impl Metadata<'_> {
         Self::check_bool(gc_heap_may_move, other.gc_heap_may_move, "GC heap may move")?;
         Self::check_bool(an_encoding, other.an_encoding, "AN-encoding")?;
         Self::check_int(an_constant, other.an_constant, "AN-encoding constant A")?;
-        Self::check_bool(
-            an_load_validity_check,
-            other.an_load_validity_check,
-            "AN-encoding load-side validity check",
-        )?;
         Self::check_int(
             an_inject_codeword_fault,
             other.an_inject_codeword_fault,

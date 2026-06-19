@@ -193,6 +193,8 @@ unsafe fn utf8_to_utf8(
     let dst = unsafe { slice::from_raw_parts_mut(dst, len) };
     assert_no_overlap(src, dst);
     let an_dst = dst.as_ptr() as usize;
+    // Verify-at-use: cross-check the raw source bytes before transcoding.
+    instance.an_check_transcode_src(store, src.as_ptr() as usize, len)?;
     log::trace!("utf8-to-utf8 {len}");
     let src = core::str::from_utf8(src).map_err(|_| format_err!("invalid utf8 encoding"))?;
     dst.copy_from_slice(src.as_bytes());
@@ -216,6 +218,8 @@ unsafe fn utf16_to_utf16(
     let dst = unsafe { slice::from_raw_parts_mut(dst, len) };
     assert_no_overlap(src, dst);
     let an_dst = dst.as_ptr() as usize;
+    // Verify-at-use: cross-check the raw source bytes before transcoding.
+    instance.an_check_transcode_src(store, src.as_ptr() as usize, 2 * len)?;
     log::trace!("utf16-to-utf16 {len}");
     run_utf16_to_utf16(src, dst)?;
     instance.an_resync_transcode_dst(store, an_dst, 2 * len);
@@ -254,6 +258,8 @@ unsafe fn latin1_to_latin1(
     let dst = unsafe { slice::from_raw_parts_mut(dst, len) };
     assert_no_overlap(src, dst);
     let an_dst = dst.as_ptr() as usize;
+    // Verify-at-use: cross-check the raw source bytes before transcoding.
+    instance.an_check_transcode_src(store, src.as_ptr() as usize, len)?;
     log::trace!("latin1-to-latin1 {len}");
     dst.copy_from_slice(src);
     instance.an_resync_transcode_dst(store, an_dst, len);
@@ -275,6 +281,8 @@ unsafe fn latin1_to_utf16(
     let dst = unsafe { slice::from_raw_parts_mut(dst, len) };
     assert_no_overlap(src, dst);
     let an_dst = dst.as_ptr() as usize;
+    // Verify-at-use: cross-check the raw source bytes before transcoding.
+    instance.an_check_transcode_src(store, src.as_ptr() as usize, len)?;
     for (src, dst) in src.iter().zip(dst) {
         *dst = u16::from(*src).to_le();
     }
@@ -308,6 +316,8 @@ unsafe fn utf8_to_utf16(
     let dst = unsafe { slice::from_raw_parts_mut(dst, len) };
     assert_no_overlap(src, dst);
     let an_dst = dst.as_ptr() as usize;
+    // Verify-at-use: cross-check the raw source bytes before transcoding.
+    instance.an_check_transcode_src(store, src.as_ptr() as usize, len)?;
 
     let result = run_utf8_to_utf16(src, dst)?;
     log::trace!("utf8-to-utf16 {len} => {result}");
@@ -357,6 +367,8 @@ unsafe fn utf16_to_utf8(
     let mut dst = unsafe { slice::from_raw_parts_mut(dst, dst_len) };
     assert_no_overlap(src, dst);
     let an_dst = dst.as_ptr() as usize;
+    // Verify-at-use: cross-check the raw source bytes before transcoding.
+    instance.an_check_transcode_src(store, src.as_ptr() as usize, 2 * src_len)?;
 
     // This iterator will convert to native endianness and additionally count
     // how many items have been read from the iterator so far. This
@@ -421,6 +433,8 @@ unsafe fn latin1_to_utf8(
     let dst = unsafe { slice::from_raw_parts_mut(dst, dst_len) };
     assert_no_overlap(src, dst);
     let an_dst = dst.as_ptr() as usize;
+    // Verify-at-use: cross-check the raw source bytes before transcoding.
+    instance.an_check_transcode_src(store, src.as_ptr() as usize, src_len)?;
     // The spec mandates that this transcoding in the first pass halts when a
     // multi-byte utf8 code point is encountered, so handle that here.
     let stop = if first_pass != 0 {
@@ -455,6 +469,8 @@ unsafe fn utf16_to_compact_probably_utf16(
     let dst = unsafe { slice::from_raw_parts_mut(dst, len) };
     assert_no_overlap(src, dst);
     let an_dst = dst.as_ptr() as usize;
+    // Verify-at-use: cross-check the raw source bytes before transcoding.
+    instance.an_check_transcode_src(store, src.as_ptr() as usize, 2 * len)?;
     let all_latin1 = run_utf16_to_utf16(src, dst)?;
     if all_latin1 {
         let (left, dst, right) = unsafe { dst.align_to_mut::<u8>() };
@@ -494,6 +510,8 @@ unsafe fn utf8_to_latin1(
     let dst = unsafe { slice::from_raw_parts_mut(dst, len) };
     assert_no_overlap(src, dst);
     let an_dst = dst.as_ptr() as usize;
+    // Verify-at-use: cross-check the raw source bytes before transcoding.
+    instance.an_check_transcode_src(store, src.as_ptr() as usize, len)?;
     let read = encoding_rs::mem::utf8_latin1_up_to(src);
     let written = encoding_rs::mem::convert_utf8_to_latin1_lossy(&src[..read], dst);
     log::trace!("utf8-to-latin1 {len} => ({read}, {written})");
@@ -518,6 +536,8 @@ unsafe fn utf16_to_latin1(
     let dst = unsafe { slice::from_raw_parts_mut(dst, len) };
     assert_no_overlap(src, dst);
     let an_dst = dst.as_ptr() as usize;
+    // Verify-at-use: cross-check the raw source bytes before transcoding.
+    instance.an_check_transcode_src(store, src.as_ptr() as usize, 2 * len)?;
 
     let mut size = 0;
     for (src, dst) in src.iter().zip(dst) {
@@ -564,6 +584,8 @@ unsafe fn utf8_to_compact_utf16(
     let dst = unsafe { slice::from_raw_parts_mut(dst, dst_len) };
     assert_no_overlap(src, dst);
     let an_dst = dst.as_ptr() as usize;
+    // Verify-at-use: cross-check the raw source bytes before transcoding.
+    instance.an_check_transcode_src(store, src.as_ptr() as usize, src_len)?;
 
     let dst = inflate_latin1_bytes(dst, latin1_bytes_so_far);
     let result = run_utf8_to_utf16(src, dst)?;
@@ -586,6 +608,8 @@ unsafe fn utf16_to_compact_utf16(
     let dst = unsafe { slice::from_raw_parts_mut(dst, dst_len) };
     assert_no_overlap(src, dst);
     let an_dst = dst.as_ptr() as usize;
+    // Verify-at-use: cross-check the raw source bytes before transcoding.
+    instance.an_check_transcode_src(store, src.as_ptr() as usize, 2 * src_len)?;
 
     let dst = inflate_latin1_bytes(dst, latin1_bytes_so_far);
     run_utf16_to_utf16(src, dst)?;

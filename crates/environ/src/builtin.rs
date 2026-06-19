@@ -251,21 +251,6 @@ macro_rules! foreach_builtin_function {
             // Process a debug breakpoint.
             breakpoint(vmctx: vmctx) -> bool;
 
-            // AN-encoding host-call boundary cross-check.
-            //
-            // First re-encodes (store-wide) every memory whose whole-dirty
-            // flag is set — a legitimate untracked host write via
-            // `Memory::data_mut` — then walks the calling instance's defined
-            // AND imported linear memories' encoded shadows slot-by-slot,
-            // asserting `decode(enc_slot) == u32_le(raw_slot)`. Returns
-            // `false` (a `Falsy` trap sentinel) on the first mismatch, which
-            // the trampoline turns into an `AnMemoryMismatch` trap. Returns
-            // `true` when all slots match. Emitted by the wasm-to-host
-            // trampoline immediately before the host call when
-            // `tunables.an_encoding` is on, so that bit flips accumulated
-            // during wasm execution are surfaced at the next host boundary.
-            an_check_host_boundary(vmctx: vmctx) -> bool;
-
             // AN-encoding host-call boundary resync.
             //
             // Dirty-driven and store-wide: re-encodes from raw exactly those

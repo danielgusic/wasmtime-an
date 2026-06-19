@@ -147,6 +147,19 @@ impl Global {
         self._get(&mut store)
     }
 
+    /// Fallible counterpart to [`Global::get`].
+    ///
+    /// Behaves exactly like [`Global::get`] but, when AN-encoding is on and
+    /// this is an encoded i32 global whose 64-bit slot fails the codeword
+    /// validity check (`encoded % A != 0`, i.e. the slot is not a valid `A*v`),
+    /// returns `Err(`[`Trap::AnCodewordInvalid`]`)` instead of panicking. When
+    /// propagated out of a host call it raises the `AnCodewordInvalid` wasm
+    /// trap. With AN-encoding off (or for non-i32 globals) this never fails.
+    pub fn try_get(&self, mut store: impl AsContextMut) -> Result<Val> {
+        let mut store = AutoAssertNoGc::new(store.as_context_mut().0);
+        self._try_get(&mut store)
+    }
+
     pub(crate) fn _get(&self, store: &mut AutoAssertNoGc<'_>) -> Val {
         unsafe {
             let definition = self.definition(store).as_ref();
@@ -154,9 +167,21 @@ impl Global {
                 ValType::I32 => match self.an_constant_for_i32(&store) {
                     // AN-encoded storage holds `A * v` in the 64-bit slot;
                     // decode back to the raw i32 the host expects.
+                    //
+                    // Host-boundary codeword validity, mirroring the guest's
+                    // `emit_an_codeword_validity_check`: a valid encoded i32 is
+                    // `A*v`, hence a multiple of A. A non-multiple means the slot
+                    // was corrupted. This accessor is infallible (`-> Val`), so a
+                    // mismatch can only panic; the fallible `Global::try_get`
+                    // twin surfaces it as `Trap::AnCodewordInvalid`.
                     Some(a) => {
-                        let v = (*definition.as_i64() as u64) / a;
-                        Val::from(v as u32 as i32)
+                        let enc = *definition.as_i64() as u64;
+                        assert!(
+                            a == 1 || enc % a == 0,
+                            "AN-encoding: Global::get over an invalid codeword \
+                             (AnCodewordInvalid); use try_get to handle"
+                        );
+                        Val::from((enc / a) as u32 as i32)
                     }
                     None => Val::from(*definition.as_i32()),
                 },
@@ -217,6 +242,41 @@ impl Global {
                     reference.into()
                 }
             }
+        }
+    }
+
+    /// Fallible decode used by [`Global::try_get`].
+    ///
+    /// Only the AN-encoded i32 path can fail (an invalid codeword in the 64-bit
+    /// slot); every other value type is read verbatim. Validate the codeword up
+    /// front so the otherwise-infallible [`Global::_get`] below never reaches
+    /// its panic, then delegate to it for the actual read.
+    pub(crate) fn _try_get(&self, store: &mut AutoAssertNoGc<'_>) -> Result<Val> {
+        if let ValType::I32 = self._ty(store).content() {
+            if let Some(a) = self.an_constant_for_i32(store) {
+                // SAFETY: same definition access as `_get`; reading the slot.
+                let enc = unsafe { *self.definition(store).as_ref().as_i64() } as u64;
+                if a != 1 && enc % a != 0 {
+                    return Err(crate::Trap::AnCodewordInvalid.into());
+                }
+            }
+        }
+        Ok(self._get(store))
+    }
+
+    /// Test-only: overwrite this global's raw 64-bit storage slot, bypassing
+    /// AN-encoding. Lets a test inject an invalid codeword (a value that is not
+    /// `A * v`) so the host-boundary validity check in
+    /// [`Global::get`]/[`Global::try_get`] can be exercised. No-op safety: only
+    /// meaningful for i32 globals under AN-encoding.
+    #[doc(hidden)]
+    pub fn an_corrupt_i64_slot_for_test(&self, mut store: impl AsContextMut, raw: i64) {
+        let store = store.as_context_mut().0;
+        // SAFETY: the definition pointer is valid for this global within the
+        // store and writing its 64-bit slot is the same access `set_unchecked`
+        // performs.
+        unsafe {
+            *self.definition(store).as_mut().as_i64_mut() = raw;
         }
     }
 

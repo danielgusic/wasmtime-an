@@ -1134,6 +1134,9 @@ impl From<GuestError> for types::Error {
             InvalidUtf8 { .. } => types::Errno::Ilseq.into(),
             TryFromIntError { .. } => types::Errno::Overflow.into(),
             SliceLengthsDiffer { .. } => types::Errno::Fault.into(),
+            // An AN-encoding raw/shadow divergence over a read range is a
+            // memory-integrity fault, not a recoverable errno — trap.
+            AnMemoryMismatch => types::Error::trap(err.into()),
             InFunc { err, .. } => types::Error::from(*err),
         }
     }

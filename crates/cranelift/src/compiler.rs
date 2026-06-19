@@ -457,21 +457,6 @@ impl wasmtime_environ::Compiler for Compiler {
             ptr_size.vmarray_call_host_func_context_func_ref() + ptr_size.vm_func_ref_array_call(),
         );
 
-        // AN-encoding host-boundary cross-check. Emitted right
-        // before the host call so any divergence between raw and shadow
-        // (e.g. a bit flip in either copy) traps as `AnMemoryMismatch`
-        // before the host gets a chance to interpret possibly-corrupted
-        // bytes. No-op when AN-encoding is off on the engine.
-        if self.tunables.an_encoding {
-            let sigs = BuiltinFunctionSignatures::new(self);
-            let check_idx = BuiltinFunctionIndex::an_check_host_boundary();
-            let check_sig = sigs.host_signature(check_idx);
-            let check_call =
-                self.call_builtin(&mut builder, caller_vmctx, &[caller_vmctx], check_idx, check_sig);
-            let check_ok = builder.func.dfg.inst_results(check_call)[0];
-            self.raise_if_host_trapped(&mut builder, caller_vmctx, check_ok);
-        }
-
         // Do an indirect call to the callee.
         let callee_signature = builder.func.import_signature(array_call_sig);
         let call = self.call_indirect_host(
@@ -512,10 +497,9 @@ impl wasmtime_environ::Compiler for Compiler {
 
         // AN-encoding host-boundary resync. Emitted immediately
         // after the host call so any raw-memory writes the host performed
-        // (e.g. WASI `fd_read` copying input bytes) get reflected in the
-        // encoded shadow before wasm resumes and either reads memory or
-        // hits the next host call's cross-check. No-op when AN-encoding is
-        // off on the engine.
+        // wholesale via `Memory::data_mut` (whole-dirty flag) get re-encoded
+        // into the shadow before wasm resumes and reads memory. No-op when
+        // AN-encoding is off on the engine.
         if self.tunables.an_encoding {
             let sigs = BuiltinFunctionSignatures::new(self);
             let resync_idx = BuiltinFunctionIndex::an_resync_host_boundary();

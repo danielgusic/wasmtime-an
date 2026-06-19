@@ -14,17 +14,50 @@ use wasmtime_environ::DefinedMemoryIndex;
 
 pub use crate::runtime::vm::WaitResult;
 
-/// Error for out of bounds [`Memory`] access.
+/// Error for a failed [`Memory`] access.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct MemoryAccessError {
     // Keep struct internals private for future extensibility.
-    _private: (),
+    kind: MemoryAccessErrorKind,
+}
+
+#[derive(Debug)]
+enum MemoryAccessErrorKind {
+    /// The access fell outside the memory's current bounds.
+    OutOfBounds,
+    /// AN-encoding verify-at-use: the bytes being read diverged from the
+    /// encoded shadow (corruption). `Memory::read`'s typed signature cannot
+    /// carry the `AnMemoryMismatch` trap *code*, but the message names the
+    /// cause so it is not mistaken for a bounds error. The fallible accessors
+    /// (`Memory::try_data` / `try_data_mut`) surface the trap code directly.
+    AnMemoryMismatch,
+}
+
+impl MemoryAccessError {
+    fn oob() -> MemoryAccessError {
+        MemoryAccessError {
+            kind: MemoryAccessErrorKind::OutOfBounds,
+        }
+    }
+
+    fn an_mismatch() -> MemoryAccessError {
+        MemoryAccessError {
+            kind: MemoryAccessErrorKind::AnMemoryMismatch,
+        }
+    }
 }
 
 impl fmt::Display for MemoryAccessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "out of bounds memory access")
+        match self.kind {
+            MemoryAccessErrorKind::OutOfBounds => write!(f, "out of bounds memory access"),
+            MemoryAccessErrorKind::AnMemoryMismatch => write!(
+                f,
+                "AN-encoding memory mismatch: encoded shadow disagrees with raw memory \
+                 over the read range"
+            ),
+        }
     }
 }
 
@@ -358,11 +391,18 @@ impl Memory {
         buffer: &mut [u8],
     ) -> Result<(), MemoryAccessError> {
         let store = store.as_context();
+        // Verify-at-use: cross-check exactly the bytes being read before
+        // copying them out. A mismatch means raw diverged from the encoded
+        // shadow without a tracked write (corruption); the read aborts with an
+        // `AnMemoryMismatch`-named error (see `MemoryAccessErrorKind`).
+        if !self.an_range_consistent(StoreContext(store.0), offset, buffer.len()) {
+            return Err(MemoryAccessError::an_mismatch());
+        }
         let slice = self
-            .data(&store)
+            .data_untracked(store)
             .get(offset..)
             .and_then(|s| s.get(..buffer.len()))
-            .ok_or(MemoryAccessError { _private: () })?;
+            .ok_or(MemoryAccessError::oob())?;
         buffer.copy_from_slice(slice);
         Ok(())
     }
@@ -396,7 +436,7 @@ impl Memory {
         self.data_mut_untracked(&mut context)
             .get_mut(offset..)
             .and_then(|s| s.get_mut(..buffer.len()))
-            .ok_or(MemoryAccessError { _private: () })?
+            .ok_or(MemoryAccessError::oob())?
             .copy_from_slice(buffer);
         self.an_resync_range(&mut context, offset, buffer.len());
         Ok(())
@@ -417,17 +457,6 @@ impl Memory {
         self.instance
             .get_mut(&mut context.0)
             .an_encode_range_from_raw(self.index, offset, len, a);
-    }
-
-    /// Whether host writes to this memory need AN-encoding write tracking,
-    /// i.e. whether an encoded shadow is allocated for it.
-    ///
-    /// `#[doc(hidden)]`: used by the wiggle-generated WASI preview1 hostcall
-    /// wrappers to decide whether the `GuestMemory` view should record
-    /// written ranges.
-    #[doc(hidden)]
-    pub fn an_tracking_enabled(&self, store: impl AsContext) -> bool {
-        store.as_context()[self.instance].an_has_shadow(self.index)
     }
 
     /// If the host pointer range `[ptr, ptr + len)` lies inside this
@@ -456,6 +485,39 @@ impl Memory {
         true
     }
 
+    /// Verify-at-use read-twin of [`Self::an_resync_if_contains_ptr`]: if the
+    /// host pointer range `[ptr, ptr + len)` lies inside this memory's current
+    /// allocation, cross-checks exactly that range against the encoded shadow
+    /// and returns `Some(consistent)`; returns `None` when the range is not in
+    /// this memory (so the caller keeps scanning other memories).
+    ///
+    /// A whole-dirty memory (host wrote raw via `data_mut`, re-encode pending)
+    /// reports `Some(true)`: its shadow is legitimately stale, raw is the
+    /// source of truth there.
+    ///
+    /// Used by the component-model transcode libcalls to cross-check the raw
+    /// source bytes they read (computed by the fused-adapter trampolines from a
+    /// runtime memory's base) before transcoding them.
+    pub(crate) fn an_cross_check_if_contains_ptr(
+        &self,
+        store: &mut StoreOpaque,
+        ptr: usize,
+        len: usize,
+    ) -> Option<bool> {
+        let definition = self.instance.get(store).memory(self.index);
+        let base = definition.base.as_ptr() as usize;
+        let mem_len = definition.current_length();
+        if ptr < base || ptr.saturating_add(len) > base.saturating_add(mem_len) {
+            return None;
+        }
+        let instance = self.instance.get(store);
+        if instance.an_is_whole_dirty(self.index) {
+            return Some(true);
+        }
+        let a = store.engine().tunables().an_constant;
+        Some(self.instance.get(store).an_cross_check_range(self.index, ptr - base, len, a))
+    }
+
     /// Returns this memory as a native Rust slice.
     ///
     /// Note that this method will consider the entire store context provided as
@@ -465,12 +527,103 @@ impl Memory {
     ///
     /// Panics if this memory doesn't belong to `store`.
     pub fn data<'a, T: 'static>(&self, store: impl Into<StoreContext<'a, T>>) -> &'a [u8] {
+        let store = store.into();
+        // Verify-at-use: this hands the host an opaque whole-memory immutable
+        // borrow whose read range we cannot see, so cross-check the whole
+        // memory now (skipped for whole-dirty memories, whose shadow is
+        // legitimately stale; see `an_range_consistent`).
+        //
+        // This accessor is infallible (`-> &[u8]`), so a detected corruption
+        // can only panic here. Embedders that need to handle the mismatch
+        // gracefully (as a `Trap::AnMemoryMismatch`) should use the fallible
+        // [`Memory::try_data`] twin instead.
+        if !self.an_whole_consistent(StoreContext(store.0)) {
+            panic!(
+                "AN-encoding: Memory::data borrow over a raw/shadow mismatch (AnMemoryMismatch)"
+            );
+        }
+        self.data_untracked(store)
+    }
+
+    /// Fallible counterpart to [`Memory::data`].
+    ///
+    /// Behaves exactly like [`Memory::data`] but, when the AN-encoding
+    /// verify-at-use whole-memory cross-check detects a raw/shadow mismatch,
+    /// returns `Err(`[`Trap::AnMemoryMismatch`]`)` instead of panicking. When
+    /// the error is propagated out of a host call it raises the
+    /// `AnMemoryMismatch` wasm trap. With AN-encoding off (or no shadow) this
+    /// never fails.
+    pub fn try_data<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContext<'a, T>>,
+    ) -> Result<&'a [u8]> {
+        let store = store.into();
+        if !self.an_whole_consistent(StoreContext(store.0)) {
+            return Err(Trap::AnMemoryMismatch.into());
+        }
+        Ok(self.data_untracked(store))
+    }
+
+    /// Like [`Memory::data`] but performs **no** AN-encoding verify-at-use
+    /// cross-check. Internal: callers that already cross-check the exact range
+    /// they touch (e.g. [`Memory::read`]) must use this to avoid paying for a
+    /// redundant whole-memory check.
+    fn data_untracked<'a, T: 'static>(&self, store: impl Into<StoreContext<'a, T>>) -> &'a [u8] {
         unsafe {
             let store = store.into();
             let definition = store[self.instance].memory(self.index);
             debug_assert!(!self.ty(store).is_shared());
             slice::from_raw_parts(definition.base.as_ptr(), definition.current_length())
         }
+    }
+
+    /// The AN-encoding shadow buffer of this memory as an immutable slice, or
+    /// `None` when no shadow is allocated (AN off / shared / imported).
+    ///
+    /// `pub(crate)`: used by the component lifting read-verify (`LiftContext`)
+    /// to cross-check a lifted range against the encoded shadow. The shadow
+    /// stays runtime-internal — it is never handed to embedder code.
+    pub(crate) fn an_shadow_slice<'a>(&self, store: &'a StoreOpaque) -> Option<&'a [u8]> {
+        store[self.instance].an_shadow_slice(self.index)
+    }
+
+    /// Verify-at-use cross-check of `[offset, offset + len)` (clamped to the
+    /// memory's current length) against the AN-encoding shadow.
+    ///
+    /// Returns `true` (consistent) when AN-encoding is off, the memory has no
+    /// shadow, or the memory is whole-dirty — a whole-dirty memory's shadow is
+    /// legitimately stale (host wrote raw via `data_mut`, re-encode pending),
+    /// so raw is the source of truth and there is nothing to verify. Otherwise
+    /// returns whether every touched shadow slot matches raw.
+    fn an_range_consistent<'a, T: 'static>(
+        &self,
+        store: StoreContext<'a, T>,
+        offset: usize,
+        len: usize,
+    ) -> bool {
+        let tunables = store.engine().tunables();
+        if !tunables.an_encoding {
+            return true;
+        }
+        let instance = &store[self.instance];
+        if instance.an_is_whole_dirty(self.index) {
+            return true;
+        }
+        instance.an_cross_check_range(self.index, offset, len, tunables.an_constant)
+    }
+
+    /// Whole-memory variant of [`Self::an_range_consistent`] for the opaque
+    /// `data()` / `data_mut()` borrows whose read range cannot be known.
+    fn an_whole_consistent<'a, T: 'static>(&self, store: StoreContext<'a, T>) -> bool {
+        let tunables = store.engine().tunables();
+        if !tunables.an_encoding {
+            return true;
+        }
+        let instance = &store[self.instance];
+        if instance.an_is_whole_dirty(self.index) {
+            return true;
+        }
+        instance.an_cross_check_memory(self.index, tunables.an_constant)
     }
 
     /// Returns this memory as a native Rust mutable slice.
@@ -486,14 +639,52 @@ impl Memory {
         store: impl Into<StoreContextMut<'a, T>>,
     ) -> &'a mut [u8] {
         let mut store = store.into();
+        // Verify-at-use: the caller gets an opaque whole-memory mutable borrow
+        // (read+write, range unknown), so cross-check the whole memory now,
+        // before handing it out. Skipped for already-whole-dirty memories
+        // (shadow legitimately stale; see `an_whole_consistent`).
+        //
+        // Infallible accessor (`-> &mut [u8]`), so a detected corruption can
+        // only panic here. Embedders that need to handle the mismatch
+        // gracefully (as a `Trap::AnMemoryMismatch`) should use the fallible
+        // [`Memory::try_data_mut`] twin instead.
+        if !self.an_whole_consistent(store.as_context()) {
+            panic!(
+                "AN-encoding: Memory::data_mut borrow over a raw/shadow mismatch (AnMemoryMismatch)"
+            );
+        }
         // The caller may write anywhere in raw memory through the returned
         // borrow, invisibly to the AN-encoding shadow. Mark the memory
-        // whole-dirty so the next host-boundary resync re-encodes it from
-        // raw. No-op when no shadow is allocated (AN-encoding off).
+        // whole-dirty so the next heal (wasm entry or host-boundary resync)
+        // re-encodes it from raw. No-op when no shadow is allocated.
         self.instance
             .get_mut(&mut store.0)
             .an_mark_whole_dirty(self.index);
         self.data_mut_untracked(store)
+    }
+
+    /// Fallible counterpart to [`Memory::data_mut`].
+    ///
+    /// Behaves exactly like [`Memory::data_mut`] but, when the AN-encoding
+    /// verify-at-use whole-memory cross-check detects a raw/shadow mismatch,
+    /// returns `Err(`[`Trap::AnMemoryMismatch`]`)` instead of panicking. When
+    /// the error is propagated out of a host call it raises the
+    /// `AnMemoryMismatch` wasm trap. With AN-encoding off (or no shadow) this
+    /// never fails.
+    pub fn try_data_mut<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContextMut<'a, T>>,
+    ) -> Result<&'a mut [u8]> {
+        let mut store = store.into();
+        // Cross-check BEFORE marking whole-dirty: a pre-existing divergence must
+        // trap here, not be laundered into the shadow by the next heal.
+        if !self.an_whole_consistent(store.as_context()) {
+            return Err(Trap::AnMemoryMismatch.into());
+        }
+        self.instance
+            .get_mut(&mut store.0)
+            .an_mark_whole_dirty(self.index);
+        Ok(self.data_mut_untracked(store))
     }
 
     /// Like [`Memory::data_mut`] but does *not* mark the memory whole-dirty
@@ -520,9 +711,9 @@ impl Memory {
     /// 4-byte raw slot maps to an 8-byte shadow slot holding the
     /// little-endian encoding of `A * u32_le(raw_slot)`. Embedders should
     /// not rely on the layout. Tampering the shadow under this accessor and
-    /// then performing any wasm op that triggers the host-boundary
-    /// cross-check (or, under `an_load_validity_check`, an i32 load of the
-    /// touched slot) raises `Trap::AnMemoryMismatch`.
+    /// then reading the touched slot — a guest `i32.load` (raises
+    /// `Trap::AnMemoryMismatch`) or a host `Memory::read` of the range
+    /// (returns `Err`) — surfaces the divergence under verify-at-use.
     #[doc(hidden)]
     pub fn an_shadow_data_mut_for_test<'a, T: 'static>(
         &self,
@@ -571,24 +762,69 @@ impl Memory {
         }
     }
 
-    /// Like [`Memory::data_and_store_mut`] but does *not* mark the memory
-    /// whole-dirty for AN-encoding shadow maintenance.
+    /// Fallible counterpart to [`Memory::data_and_store_mut`].
     ///
-    /// `#[doc(hidden)]`: used by the wiggle-generated WASI preview1 hostcall
-    /// wrappers, which instead record every written byte range through the
-    /// `GuestMemory` view and re-encode the shadow for exactly those ranges
-    /// after the hostcall body completes. Any other caller must bring the
-    /// shadow back in sync itself.
-    #[doc(hidden)]
-    pub fn an_untracked_data_and_store_mut<'a, T: 'static>(
+    /// Behaves exactly like [`Memory::data_and_store_mut`] but surfaces an
+    /// AN-encoding raw/shadow mismatch as `Err(`[`Trap::AnMemoryMismatch`]`)`
+    /// (via [`Memory::try_data_mut`]) instead of panicking.
+    pub fn try_data_and_store_mut<'a, T: 'static>(
         &self,
         store: impl Into<StoreContextMut<'a, T>>,
-    ) -> (&'a mut [u8], &'a mut T) {
+    ) -> Result<(&'a mut [u8], &'a mut T)> {
         // SAFETY: same disjoint-borrow argument as `data_and_store_mut`.
         unsafe {
             let mut store = store.into();
             let data = &mut *(store.data_mut() as *mut T);
-            (self.data_mut_untracked(store), data)
+            Ok((self.try_data_mut(store)?, data))
+        }
+    }
+
+    /// Like [`Memory::data_and_store_mut`] but does *not* mark the memory
+    /// whole-dirty for AN-encoding shadow maintenance, and also hands back this
+    /// memory's AN-encoding shadow (immutable) and the encoding constant `A`,
+    /// so the wiggle `GuestMemory` view can verify host *reads* against the
+    /// shadow at range granularity (verify-at-use) instead of scanning the
+    /// whole memory.
+    ///
+    /// The raw memory is still `&mut` — the hostcall body writes results
+    /// through the same view — while the shadow is `&` because verification
+    /// only reads it. The shadow is a separate allocation from both the raw
+    /// memory and the store data, so the three borrows are mutually disjoint
+    /// (same laundering argument as [`Memory::data_and_store_mut`]). `shadow`
+    /// is `None` when no shadow is allocated (AN-encoding off / shared /
+    /// imported memory).
+    ///
+    /// `#[doc(hidden)]`: wiggle-internal, like `data_and_store_mut`.
+    #[doc(hidden)]
+    pub fn an_untracked_data_shadow_and_store_mut<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContextMut<'a, T>>,
+    ) -> (&'a mut [u8], Option<&'a [u8]>, u64, &'a mut T) {
+        // SAFETY: same disjoint-borrow argument as `data_and_store_mut`,
+        // extended to the shadow buffer (a distinct allocation in the owning
+        // instance, read-only here).
+        unsafe {
+            let mut store = store.into();
+            let data = &mut *(store.data_mut() as *mut T);
+            let a = store.as_context().engine().tunables().an_constant;
+            let shadow = {
+                let instance = &store[self.instance];
+                // A memory reaching a wiggle hostcall is never whole-dirty: the
+                // host->wasm entry heal re-encodes any `data_mut`-dirtied memory
+                // before the guest runs, and the guest cannot mark a memory
+                // whole-dirty. So the shadow handed out here is consistent with
+                // raw (modulo bytes this same call writes, tracked separately).
+                debug_assert!(
+                    !instance.an_is_whole_dirty(self.index),
+                    "wiggle hostcall reached a whole-dirty memory"
+                );
+                // Launder the shadow borrow to `'a`; it is disjoint from both
+                // the raw memory and the store data taken above/below.
+                instance
+                    .an_shadow_slice(self.index)
+                    .map(|s| &*(s as *const [u8]))
+            };
+            (self.data_mut_untracked(store), shadow, a, data)
         }
     }
 
@@ -1243,6 +1479,64 @@ mod tests {
             ),
             12,
         ));
+    }
+
+    // Unit coverage for the transcoder source verify-at-use primitive
+    // (`Memory::an_cross_check_if_contains_ptr`): given a raw host pointer it
+    // resolves the owning range, cross-checks it against the encoded shadow,
+    // and distinguishes "not in this memory" (`None`) from "in this memory and
+    // (in)consistent" (`Some(bool)`). The transcoder libcalls call this via
+    // `ComponentInstance::an_check_transcode_src` before reading source bytes;
+    // the clean end-to-end path is covered by the `transcode_string_roundtrip`
+    // integration tests.
+    #[test]
+    fn an_cross_check_if_contains_ptr_detects_tamper() -> Result<()> {
+        let mut cfg = Config::new();
+        cfg.an_encoding(true);
+        cfg.an_constant(65521);
+        let engine = Engine::new(&cfg)?;
+        let module = Module::new(&engine, r#"(module (memory (export "m") 1))"#)?;
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[])?;
+        let mem = instance.get_memory(&mut store, "m").unwrap();
+
+        // Write known bytes through the tracked host path so the shadow for
+        // [16, 24) is brought in sync.
+        mem.write(&mut store, 16, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])?;
+        let base = mem.data_ptr(&store) as usize;
+
+        {
+            let so = store.as_context_mut().0;
+            // Clean range: consistent.
+            assert_eq!(
+                mem.an_cross_check_if_contains_ptr(so, base + 16, 8),
+                Some(true),
+                "clean range should be consistent"
+            );
+            // Pointer below the memory base: not contained.
+            assert_eq!(
+                mem.an_cross_check_if_contains_ptr(so, base.wrapping_sub(4096), 8),
+                None,
+                "out-of-range pointer should not be contained"
+            );
+        }
+
+        // Introduce an external fault (untracked raw write, like `data_ptr`):
+        // raw byte 18 now disagrees with its shadow slot.
+        unsafe {
+            let p = (base as *mut u8).add(18);
+            p.write(p.read() ^ 0x40);
+        }
+
+        {
+            let so = store.as_context_mut().0;
+            assert_eq!(
+                mem.an_cross_check_if_contains_ptr(so, base + 16, 8),
+                Some(false),
+                "tampered range must be detected as inconsistent"
+            );
+        }
+        Ok(())
     }
 
     #[test]

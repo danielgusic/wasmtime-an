@@ -1848,10 +1848,43 @@ impl StoreOpaque {
 
     /// AN-encoding: ids of every instance in this store, *including* dummy
     /// instances (which back host-created memories and own AN shadows too).
-    /// Used by the host-boundary libcalls to sweep whole-dirty flags
-    /// store-wide before cross-checking.
+    /// Used by the host-boundary resync libcall and the wasm-entry heal to
+    /// sweep whole-dirty flags store-wide.
     pub fn an_all_instance_ids(&self) -> Vec<InstanceId> {
         self.instances.iter().map(|(id, _)| id).collect()
+    }
+
+    /// AN-encoding: re-encode every whole-dirty memory in the store from raw
+    /// bytes, consuming the flags. A memory is whole-dirty when the host took
+    /// an untracked whole-memory mutable view (`Memory::data_mut` /
+    /// `data_and_store_mut`) and may have written anywhere through it.
+    ///
+    /// Must run before *any* wasm executes, because under verify-at-use the
+    /// guest's inline per-load check reads the shadow as source-of-truth: a
+    /// stale shadow (raw written via `data_mut` but not yet re-encoded) would
+    /// otherwise false-trap as `AnMemoryMismatch` on the first guest load.
+    /// `data_mut` can only happen while no wasm is running, so two heal points
+    /// — this one (host→wasm entry) and the host-call-exit resync libcall —
+    /// cover every window in which a memory can become whole-dirty.
+    ///
+    /// No-op when AN-encoding is disabled on the engine.
+    pub(crate) fn an_heal_whole_dirty(&mut self) {
+        if !self.engine().tunables().an_encoding {
+            return;
+        }
+        let a = self.engine().tunables().an_constant;
+        for id in self.an_all_instance_ids() {
+            let mut instance = self.instance_mut(id);
+            let num_defined_memories =
+                u32::try_from(instance.env_module().num_defined_memories())
+                    .expect("number of defined memories fits in u32");
+            for i in 0..num_defined_memories {
+                let def_idx = wasmtime_environ::DefinedMemoryIndex::from_u32(i);
+                if instance.as_mut().an_take_whole_dirty(def_idx) {
+                    instance.as_mut().an_encode_full_memory_from_raw(def_idx, a);
+                }
+            }
+        }
     }
 
     /// Get all instances (ignoring dummy instances) within this store.

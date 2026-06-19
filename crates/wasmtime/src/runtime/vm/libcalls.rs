@@ -557,6 +557,39 @@ fn memory_copy(
         .instance(instance)
         .env_module()
         .defined_memory_index(dst_index);
+    // Verify-at-use: `memory.copy` reads its source range out of guest memory.
+    // Cross-check it against the encoded shadow *before* copying, so a
+    // raw/shadow divergence in the source is caught here rather than being
+    // copied into the destination and then laundered into a valid destination
+    // codeword by the post-copy re-encode below. No whole-dirty handling is
+    // needed: a memory only becomes whole-dirty via a host `data_mut`, which
+    // runs while no wasm executes and is always healed (wasm-entry heal /
+    // post-host-call resync) before this libcall — reached only from wasm —
+    // can run.
+    if an_on {
+        let def_src = store
+            .instance(instance)
+            .env_module()
+            .defined_memory_index(src_index);
+        let src_usize = usize::try_from(src).unwrap();
+        let len_usize = usize::try_from(len).unwrap();
+        let consistent = match def_src {
+            Some(def_idx) => {
+                store
+                    .instance(instance)
+                    .an_cross_check_range(def_idx, src_usize, len_usize, a)
+            }
+            None => store.instance(instance).an_cross_check_imported_range(
+                src_index,
+                src_usize,
+                len_usize,
+                a,
+            ),
+        };
+        if !consistent {
+            return Err(Trap::AnMemoryMismatch);
+        }
+    }
     store
         .instance_mut(instance)
         .memory_copy(dst_index, dst, src_index, src, len)?;
@@ -600,9 +633,12 @@ fn memory_fill(
     if an_on {
         let dst_usize = usize::try_from(dst).unwrap();
         let len_usize = usize::try_from(len).unwrap();
-        store
-            .instance_mut(instance)
-            .an_encode_range_from_raw(memory_index, dst_usize, len_usize, a);
+        store.instance_mut(instance).an_encode_range_from_raw(
+            memory_index,
+            dst_usize,
+            len_usize,
+            a,
+        );
     }
     Ok(())
 }
@@ -640,9 +676,12 @@ fn memory_init(
             // Imported destination: re-encode the owning instance's shadow
             // through the `VMMemoryImport` enc-base indirection.
             None => {
-                store
-                    .instance(instance)
-                    .an_encode_imported_range_from_raw(memory_index, dst_usize, len_usize, a);
+                store.instance(instance).an_encode_imported_range_from_raw(
+                    memory_index,
+                    dst_usize,
+                    len_usize,
+                    a,
+                );
             }
         }
     }
@@ -1788,55 +1827,6 @@ fn breakpoint(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
     Ok(())
 }
 
-/// AN-encoding cross-check at the wasm-to-host trampoline boundary.
-///
-/// Walks every defined linear memory's encoded shadow slot-by-slot and
-/// compares `decode(enc_slot)` to `u32_le(raw_slot)`. Returns
-/// `Err(Trap::AnMemoryMismatch)` on the first mismatch, which the trampoline
-/// turns into a wasm trap. When AN-encoding is disabled on the engine the
-/// function returns immediately.
-///
-/// Memories whose whole-dirty flag is set anywhere in the store are
-/// re-encoded from raw first (consuming the flag): the host legitimately
-/// held an untracked whole-memory mutable borrow (`Memory::data_mut`) since
-/// the last resync — possibly *outside* any host call, e.g. between two
-/// wasm invocations or during an async/epoch suspension — so that shadow is
-/// stale by design, not corrupted. Without this step such writes would
-/// falsely trap here, because this check runs before the post-call resync
-/// ever gets a chance. The sweep is store-wide because the dirtied memory
-/// may belong to a different instance than the caller.
-///
-/// Coverage: **store-wide**. Every linear memory is *defined* by exactly one
-/// instance — an imported memory is only an alias into its owner's shadow —
-/// so walking every instance's defined memories cross-checks the caller's
-/// defined and imported memories *and* memories the caller neither defines
-/// nor imports. The last case occurs when a host call routes through a
-/// wit-component shim instance that does not itself carry the memory; a
-/// caller-scoped check would skip the memory-owning instance entirely and
-/// miss a fault there. `an_all_instance_ids` includes the dummy instances
-/// that back host-created memories, so their shadows are covered too. The
-/// `instance` argument (the caller) is therefore unused.
-fn an_check_host_boundary(store: &mut dyn VMStore, instance: InstanceId) -> Result<(), Trap> {
-    let _ = instance;
-    if !store.engine().tunables().an_encoding {
-        return Ok(());
-    }
-    let a = store.engine().tunables().an_constant;
-    an_sweep_whole_dirty(store, a);
-    for id in store.an_all_instance_ids() {
-        let instance = store.instance_mut(id);
-        let num_defined_memories = u32::try_from(instance.env_module().num_defined_memories())
-            .expect("number of defined memories fits in u32");
-        for i in 0..num_defined_memories {
-            let def_idx = DefinedMemoryIndex::from_u32(i);
-            if !instance.an_cross_check_memory(def_idx, a) {
-                return Err(Trap::AnMemoryMismatch);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Re-encodes every whole-dirty memory in the store from raw bytes,
 /// consuming the flags. Walks every instance — including dummy instances
 /// backing host-created memories — because `Memory::data_mut` can dirty any
@@ -1869,9 +1859,9 @@ fn an_sweep_whole_dirty(store: &mut dyn VMStore, a: u64) {
 ///
 /// Safety property: a raw/shadow divergence that appears during the host
 /// call in a memory that was *not* legitimately handed to the host is no
-/// longer "healed" by an unconditional full re-encode — it survives until
-/// the next host-boundary cross-check and traps as
-/// `Trap::AnMemoryMismatch`.
+/// longer "healed" by an unconditional full re-encode — it survives this
+/// dirty-only resync and is caught at use (the guest's inline load check or a
+/// host read of the range) as `Trap::AnMemoryMismatch`.
 fn an_resync_host_boundary(store: &mut dyn VMStore, instance: InstanceId) -> Result<(), Trap> {
     let _ = instance;
     if !store.engine().tunables().an_encoding {

@@ -660,7 +660,9 @@ where
                 P::linear_lift_from_flat(cx, ty, storage)
             }
             Source::Memory(offset) => {
-                P::linear_lift_from_memory(cx, ty, &cx.memory()[offset..][..P::SIZE32])
+                // Verify-at-use: cross-check the params' bytes before lift.
+                let bytes = cx.memory_checked(offset, P::SIZE32)?;
+                P::linear_lift_from_memory(cx, ty, bytes)
             }
         }
     }
@@ -755,7 +757,9 @@ where
                 for ty in param_tys.types.iter() {
                     let abi = cx.types.canonical_abi(ty);
                     let size = usize::try_from(abi.size32).unwrap();
-                    let memory = &cx.memory()[abi.next_field32_size(&mut offset)..][..size];
+                    // Verify-at-use: cross-check each param's bytes before lift.
+                    let field_off = abi.next_field32_size(&mut offset);
+                    let memory = cx.memory_checked(field_off, size)?;
                     params.push(Val::load(cx, *ty, memory)?);
                 }
             }

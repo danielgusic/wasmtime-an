@@ -125,18 +125,19 @@ fn generate_func(
         };
         let (mut mem, ctx) = match &export {
             Some(wiggle::wasmtime_crate::Extern::Memory(m)) => {
-                // When this memory has an AN-encoding shadow, record every
-                // host write range in the `GuestMemory` view (the untracked
-                // accessor skips the whole-dirty mark that `data_and_store_mut`
-                // would set); the ranges are re-encoded below.
-                let an_track = m.an_tracking_enabled(&caller);
-                let (mem, ctx) = m.an_untracked_data_and_store_mut(&mut caller);
+                // When this memory has an AN-encoding shadow, hand the
+                // `GuestMemory` view the shadow + constant so host *reads*
+                // verify exactly the range they touch (verify-at-use, never the
+                // whole memory) and record host *write* ranges (re-encoded
+                // below). The untracked accessor skips the whole-dirty mark that
+                // `data_and_store_mut` would set.
+                let (raw, shadow, a, ctx) =
+                    m.an_untracked_data_shadow_and_store_mut(&mut caller);
                 let ctx = get_cx(ctx);
                 ctx.set_hostcall_fuel(fuel);
-                let mem = if an_track {
-                    wiggle::GuestMemory::unshared_an_tracked(mem)
-                } else {
-                    wiggle::GuestMemory::unshared(mem)
+                let mem = match shadow {
+                    Some(shadow) => wiggle::GuestMemory::unshared_an_verified(raw, shadow, a),
+                    None => wiggle::GuestMemory::unshared(raw),
                 };
                 (mem, ctx)
             }

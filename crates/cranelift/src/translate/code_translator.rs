@@ -4231,11 +4231,11 @@ fn translate_load(
         .Load(opcode, result_ty, flags, Offset32::new(0), base);
     let raw = dfg.first_result(load);
 
-    // AN-encoding load-side validity check (opt-in via
-    // `Tunables.an_load_validity_check`): assert the encoded shadow slot(s)
-    // match the raw bytes, so a divergence surfaces here as
-    // `Trap::AnMemoryMismatch` at the load rather than at the next host
-    // boundary.
+    // AN-encoding load-side validity check (always on under `an_encoding`):
+    // assert the encoded shadow slot(s) match the raw bytes, so a divergence
+    // surfaces here as `Trap::AnMemoryMismatch` at the load. This is the
+    // guest-read half of verify-at-use — there is no longer a whole-memory
+    // host-boundary cross-check behind it, so the check is mandatory.
     //
     // Emitted AFTER the raw load on purpose: the raw load carries the
     // memory's bounds enforcement (explicit check or guard-page fault), so
@@ -4244,14 +4244,9 @@ fn translate_load(
     // The check still fires before the loaded value is encoded/pushed, so
     // detection semantics are unchanged.
     //
-    // Only i32-family loads are checked for now. Non-i32 stores are mirrored
-    // into the shadow too (see `translate_non_i32_store_an`), so extending
-    // the check to i64/v128 loads would be sound — it is just not implemented
-    // yet; i32 is the protected domain.
-    if environ.tunables().an_encoding
-        && environ.tunables().an_load_validity_check
-        && result_ty == I32
-    {
+    // Only i32-family loads are checked: i32 is the protected domain. (Non-i32
+    // stores are still mirrored into the shadow — see `translate_non_i32_store_an`.)
+    if environ.tunables().an_encoding && result_ty == I32 {
         if let Some(enc_base) = emit_an_enc_base_pointer(
             builder,
             environ,
@@ -4334,10 +4329,10 @@ fn translate_store(
 
     environ.before_store(builder, mem_op_size, wasm_index, memarg.offset);
 
-    // AN-encoding: non-i32 stores must also update the shadow, or the next
-    // host-boundary cross-check traps. `translate_non_i32_store_an` decomposes
-    // them into raw i32 sub-stores routed through the same shadow path as
-    // `i32.store{,8,16}`.
+    // AN-encoding: non-i32 stores must also update the shadow, or a later
+    // verify-at-use read of those slots would trap. `translate_non_i32_store_an`
+    // decomposes them into raw i32 sub-stores routed through the same shadow
+    // path as `i32.store{,8,16}`.
     if environ.tunables().an_encoding && !wasm_val_is_i32 {
         translate_non_i32_store_an(
             builder, environ, memarg, opcode, val, val_ty, flags, wasm_index, base,
@@ -4349,9 +4344,9 @@ fn translate_store(
         .ins()
         .Store(opcode, val_ty, flags, Offset32::new(0), val, base);
 
-    // AN-encoding: mirror the i32 store into the encoded shadow so the
-    // host-boundary cross-check sees `decode(enc_slot) == u32_le(raw_slot)`
-    // across the whole memory. Aligned full stores write the encoded operand
+    // AN-encoding: mirror the i32 store into the encoded shadow so a later
+    // verify-at-use read sees `decode(enc_slot) == u32_le(raw_slot)`.
+    // Aligned full stores write the encoded operand
     // directly; subword and unaligned stores decompose into per-slot byte-RMWs
     // (each computing its own slot index, so cross-slot cases fall out).
     if environ.tunables().an_encoding && wasm_val_is_i32 {
@@ -4487,7 +4482,7 @@ enum NonI32StorePiece {
 /// is purely codegen-level: the wasm operand stack already gave us the
 /// non-i32 value, we just split it into `i32` pieces in IR.
 ///
-/// V128 stores (full + lane variants) are not yet decomposed; under AN they
+/// V128 stores (full + lane variants) are not decomposed; under AN they
 /// surface as `wasm_unsupported!` so a Rust binary that pulls in SIMD will
 /// fail loudly rather than silently corrupt the shadow.
 fn translate_non_i32_store_an(

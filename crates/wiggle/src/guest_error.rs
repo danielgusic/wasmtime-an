@@ -15,6 +15,8 @@ pub enum GuestError {
     PtrNotAligned(Region, u32),
     #[error("Slice length mismatch")]
     SliceLengthsDiffer,
+    #[error("AN-encoding memory mismatch: encoded shadow disagrees with raw memory over the read range")]
+    AnMemoryMismatch,
     #[error("In func {modulename}::{funcname} at {location}: {err}")]
     InFunc {
         modulename: &'static str,

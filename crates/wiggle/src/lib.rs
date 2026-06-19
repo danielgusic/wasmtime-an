@@ -53,6 +53,22 @@ pub struct GuestMemory<'a> {
     /// memory has an AN-encoding shadow allocated, so non-AN embeddings pay
     /// nothing.
     an_track: bool,
+
+    /// AN-encoding read-verify state, present only when this memory has an
+    /// encoded shadow. Lets host *reads* cross-check exactly the byte range
+    /// they touch against the shadow (verify-at-use), without ever scanning
+    /// the whole memory.
+    an_read: Option<AnRead<'a>>,
+}
+
+/// Captured AN-encoding shadow + constant for verifying host reads at range
+/// granularity. See [`GuestMemory::an_cross_check_read`].
+struct AnRead<'a> {
+    /// The encoded shadow buffer (`2 *` the raw size; each 4-byte raw slot
+    /// maps to an 8-byte little-endian `A * u32_le(raw_slot)` shadow slot).
+    shadow: &'a [u8],
+    /// The AN-encoding constant `A`.
+    a: u64,
 }
 
 enum GuestMemoryInner<'a> {
@@ -74,6 +90,7 @@ impl<'a> GuestMemory<'a> {
             inner: GuestMemoryInner::Unshared(mem),
             an_dirty: Vec::new(),
             an_track: false,
+            an_read: None,
         }
     }
 
@@ -86,6 +103,30 @@ impl<'a> GuestMemory<'a> {
             inner: GuestMemoryInner::Unshared(mem),
             an_dirty: Vec::new(),
             an_track: true,
+            an_read: None,
+        }
+    }
+
+    /// Creates an "unshared" guest memory view that both records host write
+    /// ranges (like [`GuestMemory::unshared_an_tracked`]) *and* verifies host
+    /// reads against the AN-encoding `shadow` at range granularity (so a
+    /// raw/shadow divergence over a read range surfaces as
+    /// [`GuestError::AnMemoryMismatch`] without ever scanning the whole
+    /// memory). This is the constructor the wiggle-generated hostcall wrapper
+    /// uses when the memory has an encoded shadow.
+    ///
+    /// `shadow` is the encoded mirror (`2 *` the raw size) and `a` is the
+    /// AN-encoding constant. The memory must not be whole-dirty here: the
+    /// host→wasm entry heal re-encodes any `data_mut`-dirtied memory before
+    /// the guest runs, and the guest cannot mark a memory whole-dirty, so a
+    /// memory reaching a wiggle hostcall always has a shadow consistent with
+    /// raw (modulo bytes this same call writes, tracked in `an_dirty`).
+    pub fn unshared_an_verified(mem: &'a mut [u8], shadow: &'a [u8], a: u64) -> GuestMemory<'a> {
+        GuestMemory {
+            inner: GuestMemoryInner::Unshared(mem),
+            an_dirty: Vec::new(),
+            an_track: true,
+            an_read: Some(AnRead { shadow, a }),
         }
     }
 
@@ -96,6 +137,7 @@ impl<'a> GuestMemory<'a> {
             inner: GuestMemoryInner::Shared(mem),
             an_dirty: Vec::new(),
             an_track: false,
+            an_read: None,
         }
     }
 
@@ -144,6 +186,75 @@ impl<'a> GuestMemory<'a> {
     #[doc(hidden)]
     pub fn an_take_dirty(&mut self) -> Vec<Range<u32>> {
         mem::take(&mut self.an_dirty)
+    }
+
+    /// AN-encoding verify-at-use for a host *read* of `byte_len` bytes at guest
+    /// `offset`: cross-checks exactly the 4-byte slots the range overlaps
+    /// against the captured shadow, returning [`GuestError::AnMemoryMismatch`]
+    /// on a raw/shadow divergence. No-op unless this view was built with
+    /// [`GuestMemory::unshared_an_verified`] (i.e. the memory has a shadow).
+    ///
+    /// Skipped, per 4-byte slot, for any slot the host has already written this
+    /// call (recorded in `an_dirty`): those bytes are host-authored and their
+    /// shadow stays stale until the post-call resync, so checking them against
+    /// the captured shadow would false-trap. The slot-compare mirrors
+    /// `Instance::an_cross_check_range_parts` in the `wasmtime` crate (the
+    /// canonical implementation); keep them in sync.
+    pub(crate) fn an_cross_check_read(&self, offset: u32, byte_len: u32) -> Result<(), GuestError> {
+        let Some(an) = self.an_read.as_ref() else {
+            return Ok(());
+        };
+        if byte_len == 0 {
+            return Ok(());
+        }
+        // Only unshared memories carry a shadow (shared memories are refused
+        // under AN-encoding), so the raw bytes are a plain slice.
+        let raw = match &self.inner {
+            GuestMemoryInner::Unshared(s) => &**s,
+            GuestMemoryInner::Shared(_) => return Ok(()),
+        };
+        let start = offset as usize;
+        let end = start.saturating_add(byte_len as usize).min(raw.len());
+        if start >= end {
+            return Ok(());
+        }
+        let first_slot = start / 4;
+        let last_slot = (end + 3) / 4;
+        for slot in first_slot..last_slot {
+            let raw_off = slot * 4;
+            // Skip slots the host wrote this call (shadow stale until resync).
+            if self.an_slot_overlaps_dirty(raw_off) {
+                continue;
+            }
+            let enc_off = slot * 8;
+            // The shadow is `2 *` the raw size, so this slice is always in
+            // bounds for slots within `raw`; guard defensively rather than
+            // panic if a truncated shadow ever slipped through.
+            let Some(enc_bytes) = an.shadow.get(enc_off..enc_off + 8) else {
+                break;
+            };
+            // Raw word with zero-padded tail (matches the encoder for memories
+            // whose length is not a multiple of 4, e.g. custom page sizes).
+            let mut word = [0u8; 4];
+            let avail = (raw.len() - raw_off).min(4);
+            word[..avail].copy_from_slice(&raw[raw_off..raw_off + avail]);
+            let raw_u32 = u32::from_le_bytes(word);
+            let enc_slot = u64::from_le_bytes(enc_bytes.try_into().unwrap());
+            if enc_slot != an.a.wrapping_mul(u64::from(raw_u32)) {
+                return Err(GuestError::AnMemoryMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the 4-byte slot at raw byte offset `raw_off` overlaps any range
+    /// the host has written this call (recorded in `an_dirty`).
+    fn an_slot_overlaps_dirty(&self, raw_off: usize) -> bool {
+        let slot_start = raw_off as u64;
+        let slot_end = slot_start + 4;
+        self.an_dirty
+            .iter()
+            .any(|r| u64::from(r.start) < slot_end && slot_start < u64::from(r.end))
     }
 
     /// Read a value from the provided pointer.
@@ -225,6 +336,9 @@ impl<'a> GuestMemory<'a> {
     /// not valid to read from.
     pub fn as_slice(&self, ptr: GuestPtr<[u8]>) -> Result<Option<&[u8]>, GuestError> {
         let range = self.validate_range::<u8>(ptr.pointer.0, ptr.pointer.1)?;
+        // Verify-at-use: the host is about to read these bytes, so cross-check
+        // exactly this range against the AN-encoding shadow first.
+        self.an_cross_check_read(ptr.pointer.0, ptr.pointer.1)?;
         match &self.inner {
             GuestMemoryInner::Unshared(slice) => Ok(Some(&slice[range])),
             GuestMemoryInner::Shared(_) => Ok(None),
@@ -265,6 +379,12 @@ impl<'a> GuestMemory<'a> {
         T: GuestTypeTransparent + Copy,
     {
         let guest = self.validate_size_align::<T>(ptr.pointer.0, ptr.pointer.1)?;
+        // Verify-at-use: cross-check exactly the bytes being copied out against
+        // the AN-encoding shadow before the copy.
+        self.an_cross_check_read(
+            ptr.pointer.0,
+            ptr.pointer.1.saturating_mul(T::guest_size()),
+        )?;
         let mut host = Vec::with_capacity(guest.len());
 
         // SAFETY: The `guest_slice` variable is already a valid pointer into

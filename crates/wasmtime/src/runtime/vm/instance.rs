@@ -768,8 +768,8 @@ impl Instance {
         // leaving the freshly mapped tail untouched and lazily zero-backed.
         //
         // It also keeps the encoded shadow as the source of truth: re-encoding
-        // from raw would silently "heal" any raw corruption that the
-        // host-boundary cross-check is supposed to detect.
+        // from raw would silently "heal" any raw corruption that verify-at-use
+        // (the guest load check / host read verify) is supposed to detect.
         if let Some(old_shadow) = self.an_enc_shadows[memory_index].as_deref() {
             let n = old_shadow.len().min(new_shadow.len());
             new_shadow[..n].copy_from_slice(&old_shadow[..n]);
@@ -797,6 +797,14 @@ impl Instance {
     /// (true only when AN-encoding is on and the memory is not shared).
     pub(crate) fn an_has_shadow(&self, memory_index: DefinedMemoryIndex) -> bool {
         self.an_enc_shadows[memory_index].is_some()
+    }
+
+    /// The AN-encoding shadow buffer of one defined memory as an immutable
+    /// slice, or `None` when no shadow is allocated (AN off / shared /
+    /// imported). Used by the component lifting read-verify to cross-check a
+    /// lifted range against the encoded shadow before the bytes reach the host.
+    pub(crate) fn an_shadow_slice(&self, memory_index: DefinedMemoryIndex) -> Option<&[u8]> {
+        self.an_enc_shadows[memory_index].as_deref()
     }
 
     /// Raw `(shadow_base, raw_base, raw_len)` of an *imported* memory's
@@ -846,6 +854,29 @@ impl Instance {
         Self::an_encode_range_parts(shadow, raw_base, raw_len, start, len, a);
     }
 
+    /// Cross-check `[start, start + len)` of an *imported* memory's raw bytes
+    /// against the owning instance's shadow — the read-twin of
+    /// [`Self::an_encode_imported_range_from_raw`]. Returns `true` when every
+    /// touched slot agrees, or when no shadow is allocated (AN off / shared).
+    /// Used by the `memory.copy` source verify-at-use when the source resolves
+    /// to an imported memory.
+    pub(crate) fn an_cross_check_imported_range(
+        &self,
+        index: MemoryIndex,
+        start: usize,
+        len: usize,
+        a: u64,
+    ) -> bool {
+        let Some((shadow_base, raw_base, raw_len)) = self.an_imported_memory_shadow_parts(index)
+        else {
+            return true;
+        };
+        // SAFETY: the owner's shadow is `2 * raw_len` bytes by the layout
+        // invariant and alive for the owner's lifetime; we only read it.
+        let shadow = unsafe { core::slice::from_raw_parts(shadow_base as *const u8, raw_len * 2) };
+        Self::an_cross_check_range_parts(shadow, raw_base, raw_len, start, len, a)
+    }
+
     /// Mark one defined memory's AN-encoding shadow as wholly out-of-sync
     /// with raw memory.
     ///
@@ -879,36 +910,61 @@ impl Instance {
         core::mem::replace(flag, false)
     }
 
-    /// AN-encoding cross-check for a single defined memory.
+    /// Peek (without clearing) whether one defined memory is whole-dirty.
     ///
-    /// Walks the memory slot-by-slot, asserting each 8-byte shadow slot
-    /// equals `A * u32_le(raw[4i..4i+4])` (a single multiply + compare,
-    /// equivalent to checking `shadow_u64 % A == 0 && shadow_u64 / A == raw`
-    /// because `A < 2^23` keeps the product exact in a u64). Returns `false`
-    /// on the first mismatch, `true` if every slot agrees (including any
-    /// tail bytes shorter than a full slot, which are zero-padded on the raw
-    /// side before comparison).
+    /// A whole-dirty memory has had its raw bytes written through an untracked
+    /// host borrow (`Memory::data_mut`) and is pending a full re-encode, so its
+    /// shadow is *legitimately* stale. Host read-side verify-at-use checks
+    /// consult this to skip a memory whose shadow is known-stale (raw is the
+    /// source of truth there) rather than mistaking the staleness for
+    /// corruption. Returns `false` when the memory has no shadow.
+    pub(crate) fn an_is_whole_dirty(&self, memory_index: DefinedMemoryIndex) -> bool {
+        self.an_whole_dirty[memory_index]
+    }
+
+    /// AN-encoding cross-check for a whole defined memory.
     ///
-    /// Skips the check (returning `true`) if the memory has no shadow
-    /// allocated — that happens when AN-encoding is off or the memory is
-    /// shared/imported, both of which the surrounding plumbing guarantees
-    /// before invoking this method.
-    ///
-    /// Used by the `an_check_host_boundary` libcall, which is emitted by
-    /// the wasm-to-host trampoline immediately before a host call. Any
-    /// returned `false` becomes a `Trap::AnMemoryMismatch` at the
-    /// trampoline.
+    /// Asserts every 8-byte shadow slot equals `A * u32_le(raw[4i..4i+4])`.
+    /// Returns `false` on the first mismatch, `true` if all agree or the
+    /// memory has no shadow (AN off / shared / imported). Used by the opaque
+    /// whole-memory host borrows (`Memory::data` / `data_mut`), whose read
+    /// range cannot be known. Thin wrapper over [`Self::an_cross_check_range`]
+    /// (whole memory = the full range) so there is a single slot-compare
+    /// implementation.
     pub(crate) fn an_cross_check_memory(&self, memory_index: DefinedMemoryIndex, a: u64) -> bool {
         // `a == 0` is rejected by the config setter; the surrounding plumbing
         // guarantees a non-zero `a` here.
         debug_assert!(a != 0, "AN constant A=0 reached an_cross_check_memory");
-        // The setter also enforces `a < 2^23`; the mul+compare below relies on
-        // it (`a * raw < 2^55` cannot wrap a u64).
+        // The setter also enforces `a < 2^23`; the mul+compare relies on it
+        // (`a * raw < 2^55` cannot wrap a u64).
         debug_assert!(
             a < (1 << 23),
             "AN constant A >= 2^23 reached an_cross_check_memory"
         );
+        self.an_cross_check_range(memory_index, 0, usize::MAX, a)
+    }
 
+    /// AN-encoding cross-check restricted to the 4-byte slots overlapping
+    /// `[start, start + len)` (clamped to the memory's current length).
+    ///
+    /// Asserts `enc_slot == A * u32_le(raw_slot)` for exactly the slots a host
+    /// is about to read (verify-at-use), instead of sweeping the whole memory.
+    /// `enc_slot == A * raw` is exactly equivalent to
+    /// `enc_slot % A == 0 && enc_slot / A == raw` because `A < 2^23` keeps the
+    /// product below `2^55` (no u64 wrap). Returns `true` when consistent, when
+    /// the memory has no shadow (AN off / shared / imported), or when the range
+    /// is empty / entirely past the end.
+    ///
+    /// Mirrors [`Self::an_encode_range_parts`] for slot selection and tail
+    /// (zero-pad) handling, so the verified slots are exactly those the
+    /// re-encode would have touched.
+    pub(crate) fn an_cross_check_range(
+        &self,
+        memory_index: DefinedMemoryIndex,
+        start: usize,
+        len: usize,
+        a: u64,
+    ) -> bool {
         let mem_def = self.memories[memory_index].1.vmmemory();
         let raw_base: *const u8 = mem_def.base.as_ptr();
         let raw_len = mem_def.current_length();
@@ -917,54 +973,53 @@ impl Instance {
             Some(s) => s,
             None => return true,
         };
-        debug_assert_eq!(
-            shadow.len(),
-            raw_len * usize::try_from(wasmtime_environ::ENC_MEM_GROWTH_FACTOR).unwrap(),
-            "AN-encoding shadow has wrong size during cross-check"
-        );
-
-        Self::an_cross_check_parts(shadow, raw_base, raw_len, a)
+        Self::an_cross_check_range_parts(shadow, raw_base, raw_len, start, len, a)
     }
 
-    /// Cross-check core shared by [`Self::an_cross_check_memory`] and the
-    /// imported-memory path (which addresses the owning instance's shadow
-    /// through raw parts).
-    fn an_cross_check_parts(shadow: &[u8], raw_base: *const u8, raw_len: usize, a: u64) -> bool {
-        // Hot loop: one multiply + compare per slot. `enc_slot == a * raw` is
-        // exactly equivalent to `enc_slot % a == 0 && enc_slot / a == raw`
-        // (any slot value other than `a * raw` is a corruption signature):
-        // `a < 2^23` and `raw < 2^32` bound the product below `2^55`, so the
-        // multiplication cannot wrap a u64 and the comparison is exact.
-        let num_full_slots = raw_len / 4;
-        for (slot, enc_bytes) in shadow[..num_full_slots * 8].chunks_exact(8).enumerate() {
-            // SAFETY: `slot * 4 + 4 <= raw_len`, and `raw_base` points to a
-            // valid `raw_len`-byte allocation for the duration of this call.
-            let raw_u32 =
-                u32::from_le(unsafe { raw_base.add(slot * 4).cast::<u32>().read_unaligned() });
-            let enc_slot = u64::from_le_bytes(enc_bytes.try_into().expect("8 bytes from shadow"));
-            if enc_slot != a * u64::from(raw_u32) {
-                return false;
-            }
+    /// Range cross-check core shared by [`Self::an_cross_check_range`]. Every
+    /// 4-byte slot partially or fully contained in `[start, start + len)`
+    /// (clamped to `raw_len`) is compared against its 8-byte shadow slot.
+    ///
+    /// `pub(crate)` so the component lifting read-verify can reuse the single
+    /// slot-compare implementation against raw + shadow slices it already
+    /// holds (rather than re-deriving the memory index).
+    pub(crate) fn an_cross_check_range_parts(
+        shadow: &[u8],
+        raw_base: *const u8,
+        raw_len: usize,
+        start: usize,
+        len: usize,
+        a: u64,
+    ) -> bool {
+        if len == 0 || start >= raw_len {
+            return true;
         }
+        let end = start.saturating_add(len).min(raw_len);
+        let first_slot = start / 4;
+        let last_slot_exclusive = (end + 3) / 4;
 
-        let tail = raw_len % 4;
-        if tail != 0 {
-            let slot = num_full_slots;
+        for slot in first_slot..last_slot_exclusive {
             let raw_off = slot * 4;
-            let mut bytes = [0u8; 4];
-            // SAFETY: copy `tail < 4` bytes starting at `raw_off`; range
-            // ends at `raw_off + tail = raw_len`.
-            unsafe {
-                ptr::copy_nonoverlapping(raw_base.add(raw_off), bytes.as_mut_ptr(), tail);
-            }
-            let raw_u32 = u32::from_le_bytes(bytes);
+            let raw_u32 = if raw_len - raw_off >= 4 {
+                // SAFETY: `raw_off + 4 <= raw_len`; `raw_base` is valid for
+                // `raw_len` bytes for the duration of this call.
+                u32::from_le(unsafe { raw_base.add(raw_off).cast::<u32>().read_unaligned() })
+            } else {
+                let mut bytes = [0u8; 4];
+                let to_copy = raw_len - raw_off;
+                // SAFETY: `raw_off + to_copy <= raw_len`.
+                unsafe {
+                    ptr::copy_nonoverlapping(raw_base.add(raw_off), bytes.as_mut_ptr(), to_copy);
+                }
+                u32::from_le_bytes(bytes)
+            };
             let enc_off = slot * 8;
             let enc_slot = u64::from_le_bytes(
                 shadow[enc_off..enc_off + 8]
                     .try_into()
                     .expect("8 bytes from shadow"),
             );
-            if enc_slot != a * u64::from(raw_u32) {
+            if enc_slot != a.wrapping_mul(u64::from(raw_u32)) {
                 return false;
             }
         }
@@ -1026,7 +1081,7 @@ impl Instance {
     ///
     /// Skips allocation for shared memories (they cannot be cross-checked
     /// against a private shadow without a per-slot lock; refused at compile
-    /// time in v1) and is a no-op when AN-encoding is disabled.
+    /// time) and is a no-op when AN-encoding is disabled.
     fn set_an_enc_shadows(mut self: Pin<&mut Self>, store: &StoreOpaque) {
         if !store.engine().tunables().an_encoding {
             return;

@@ -76,6 +76,12 @@ macro_rules! integer_primitives {
                 let offset = ptr.offset();
                 let host_ptr = mem.validate_size_align::<Self>(offset, 1)?;
 
+                // Verify-at-use: cross-check this value's bytes against the
+                // AN-encoding shadow before loading them. Every typed read
+                // (floats and guest pointers delegate to their integer
+                // counterparts) funnels through here.
+                mem.an_cross_check_read(offset, Self::guest_size())?;
+
                 // If the accessed memory is shared, we need to load the bytes
                 // with the correct memory consistency. We could check if the
                 // memory is shared each time, but we expect little performance

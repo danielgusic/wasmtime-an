@@ -32,11 +32,14 @@ pub const DEFAULT_AN_CONSTANT: u64 = 65521;
 /// Each 4-byte raw slot becomes one 8-byte encoded slot, hence the factor 2.
 ///
 /// Wasm code stores update both copies in lockstep. Wasm code loads pull from
-/// the shadow only (raw is a passive copy at that point). At host-call
-/// boundaries the wasm runtime cross-checks the two copies slot-by-slot; if
-/// any mismatch is found a fresh `AN_MEMORY_MISMATCH` trap is raised. After
-/// the host call returns the shadow is re-encoded from raw (since the host
-/// may have written raw directly).
+/// the raw buffer and verify it against the shadow at the load site
+/// (verify-at-use): every i32 load asserts `enc_slot == A * u32_le(raw_slot)`
+/// for the touched slot(s), trapping `AN_MEMORY_MISMATCH` on a mismatch. Host
+/// reads cross-check exactly the bytes they touch the same way. Host writes
+/// keep the shadow in sync: range-tracked writes re-encode their exact range
+/// at the write site, while opaque whole-memory borrows (`Memory::data_mut`)
+/// mark the memory dirty and are re-encoded from raw at the next heal
+/// (host-call exit / wasm entry). There is no periodic whole-memory sweep.
 ///
 /// `memory.size` continues to report raw page counts (wasm-visible size).
 /// `memory.grow` grows both. Bounds checks always apply to the raw size; the
@@ -233,21 +236,6 @@ define_tunables! {
         /// ≥ 1 (A=0 would break everything)
         pub an_constant: u64,
 
-        /// AN-encoding opt-in: emit a per-load shadow-validity check.
-        ///
-        /// When `an_encoding` and this tunable are both `true`, every i32
-        /// load family op (`i32.load{,8_u,16_u,8_s,16_s}`) emits an extra
-        /// shadow read of every slot it touches and asserts
-        /// `slot % A == 0 && slot / A == u32_le(raw_slot)`. Any divergence
-        /// raises `Trap::AnMemoryMismatch` *at the load*, immediately,
-        /// rather than waiting for the next host-call cross-check.
-        ///
-        /// Cost: ~3 extra instructions (`udiv`, `iconst`, `icmp`, `trapnz`)
-        /// per touched slot per i32 load. Real-world programs are load-heavy,
-        /// so this can multiply the cost of memory accesses; gate it on a
-        /// per-deployment safety/perf tradeoff. Default `false`.
-        pub an_load_validity_check: bool,
-
         /// AN-encoding test-only fault injection at trampoline boundaries.
         ///
         /// When non-zero AND `an_encoding` is on, the wasm/host trampolines
@@ -358,7 +346,6 @@ impl Tunables {
             gc_heap_may_move: true,
             an_encoding: false,
             an_constant: DEFAULT_AN_CONSTANT,
-            an_load_validity_check: false,
             an_inject_codeword_fault: 0,
             an_inject_conversion_fault: 0,
         }

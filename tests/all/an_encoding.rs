@@ -134,7 +134,7 @@ fn fib_with_an() -> wasmtime::Result<()> {
     fib_check(true)
 }
 
-// WASI roundtrip stress under `an_load_validity_check`. WASI `fd_read`
+// WASI roundtrip stress with the mandatory per-load check. WASI `fd_read`
 // writes raw input bytes into wasm linear memory via `Memory::data_mut`;
 // without the post-host resync libcall the encoded shadow would lag behind
 // raw and the next wasm `i32.load8_u` of those bytes (inside `$parse`)
@@ -145,7 +145,6 @@ fn fib_with_an() -> wasmtime::Result<()> {
 fn run_fib_with_load_check(n: u32) -> wasmtime::Result<String> {
     let mut config = Config::new();
     config.an_encoding(true);
-    config.an_load_validity_check(true);
     let engine = Engine::new(&config)?;
     let module = Module::new(&engine, FIB_WAT)?;
     let mut linker: Linker<wasmtime_wasi::p1::WasiP1Ctx> = Linker::new(&engine);
@@ -1037,36 +1036,28 @@ fn refuse_memory_atomic_notify_under_an() {
 fn instantiate_data_segment_under_an() -> wasmtime::Result<()> {
     // Data-segment init runs `Instance::an_encode_full_memory_from_raw` after
     // raw bytes land, so the shadow must reflect the segment content. Verify
-    // by reading each byte back through a wasm `i32.load8_u`, then triggering
-    // a host-boundary cross-check via a host call. Either path would surface
-    // a divergence: the load (only when `an_load_validity_check` were on) or
-    // the cross-check at the noop call (always-on under AN).
+    // by reading each byte back through a wasm `i32.load8_u`: under AN the
+    // mandatory load-side check asserts the shadow slot matches raw, so a
+    // divergence in the segment's shadow would trap the load.
     let wat = r#"
         (module
-            (import "env" "noop" (func $noop))
             (memory (export "m") 1)
             (data (i32.const 0) "Hello, AN-encoding!")
             (func (export "load_byte") (param $a i32) (result i32)
-                local.get $a i32.load8_u)
-            (func (export "trigger_host")
-                call $noop))
+                local.get $a i32.load8_u))
     "#;
     let mut config = make_config(true);
     config.an_constant(65521);
     let engine = Engine::new(&config)?;
     let module = Module::new(&engine, wat)?;
-    let mut linker = Linker::new(&engine);
-    linker.func_wrap("env", "noop", |_caller: wasmtime::Caller<'_, ()>| {})?;
     let mut store = Store::new(&engine, ());
-    let instance = linker.instantiate(&mut store, &module)?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &module)?;
     let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
-    let trigger = instance.get_typed_func::<(), ()>(&mut store, "trigger_host")?;
     let expected = b"Hello, AN-encoding!";
     for (i, &want) in expected.iter().enumerate() {
         let got = load_byte.call(&mut store, i as i32)? as u8;
         assert_eq!(got, want, "data segment byte {i}");
     }
-    trigger.call(&mut store, ())?;
     Ok(())
 }
 
@@ -1143,6 +1134,32 @@ fn expect_an_mismatch_trap(res: wasmtime::Result<i32>, label: &str) {
     );
 }
 
+/// Assert that a host `Memory::read` of the 4-byte slot at `offset` fails its
+/// verify-at-use cross-check (returns `Err`).
+///
+/// This is the host-side counterpart of `expect_an_mismatch_trap`: under
+/// verify-at-use a raw/shadow divergence is caught when the bytes are *read*,
+/// not at a host-call boundary. `Memory::read` returns `MemoryAccessError`,
+/// whose typed signature cannot carry the `AnMemoryMismatch` trap code, but the
+/// error message is enriched to name the AN mismatch (rather than the generic
+/// "out of bounds" text) so the cause is not mistaken for a bounds error.
+fn expect_host_read_mismatch<T>(
+    mem: &wasmtime::Memory,
+    store: &mut Store<T>,
+    offset: usize,
+    label: &str,
+) {
+    let mut buf = [0u8; 4];
+    let err = mem
+        .read(&*store, offset, &mut buf)
+        .expect_err(&format!("{label}: expected host read verify-at-use failure, got Ok"));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("AN-encoding") && msg.to_lowercase().contains("mismatch"),
+        "{label}: expected an AN mismatch message, got {msg:?}"
+    );
+}
+
 /// Tampers one raw memory byte WITHOUT going through any host-write API,
 /// modeling an external fault (bit flip). `Memory::data_mut` is no longer
 /// suitable for fault injection: it marks the memory whole-dirty, and the
@@ -1166,12 +1183,14 @@ fn tamper_raw_byte(
 
 #[test]
 fn fault_inject_flip_in_raw_traps() -> wasmtime::Result<()> {
-    let (mut store, _instance, memory, f) = fault_injection_setup(65521)?;
+    let (mut store, _instance, memory, _f) = fault_injection_setup(65521)?;
     // The whole memory was zeroed at instantiation and re-encoded into the
     // shadow, so raw[0..4] == 0 and shadow[0..8] == A·0 == 0. Flip a single
-    // bit in raw to introduce a divergence.
+    // bit in raw to introduce a divergence. Verify-at-use: the divergence is
+    // caught when the slot is read (host `Memory::read` of slot 0), not at a
+    // host-call boundary.
     tamper_raw_byte(&memory, &mut store, 3, |b| b ^ 0x80);
-    expect_an_mismatch_trap(f.call(&mut store, ()), "raw bit flip");
+    expect_host_read_mismatch(&memory, &mut store, 0, "raw bit flip");
     Ok(())
 }
 
@@ -1182,13 +1201,138 @@ fn fault_inject_flip_in_shadow_traps() -> wasmtime::Result<()> {
     // The slot is initialized to `A*0 == 0` at setup; flipping any shadow
     // byte makes `enc_slot % A != 0` (or `enc_slot / A != raw_u32`),
     // surfacing as `AnMemoryMismatch` at the next host-call cross-check.
-    let (mut store, _instance, memory, f) = fault_injection_setup(65521)?;
+    let (mut store, _instance, memory, _f) = fault_injection_setup(65521)?;
     let shadow = memory
         .an_shadow_data_mut_for_test(&mut store)
         .expect("shadow allocated under AN");
+    // shadow[8] is shadow slot 1, i.e. raw bytes [4, 8). Reading that slot
+    // surfaces the divergence (host `Memory::read` of offset 4).
     shadow[8] ^= 0x01;
-    expect_an_mismatch_trap(f.call(&mut store, ()), "shadow byte flip");
+    expect_host_read_mismatch(&memory, &mut store, 4, "shadow byte flip");
     Ok(())
+}
+
+#[test]
+#[should_panic(expected = "AnMemoryMismatch")]
+fn data_mut_whole_verify_detects_pre_existing_corruption() {
+    // `Memory::data_mut` hands out an opaque whole-memory mutable borrow and
+    // marks the memory whole-dirty, so the next heal re-encodes the WHOLE
+    // memory from raw — which would launder any pre-existing corruption.
+    // Per verify-at-use the accessor cross-checks the whole memory BEFORE
+    // handing out the borrow. A raw byte tampered via the untracked `data_ptr`
+    // path (not `data_mut`, which would legitimately resync) must make that
+    // pre-borrow check fire. The accessor is infallible (`-> &mut [u8]`), so a
+    // detected mismatch can only panic (see the `Memory::data_mut` TODO about
+    // surfacing `Trap::AnMemoryMismatch`).
+    let (mut store, _instance, memory, _f) = fault_injection_setup(65521).unwrap();
+    tamper_raw_byte(&memory, &mut store, 3, |b| b ^ 0x80);
+    let _ = memory.data_mut(&mut store);
+}
+
+#[test]
+fn try_data_traps_on_tamper() -> wasmtime::Result<()> {
+    // `Memory::try_data` is the fallible twin of `Memory::data`: a pre-existing
+    // raw/shadow divergence must surface as `Err(Trap::AnMemoryMismatch)`
+    // rather than the panic `data` raises.
+    let (mut store, _instance, memory, _f) = fault_injection_setup(65521)?;
+    tamper_raw_byte(&memory, &mut store, 3, |b| b ^ 0x80);
+    let err = memory
+        .try_data(&store)
+        .expect_err("try_data: expected AnMemoryMismatch, got Ok");
+    let trap = err
+        .downcast_ref::<wasmtime::Trap>()
+        .unwrap_or_else(|| panic!("try_data: not a Trap: {err:?}"));
+    assert_eq!(*trap, wasmtime::Trap::AnMemoryMismatch, "try_data: wrong trap");
+    Ok(())
+}
+
+#[test]
+fn try_data_mut_traps_on_tamper() -> wasmtime::Result<()> {
+    // `Memory::try_data_mut` must cross-check BEFORE marking the memory
+    // whole-dirty, so a pre-existing divergence traps instead of being
+    // laundered into the shadow by the next heal.
+    let (mut store, _instance, memory, _f) = fault_injection_setup(65521)?;
+    tamper_raw_byte(&memory, &mut store, 3, |b| b ^ 0x80);
+    let err = memory
+        .try_data_mut(&mut store)
+        .expect_err("try_data_mut: expected AnMemoryMismatch, got Ok");
+    let trap = err
+        .downcast_ref::<wasmtime::Trap>()
+        .unwrap_or_else(|| panic!("try_data_mut: not a Trap: {err:?}"));
+    assert_eq!(
+        *trap,
+        wasmtime::Trap::AnMemoryMismatch,
+        "try_data_mut: wrong trap"
+    );
+    Ok(())
+}
+
+#[test]
+fn try_data_clean_passes() -> wasmtime::Result<()> {
+    // With no tampering the fallible twins return Ok and expose the live bytes.
+    let (mut store, _instance, memory, _f) = fault_injection_setup(65521)?;
+    assert_eq!(memory.try_data(&store)?[0], 0, "clean try_data");
+    assert_eq!(memory.try_data_mut(&mut store)?[0], 0, "clean try_data_mut");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Host-boundary `Global::get` codeword validity.
+//
+// An AN-encoded i32 global stores `A*v` in its 64-bit slot. The guest reads
+// the encoded form directly; the host boundary (`Global::get`) decodes it. A
+// corrupted slot that is not a multiple of `A` is an invalid codeword: `get`
+// panics, `try_get` returns `Trap::AnCodewordInvalid`.
+// ---------------------------------------------------------------------------
+
+const GLOBAL_CODEWORD_A: u64 = 1009;
+
+fn global_codeword_setup() -> wasmtime::Result<(Store<()>, wasmtime::Global)> {
+    use wasmtime::Val;
+    let mut config = Config::new();
+    config.an_encoding(true);
+    config.an_constant(GLOBAL_CODEWORD_A);
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, GLOBAL_EXPORT_WAT)?;
+    let mut store = Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
+    let g = instance.get_global(&mut store, "g").unwrap();
+    g.set(&mut store, Val::I32(42))?; // stores A*42, a valid codeword
+    Ok((store, g))
+}
+
+#[test]
+fn global_try_get_clean_passes() -> wasmtime::Result<()> {
+    let (mut store, g) = global_codeword_setup()?;
+    assert_eq!(g.try_get(&mut store)?.unwrap_i32(), 42, "clean try_get");
+    Ok(())
+}
+
+#[test]
+fn global_try_get_invalid_codeword_traps() -> wasmtime::Result<()> {
+    let (mut store, g) = global_codeword_setup()?;
+    // Corrupt the slot to `A*42 + 1`, which is not a multiple of A.
+    g.an_corrupt_i64_slot_for_test(&mut store, (GLOBAL_CODEWORD_A * 42 + 1) as i64);
+    let err = g
+        .try_get(&mut store)
+        .expect_err("try_get: expected AnCodewordInvalid, got Ok");
+    let trap = err
+        .downcast_ref::<wasmtime::Trap>()
+        .unwrap_or_else(|| panic!("try_get: not a Trap: {err:?}"));
+    assert_eq!(
+        *trap,
+        wasmtime::Trap::AnCodewordInvalid,
+        "try_get: wrong trap"
+    );
+    Ok(())
+}
+
+#[test]
+#[should_panic(expected = "AnCodewordInvalid")]
+fn global_get_panics_on_invalid_codeword() {
+    let (mut store, g) = global_codeword_setup().unwrap();
+    g.an_corrupt_i64_slot_for_test(&mut store, (GLOBAL_CODEWORD_A * 42 + 1) as i64);
+    let _ = g.get(&mut store);
 }
 
 #[test]
@@ -1197,12 +1341,9 @@ fn fault_inject_various_an_constants() -> wasmtime::Result<()> {
     // confirm both the decode (slot / A) and the modular check (slot % A)
     // produce a trap consistently.
     for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
-        let (mut store, _instance, memory, f) = fault_injection_setup(a)?;
+        let (mut store, _instance, memory, _f) = fault_injection_setup(a)?;
         tamper_raw_byte(&memory, &mut store, 16, |_| 0x55);
-        expect_an_mismatch_trap(
-            f.call(&mut store, ()),
-            &format!("raw poke with A={a}"),
-        );
+        expect_host_read_mismatch(&memory, &mut store, 16, &format!("raw poke with A={a}"));
     }
     Ok(())
 }
@@ -1265,14 +1406,15 @@ fn grow_setup(
 // would absorb the corruption and the cross-check would (wrongly) pass.
 #[test]
 fn grow_does_not_resync_shadow_from_raw() -> wasmtime::Result<()> {
-    let (mut store, memory, grow, _st, _ld, f) = grow_setup(65521)?;
+    let (mut store, memory, grow, _st, ld, _f) = grow_setup(65521)?;
     // raw[0..4] == 0 and shadow[0..8] == A*0 == 0 after instantiation. Flip a
     // raw bit (untracked, modeling a fault) so raw and shadow disagree.
     tamper_raw_byte(&memory, &mut store, 3, |b| b ^ 0x80);
     // Grow a page. The divergence must survive (shadow copied forward, not
-    // re-encoded from the corrupted raw).
+    // re-encoded from the corrupted raw). Verify-at-use: a guest `i32.load` of
+    // slot 0 surfaces it via the mandatory load-side check.
     grow.call(&mut store, 1)?;
-    expect_an_mismatch_trap(f.call(&mut store, ()), "raw corruption survives grow");
+    expect_an_mismatch_trap(ld.call(&mut store, 0), "raw corruption survives grow");
     Ok(())
 }
 
@@ -1281,23 +1423,24 @@ fn grow_does_not_resync_shadow_from_raw() -> wasmtime::Result<()> {
 // passes) after each grow.
 #[test]
 fn grow_preserves_shadow_across_repeated_grows() -> wasmtime::Result<()> {
-    let (mut store, _memory, grow, st, ld, f) = grow_setup(65521)?;
+    let (mut store, _memory, grow, st, ld, _f) = grow_setup(65521)?;
     // Sentinel in the last full slot of page 0.
     let sentinel = 0x1234_5678u32 as i32;
     st.call(&mut store, (65532, sentinel))?;
-    f.call(&mut store, ())?; // shadow consistent before growing
+    // The `ld` read-backs below verify shadow/raw consistency at the sentinel
+    // slot via the mandatory load-side check (no host-boundary cross-check any
+    // more). A divergence introduced by a grow would trap the load.
+    ld.call(&mut store, 65532)?; // shadow consistent before growing
     for delta in [1, 7, 64] {
         let prev_pages = grow.call(&mut store, delta)?;
         assert!(prev_pages > 0, "grow({delta}) should succeed");
-        // Old data preserved through the grow.
+        // Old data preserved through the grow (and the load verifies the slot's
+        // shadow still matches raw after copy-forward).
         assert_eq!(
             ld.call(&mut store, 65532)?,
             sentinel,
             "sentinel lost after grow({delta})"
         );
-        // Cross-check: the whole (grown) shadow still agrees with raw, i.e. the
-        // copy-forward left it consistent and the new pages encode as zero.
-        f.call(&mut store, ())?;
     }
     Ok(())
 }
@@ -1557,25 +1700,53 @@ fn bulk_memory_copy_keeps_shadow_consistent() -> wasmtime::Result<()> {
 }
 
 #[test]
+fn memory_copy_source_tamper_traps() -> wasmtime::Result<()> {
+    // `memory.copy` reads its SOURCE range out of guest memory. Under
+    // verify-at-use that read must be cross-checked against the encoded shadow
+    // *before* the bytes are copied (and before the destination shadow is
+    // re-encoded from them). Otherwise a raw/shadow divergence in the source is
+    // (a) copied to the destination and (b) laundered into a valid destination
+    // codeword by the post-copy re-encode, so no later load-side check can ever
+    // catch it.
+    let (mut store, instance) = bulk_setup(65521)?;
+    let fill = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "fill")?;
+    let copy = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "copy")?;
+    let memory = instance
+        .get_memory(&mut store, "m")
+        .expect("memory export missing");
+
+    // Establish a consistent source region: raw[16..24] = 0x11, shadow in sync.
+    fill.call(&mut store, (16, 0x11, 8))?;
+
+    // Fault: flip a byte in the source region via the untracked `data_ptr`
+    // path (NOT `data_mut`, which would legitimately resync). raw[18] now
+    // disagrees with shadow slot 4 (bytes [16,20)).
+    tamper_raw_byte(&memory, &mut store, 18, |b| b ^ 0x40);
+
+    // Copy the tampered source to a disjoint destination. The source
+    // cross-check must trap before the copy happens.
+    let res = copy.call(&mut store, (64, 16, 8)).map(|()| 0);
+    expect_an_mismatch_trap(res, "memory.copy tampered source");
+    Ok(())
+}
+
+#[test]
 fn active_data_segment_keeps_shadow_consistent() -> wasmtime::Result<()> {
     // Active data segment in `BULK_WAT` places "DATAseg" at addr 200, laid
     // down at instantiation. Verify the bytes round-trip through wasm-side
     // loads, and that the segment's shadow agrees with raw at the host
     // boundary.
     let (mut store, instance) = bulk_setup(65521)?;
-    let fill = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "fill")?;
     let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
 
+    // Each `load_byte` runs the mandatory load-side check, so reading the
+    // segment back verifies its shadow matches raw — a divergence would trap
+    // the load.
     let expected = b"DATAseg";
     for (i, &want) in expected.iter().enumerate() {
         let got = load_byte.call(&mut store, 200 + i as i32)? as u8;
         assert_eq!(got, want, "active data segment byte {i}");
     }
-    // `load_byte` makes no host call, so drive the cross-check explicitly with
-    // a `fill` of a scratch region disjoint from the segment. Its trailing
-    // `call $noop` cross-checks the whole memory — including addr 200 — so a
-    // divergence in the segment's shadow would trap here.
-    fill.call(&mut store, (16, 0x00, 4))?;
     Ok(())
 }
 
@@ -1830,9 +2001,9 @@ fn table_init_under_an() -> wasmtime::Result<()> {
 
 #[test]
 fn fault_inject_clean_run_passes() -> wasmtime::Result<()> {
-    // Sanity counterpart: without any tampering the host-call boundary
-    // cross-check must NOT trap. Distinguishes "any host call traps under
-    // AN" from "host call traps only on real divergence".
+    // Sanity counterpart: a clean AN program that makes a host call must run
+    // without any spurious trap and return 0. Distinguishes "AN traps on every
+    // host call" from "AN traps only on a real divergence (caught on read)".
     let (mut store, _instance, _memory, f) = fault_injection_setup(65521)?;
     let r = f.call(&mut store, ())?;
     assert_eq!(r, 0, "wasm returned non-zero from a clean run");
@@ -1915,12 +2086,13 @@ fn multi_memory_tamper_mem0_traps() -> wasmtime::Result<()> {
     // The host-call cross-check iterates all defined memories and must
     // report the mismatch.
     let (mut store, instance) = multi_memory_setup(65521)?;
-    let trigger = instance.get_typed_func::<(), i32>(&mut store, "trigger_host")?;
     let m0 = instance
         .get_memory(&mut store, "m0")
         .expect("memory m0 export missing");
     tamper_raw_byte(&m0, &mut store, 3, |b| b ^ 0x80);
-    expect_an_mismatch_trap(trigger.call(&mut store, ()), "m0 raw bit flip");
+    // Verify-at-use: a host read of the tampered slot in m0 detects the
+    // divergence (each defined memory is verified independently on read).
+    expect_host_read_mismatch(&m0, &mut store, 0, "m0 raw bit flip");
     Ok(())
 }
 
@@ -1930,26 +2102,27 @@ fn multi_memory_tamper_mem1_traps() -> wasmtime::Result<()> {
     // Confirms the cross-check loop visits every defined memory, not just
     // index 0.
     let (mut store, instance) = multi_memory_setup(65521)?;
-    let trigger = instance.get_typed_func::<(), i32>(&mut store, "trigger_host")?;
     let m1 = instance
         .get_memory(&mut store, "m1")
         .expect("memory m1 export missing");
+    // Tamper byte 7 of m1 (shadow slot 1 = raw bytes [4, 8)); read offset 4.
     tamper_raw_byte(&m1, &mut store, 7, |_| 0x42);
-    expect_an_mismatch_trap(trigger.call(&mut store, ()), "m1 raw bit flip");
+    expect_host_read_mismatch(&m1, &mut store, 4, "m1 raw bit flip");
     Ok(())
 }
 
-// Opt-in per-load shadow-validity check. When
-// `Config::an_load_validity_check(true)` is set on top of `an_encoding(true)`,
-// every i32 load emits an inline assertion that the encoded shadow slot(s) it
-// touches still satisfy `slot % A == 0 && slot / A == u32_le(raw_slot)`.
+// Mandatory per-load shadow-validity check. Under `an_encoding(true)` every
+// i32 load emits an inline assertion that the encoded shadow slot(s) it
+// touches still satisfy `slot % A == 0 && slot / A == u32_le(raw_slot)`. This
+// is the guest-read half of verify-at-use; there is no whole-memory
+// host-boundary cross-check behind it, so the load is where guest-side
+// corruption surfaces.
 //
-// We exercise the flag through the same `Memory::data_mut` poke trick used by
-// the host-boundary fault-injection tests, but with one difference:
-//   - In the host-boundary tests the trap fires on the *next host call* (the
-//     wasm-to-array trampoline runs the cross-check).
-//   - With the load-side check enabled, the trap must fire on the *next i32
-//     load* of a tampered slot, BEFORE the host call ever runs.
+// Genuine corruption is injected with `tamper_raw_byte` (an UNTRACKED
+// `data_ptr` write): `Memory::data_mut` is unsuitable because it marks the
+// memory whole-dirty and the shadow is re-encoded from raw before the guest
+// runs (see `data_mut_between_calls_resynced_before_guest_load`), so a
+// `data_mut` write is treated as legitimate and never traps.
 
 const LOAD_CHECK_WAT: &str = r#"
     (module
@@ -1968,11 +2141,9 @@ const LOAD_CHECK_WAT: &str = r#"
 
 fn load_check_setup(
     a: u64,
-    validity_check: bool,
 ) -> wasmtime::Result<(Store<()>, wasmtime::Instance, wasmtime::Memory)> {
     let mut config = make_config(true);
     config.an_constant(a);
-    config.an_load_validity_check(validity_check);
     let engine = Engine::new(&config)?;
     let module = Module::new(&engine, LOAD_CHECK_WAT)?;
     let mut linker = Linker::new(&engine);
@@ -1986,18 +2157,25 @@ fn load_check_setup(
 }
 
 #[test]
-fn load_validity_check_default_off() -> wasmtime::Result<()> {
-    // With AN on but the sub-tunable off, the load path does NOT consult the
-    // shadow. Tampering raw between wasm calls is invisible to wasm loads
-    // (the next host call still traps via the host-boundary cross-check,
-    // but a load by itself does not). This documents the default behavior.
-    let (mut store, instance, mem) = load_check_setup(65521, false)?;
+fn data_mut_between_calls_resynced_before_guest_load() -> wasmtime::Result<()> {
+    // A *legitimate* host write via `Memory::data_mut` performed BETWEEN
+    // top-level calls (outside any host call) marks the memory whole-dirty.
+    // Under mandatory verify-at-use the guest's inline load-check reads the
+    // shadow as source-of-truth, so the whole-dirty memory MUST be re-encoded
+    // from raw before any guest code runs — otherwise the first `i32.load` of
+    // the written region sees a stale shadow and false-traps with
+    // AnMemoryMismatch.
+    //
+    // The heal happens at the host->wasm entry (`an_heal_whole_dirty` in
+    // `invoke_wasm_and_catch_traps`). Without that heal this test traps;
+    // with it the guest observes the written value.
+    let (mut store, instance, mem) = load_check_setup(65521)?;
     let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
-    mem.data_mut(&mut store)[8] = 0x42;
-    // Load without an intervening host call returns the tampered raw byte
-    // without raising AnMemoryMismatch (default-off path). Non-zero address so
-    // a missing address decode can't pass on `A*0 == 0`.
-    let v = load.call(&mut store, 8)?;
+    // Non-zero address so a missing address decode can't pass on `A*0 == 0`.
+    mem.data_mut(&mut store)[8..12].copy_from_slice(&0x42u32.to_le_bytes());
+    let v = load
+        .call(&mut store, 8)
+        .expect("legitimate data_mut write must not false-trap the guest load");
     assert_eq!(v as u32, 0x42);
     Ok(())
 }
@@ -2011,7 +2189,6 @@ fn load_validity_check_clean_run_passes() -> wasmtime::Result<()> {
     // store path and then read back through the validity-checked load path.
     let mut config = make_config(true);
     config.an_constant(65521);
-    config.an_load_validity_check(true);
     let engine = Engine::new(&config)?;
     let module = Module::new(&engine, UNALIGNED_WAT)?;
     let mut linker = Linker::new(&engine);
@@ -2032,10 +2209,10 @@ fn load_validity_check_traps_on_raw_tamper() -> wasmtime::Result<()> {
     // Raw tamper between host call and the next i32 load: with the validity
     // check on the load must raise AnMemoryMismatch immediately, no host
     // call in between needed.
-    let (mut store, instance, mem) = load_check_setup(65521, true)?;
+    let (mut store, instance, mem) = load_check_setup(65521)?;
     let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
     // Non-zero load address so a missing address decode can't pass on `A*0 == 0`.
-    mem.data_mut(&mut store)[11] = 0x80;
+    tamper_raw_byte(&mem, &mut store, 11, |_| 0x80);
     let res = load.call(&mut store, 8);
     expect_an_mismatch_trap(res, "raw tamper + i32.load");
     Ok(())
@@ -2045,11 +2222,11 @@ fn load_validity_check_traps_on_raw_tamper() -> wasmtime::Result<()> {
 fn load_validity_check_traps_on_load8u() -> wasmtime::Result<()> {
     // load8_u touches a single shadow slot. Tampering a byte inside that
     // slot must surface at the load.
-    let (mut store, instance, mem) = load_check_setup(65521, true)?;
+    let (mut store, instance, mem) = load_check_setup(65521)?;
     let load8 = instance.get_typed_func::<i32, i32>(&mut store, "load_i32_8u")?;
     // Tamper a different byte (10) in the same slot as the non-zero loaded
     // address (8); the slot-level check still surfaces it.
-    mem.data_mut(&mut store)[10] ^= 0x55;
+    tamper_raw_byte(&mem, &mut store, 10, |b| b ^ 0x55);
     let res = load8.call(&mut store, 8);
     expect_an_mismatch_trap(res, "raw tamper + i32.load8_u");
     Ok(())
@@ -2060,9 +2237,9 @@ fn load_validity_check_traps_on_load16u_cross_slot() -> wasmtime::Result<()> {
     // load16_u at byte offset 3 spans two shadow slots. Tampering at byte 4
     // (the second slot) must still surface at the load — confirming the
     // check fires on both touched slots.
-    let (mut store, instance, mem) = load_check_setup(65521, true)?;
+    let (mut store, instance, mem) = load_check_setup(65521)?;
     let load16 = instance.get_typed_func::<i32, i32>(&mut store, "load_i32_16u")?;
-    mem.data_mut(&mut store)[4] = 0xCD;
+    tamper_raw_byte(&mem, &mut store, 4, |_| 0xCD);
     let res = load16.call(&mut store, 3);
     expect_an_mismatch_trap(res, "raw tamper + cross-slot i32.load16_u");
     Ok(())
@@ -2072,11 +2249,11 @@ fn load_validity_check_traps_on_load16u_cross_slot() -> wasmtime::Result<()> {
 fn load_validity_check_traps_unaligned_i32_load() -> wasmtime::Result<()> {
     // Unaligned i32.load (byte_pos != 0) spans two shadow slots. Tampering
     // either slot must surface.
-    let (mut store, instance, mem) = load_check_setup(65521, true)?;
+    let (mut store, instance, mem) = load_check_setup(65521)?;
     let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
     // Load at byte offset 1: touches slot 0 (bytes 1..4) and slot 1 (byte 4).
     // Flip a bit in slot 1's raw byte 5 — only the second slot diverges.
-    mem.data_mut(&mut store)[5] ^= 0x80;
+    tamper_raw_byte(&mem, &mut store, 5, |b| b ^ 0x80);
     let res = load.call(&mut store, 1);
     expect_an_mismatch_trap(res, "unaligned i32.load second-slot tamper");
     Ok(())
@@ -2087,29 +2264,15 @@ fn load_validity_check_various_an_constants() -> wasmtime::Result<()> {
     // The shadow encoding parameterized on A, so re-run a single trap test
     // across a few values to confirm the codegen reads A from tunables.
     for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
-        let (mut store, instance, mem) = load_check_setup(a, true)?;
+        let (mut store, instance, mem) = load_check_setup(a)?;
         let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
-        mem.data_mut(&mut store)[8] = 0x55;
+        tamper_raw_byte(&mem, &mut store, 8, |_| 0x55);
         let res = load.call(&mut store, 8);
         expect_an_mismatch_trap(res, &format!("validity check with A={a}"));
     }
     Ok(())
 }
 
-#[test]
-fn multi_memory_clean_run_passes() -> wasmtime::Result<()> {
-    // Sanity counterpart: clean stores into both memories followed by a
-    // host call must not trap.
-    let (mut store, instance) = multi_memory_setup(65521)?;
-    let store_m0 = instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_m0")?;
-    let store_m1 = instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_m1")?;
-    let trigger = instance.get_typed_func::<(), i32>(&mut store, "trigger_host")?;
-
-    store_m0.call(&mut store, (32, 0xAAAA_BBBBu32 as i32))?;
-    store_m1.call(&mut store, (48, 0xCCCC_DDDDu32 as i32))?;
-    assert_eq!(trigger.call(&mut store, ())?, 0);
-    Ok(())
-}
 
 // AN-encoding paths through component-model trampolines.
 //
@@ -2476,6 +2639,169 @@ mod component_an {
     #[test]
     fn resource_new_drop_with_an() -> wasmtime::Result<()> {
         resource_check(true)
+    }
+
+    // Component LIFTING (reading a value OUT of guest core memory into the
+    // host) must cross-check the read range against the encoded shadow under
+    // verify-at-use, exactly like `Memory::read`/`Memory::data`. Here a guest
+    // `start` writes the string "hello" at offset 16 of the (separately
+    // instantiated, then imported) core memory, mirrored into the shadow.
+    // `go` calls the host import `sink(string)`, whose canonical-ABI lowering
+    // LIFTS [16,5) out of core memory to hand the host a `String`. A raw byte
+    // tampered via the untracked `data_ptr` path must be caught when those
+    // bytes are lifted.
+    const LIFT_TAMPER_COMPONENT_WAT: &str = r#"
+        (component
+            (import "sink" (func $sink (param "s" string)))
+            (core module $libc (memory (export "memory") 1))
+            (core instance $libc (instantiate $libc))
+            (core func $sink_lowered
+                (canon lower (func $sink) string-encoding=utf8 (memory $libc "memory")))
+            (core module $m
+                (import "" "sink" (func $sink (param i32 i32)))
+                (import "" "memory" (memory 1))
+                (func $init
+                    (i32.store8 (i32.const 16) (i32.const 104))  ;; 'h'
+                    (i32.store8 (i32.const 17) (i32.const 101))  ;; 'e'
+                    (i32.store8 (i32.const 18) (i32.const 108))  ;; 'l'
+                    (i32.store8 (i32.const 19) (i32.const 108))  ;; 'l'
+                    (i32.store8 (i32.const 20) (i32.const 111)))  ;; 'o'
+                (start $init)
+                (func (export "go")
+                    (call $sink (i32.const 16) (i32.const 5))))
+            (core instance $m (instantiate $m
+                (with "" (instance
+                    (export "sink" (func $sink_lowered))
+                    (export "memory" (memory $libc "memory"))))))
+            (func (export "go") (canon lift (core func $m "go"))))
+    "#;
+
+    #[test]
+    fn component_lift_clean_run_passes() -> wasmtime::Result<()> {
+        // Baseline: with no tampering the host sink must receive the lifted
+        // "hello" and the cross-check must not false-positive.
+        let engine = make_engine(true)?;
+        let component = Component::new(&engine, LIFT_TAMPER_COMPONENT_WAT)?;
+        let mut linker = Linker::new(&engine);
+        linker.root().func_wrap("sink", |_store, (s,): (String,)| {
+            assert_eq!(s, "hello");
+            Ok(())
+        })?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component)?;
+        let go = instance.get_typed_func::<(), ()>(&mut store, "go")?;
+        go.call(&mut store, ())?;
+        Ok(())
+    }
+
+    #[test]
+    fn component_lift_tamper_traps() -> wasmtime::Result<()> {
+        let engine = make_engine(true)?;
+        let component = Component::new(&engine, LIFT_TAMPER_COMPONENT_WAT)?;
+        let mut linker = Linker::new(&engine);
+        linker
+            .root()
+            .func_wrap("sink", |_store, (_s,): (String,)| Ok(()))?;
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component)?;
+
+        // `start` wrote "hello" at offset 16 and mirrored it into the shadow.
+        // Flip a raw byte via the untracked `data_ptr` path so raw[18] diverges
+        // from the shadow without marking the memory whole-dirty.
+        let memory = instance
+            .an_core_memory_for_test(&mut store, 0)
+            .expect("core memory identity under AN");
+        super::tamper_raw_byte(&memory, &mut store, 18, |b| b ^ 0x40);
+
+        // `go` calls `sink(string)`, lifting [16,5) out of the tampered core
+        // memory. The lift cross-check must trap.
+        let go = instance.get_typed_func::<(), ()>(&mut store, "go")?;
+        let res = go.call(&mut store, ()).map(|()| 0);
+        super::expect_an_mismatch_trap(res, "component lift tampered string");
+        Ok(())
+    }
+
+    // A component that returns a `list<u32>` of the 16 bytes 0x00..0x0f lifted
+    // out of its core memory (the canonical return-area pattern: the core func
+    // stores [ptr=8, len=4] at address 100 and returns 100).
+    const LIST_RET_COMPONENT_WAT: &str = r#"
+        (component
+            (core module $m
+                (memory (export "memory") 1)
+                (func (export "list32") (result i32)
+                    (i32.store offset=0 (i32.const 100) (i32.const 8))
+                    (i32.store offset=4 (i32.const 100) (i32.const 4))
+                    i32.const 100)
+                (data (i32.const 8) "\00\01\02\03\04\05\06\07\08\09\0a\0b\0c\0d\0e\0f"))
+            (core instance $i (instantiate $m))
+            (func (export "list-u32") (result (list u32))
+                (canon lift (core func $i "list32") (memory $i "memory"))))
+    "#;
+
+    fn lifted_list_u32(
+        store: &mut Store<()>,
+        instance: &wasmtime::component::Instance,
+    ) -> wasmtime::Result<wasmtime::component::WasmList<u32>> {
+        use wasmtime::component::WasmList;
+        Ok(instance
+            .get_typed_func::<(), (WasmList<u32>,)>(&mut *store, "list-u32")?
+            .call(&mut *store, ())?
+            .0)
+    }
+
+    #[test]
+    fn try_as_le_slice_clean_and_tamper() -> wasmtime::Result<()> {
+        let engine = make_engine(true)?;
+        let component = Component::new(&engine, LIST_RET_COMPONENT_WAT)?;
+        let mut store = Store::new(&engine, ());
+        let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+        let list = lifted_list_u32(&mut store, &instance)?;
+
+        // Clean: the fallible twin returns the lifted slice verbatim.
+        assert_eq!(
+            list.try_as_le_slice(&store)?,
+            [
+                u32::to_le(0x03_02_01_00),
+                u32::to_le(0x07_06_05_04),
+                u32::to_le(0x0b_0a_09_08),
+                u32::to_le(0x0f_0e_0d_0c),
+            ]
+        );
+
+        // Tamper a raw byte inside the list's data range [8, 24) via the
+        // untracked `data_ptr` path, diverging raw from the encoded shadow.
+        let memory = instance
+            .an_core_memory_for_test(&mut store, 0)
+            .expect("core memory identity under AN");
+        super::tamper_raw_byte(&memory, &mut store, 10, |b| b ^ 0x40);
+
+        // The fallible twin surfaces the mismatch as a trap-carrying error
+        // instead of panicking like `as_le_slice`.
+        let err = list
+            .try_as_le_slice(&store)
+            .expect_err("try_as_le_slice: expected AnMemoryMismatch, got Ok");
+        let trap = err
+            .downcast_ref::<wasmtime::Trap>()
+            .unwrap_or_else(|| panic!("try_as_le_slice: not a Trap: {err:?}"));
+        assert_eq!(*trap, wasmtime::Trap::AnMemoryMismatch);
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(expected = "AnMemoryMismatch")]
+    fn as_le_slice_panics_on_tamper() {
+        let engine = make_engine(true).unwrap();
+        let component = Component::new(&engine, LIST_RET_COMPONENT_WAT).unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = Linker::new(&engine)
+            .instantiate(&mut store, &component)
+            .unwrap();
+        let list = lifted_list_u32(&mut store, &instance).unwrap();
+        let memory = instance
+            .an_core_memory_for_test(&mut store, 0)
+            .expect("core memory identity under AN");
+        super::tamper_raw_byte(&memory, &mut store, 10, |b| b ^ 0x40);
+        let _ = list.as_le_slice(&store);
     }
 }
 
@@ -3379,7 +3705,7 @@ mod int_conversions {
 // to leave the shadow stale (→ `AnMemoryMismatch` at the next boundary);
 // with the immediate range re-encode it is now a legitimate host write.
 mod dirty_resync {
-    use super::{expect_an_mismatch_trap, make_config};
+    use super::{expect_host_read_mismatch, make_config};
     use wasmtime::{AsContextMut, Caller, Engine, Extern, Linker, Module, Store};
 
     const TWO_CALLS_WAT: &str = r#"
@@ -3431,13 +3757,14 @@ mod dirty_resync {
         }
     }
 
-    /// A raw/shadow divergence introduced *during* a host call (here: a
-    /// shadow byte flip via the test accessor) must trap at the *next*
-    /// host-call boundary. The old unconditional full resync re-encoded the
-    /// shadow from raw right after the host returned, silently erasing the
-    /// divergence — the heal-window this test pins shut.
+    /// A shadow/raw divergence introduced *during* a host call (here: a shadow
+    /// byte flip via the test accessor) is not silently healed — under
+    /// verify-at-use it is caught when the affected slot is next read. The old
+    /// unconditional full resync re-encoded the shadow from raw right after the
+    /// host returned, erasing the divergence; the dirty-driven resync only
+    /// touches `data_mut`-marked memories, so an untracked shadow flip survives.
     #[test]
-    fn shadow_tamper_during_hostcall_traps_at_next_boundary() -> wasmtime::Result<()> {
+    fn shadow_tamper_during_hostcall_detected_on_read() -> wasmtime::Result<()> {
         let (mut store, instance) = setup(65521, TWO_CALLS_WAT, false, |caller| {
             let m = get_mem(caller, "m");
             let shadow = m
@@ -3446,7 +3773,11 @@ mod dirty_resync {
             shadow[8] ^= 0x01;
         })?;
         let f = instance.get_typed_func::<(), i32>(&mut store, "f")?;
-        expect_an_mismatch_trap(f.call(&mut store, ()), "shadow tamper mid-hostcall");
+        // No host-boundary cross-check any more, so the call returns normally;
+        // the divergence (shadow[8] = raw bytes [4, 8)) surfaces on read.
+        f.call(&mut store, ())?;
+        let m = instance.get_memory(&mut store, "m").expect("memory export");
+        expect_host_read_mismatch(&m, &mut store, 4, "shadow tamper mid-hostcall");
         Ok(())
     }
 
@@ -3470,7 +3801,11 @@ mod dirty_resync {
                 .expect("in-bounds write");
         })?;
         let f = instance.get_typed_func::<(), i32>(&mut store, "f")?;
-        expect_an_mismatch_trap(f.call(&mut store, ()), "tamper outside written range");
+        f.call(&mut store, ())?;
+        // `Memory::write` re-encoded only its range [64, 68); the shadow tamper
+        // at raw [512, 516) survives and is caught on read.
+        let m = instance.get_memory(&mut store, "m").expect("memory export");
+        expect_host_read_mismatch(&m, &mut store, 512, "tamper outside written range");
         Ok(())
     }
 
@@ -3572,7 +3907,12 @@ mod dirty_resync {
             shadow1[16] ^= 0x01;
         })?;
         let f = instance.get_typed_func::<(), i32>(&mut store, "f")?;
-        expect_an_mismatch_trap(f.call(&mut store, ()), "m1 tamper, m0 dirty");
+        f.call(&mut store, ())?;
+        // m0 was whole-dirtied by `data_mut` and re-encoded by its own resync;
+        // m1's shadow tamper (shadow[16] = raw bytes [8, 12)) is on a different
+        // memory, untracked, and survives — caught on read of m1.
+        let m1 = instance.get_memory(&mut store, "m1").expect("m1 export");
+        expect_host_read_mismatch(&m1, &mut store, 8, "m1 tamper, m0 dirty");
         Ok(())
     }
 
@@ -3589,8 +3929,12 @@ mod dirty_resync {
                 shadow[8] ^= 0x01;
             })?;
             let f = instance.get_typed_func::<(), i32>(&mut store, "f")?;
-            expect_an_mismatch_trap(
-                f.call(&mut store, ()),
+            f.call(&mut store, ())?;
+            let m = instance.get_memory(&mut store, "m").expect("memory export");
+            expect_host_read_mismatch(
+                &m,
+                &mut store,
+                4,
                 &format!("shadow tamper mid-hostcall, A={a}"),
             );
 
@@ -3668,28 +4012,29 @@ fn grow_then_store_same_function_reloads_shadow_base() -> wasmtime::Result<()> {
 
 // Regression: the embedder-facing `Memory::grow` bypassed the shadow grow
 // (only the wasm `memory.grow` libcall performed it), leaving a raw/shadow
-// size mismatch that panicked the next boundary cross-check.
+// size mismatch. The `ld` read-back of a grown page exercises the load-side
+// check against the grown shadow.
 #[test]
 fn host_memory_grow_keeps_shadow() -> wasmtime::Result<()> {
-    let (mut store, memory, _grow, st, ld, f) = grow_setup(65521)?;
+    let (mut store, memory, _grow, st, ld, _f) = grow_setup(65521)?;
     memory.grow(&mut store, 3)?;
     st.call(&mut store, (70_000, 0x5566_7788u32 as i32))?; // lands in a grown page
     assert_eq!(ld.call(&mut store, 70_000)? as u32, 0x5566_7788);
-    f.call(&mut store, ())?; // boundary cross-check passes
     Ok(())
 }
 
 // A host write through `Memory::data_mut` *outside* any host call is a
-// legitimate untracked write: the next boundary consumes the whole-dirty
-// flag and resyncs before comparing, instead of falsely trapping with
-// `AnMemoryMismatch` (the check used to run without consulting the flag).
+// legitimate untracked write: it marks the memory whole-dirty, and the
+// wasm-entry heal re-encodes it from raw before guest code runs, so the
+// guest load reads the written value instead of false-trapping with
+// `AnMemoryMismatch` on a stale shadow.
 #[test]
 fn data_mut_outside_hostcall_does_not_trap() -> wasmtime::Result<()> {
-    let (mut store, memory, _grow, _st, ld, f) = grow_setup(65521)?;
+    let (mut store, memory, _grow, _st, ld, _f) = grow_setup(65521)?;
     memory.data_mut(&mut store)[40] = 7;
-    f.call(&mut store, ())?; // resync-from-dirty, then check — no trap
+    // `ld.call` enters wasm; the entry heal resyncs the whole-dirty memory
+    // first, so the load sees the written byte and the load-side check passes.
     assert_eq!(ld.call(&mut store, 40)? & 0xff, 7);
-    f.call(&mut store, ())?;
     Ok(())
 }
 
@@ -3724,11 +4069,11 @@ fn memory64_mixed_copy_len_decodes() -> wasmtime::Result<()> {
     let fill32 = instance.get_typed_func::<(i32, i32), ()>(&mut store, "fill32")?;
     let copy = instance.get_typed_func::<(i64, i32, i32), ()>(&mut store, "copy_to_64")?;
     let load64 = instance.get_typed_func::<i64, i32>(&mut store, "load64")?;
-    let trigger = instance.get_typed_func::<(), ()>(&mut store, "trigger")?;
     fill32.call(&mut store, (0, 0xAABB_CCDDu32 as i32))?;
     copy.call(&mut store, (8, 0, 4))?;
+    // The `load64` read-back verifies the copied range's shadow (load-side
+    // check); a divergence would trap the load.
     assert_eq!(load64.call(&mut store, 8)? as u32, 0xAABB_CCDD);
-    trigger.call(&mut store, ())?;
     Ok(())
 }
 
@@ -3869,10 +4214,11 @@ fn imported_memory_stores_mirror_owner_shadow() -> wasmtime::Result<()> {
     let (mut store, memory, instance) = imported_memory_setup(65521)?;
     let poke = instance.get_typed_func::<(i32, i32), ()>(&mut store, "poke")?;
     let peek = instance.get_typed_func::<i32, i32>(&mut store, "peek")?;
-    let trigger = instance.get_typed_func::<(), ()>(&mut store, "trigger")?;
     poke.call(&mut store, (8, 0x1234_5678))?;
     poke.call(&mut store, (13, 0x0102_0304))?; // unaligned, byte-RMW path
-    trigger.call(&mut store, ())?; // cross-check walks the import — no trap
+    // The `peek` guest loads below verify the importer sees the owner shadow
+    // consistently (load-side check), and the host `memory.read` verifies the
+    // owner-side view.
     assert_eq!(peek.call(&mut store, 8)?, 0x1234_5678);
     assert_eq!(peek.call(&mut store, 13)?, 0x0102_0304);
     // The owner-side host view sees the same raw bytes.
@@ -3884,24 +4230,22 @@ fn imported_memory_stores_mirror_owner_shadow() -> wasmtime::Result<()> {
 
 #[test]
 fn imported_memory_tamper_raw_traps() -> wasmtime::Result<()> {
-    let (mut store, memory, instance) = imported_memory_setup(65521)?;
-    let trigger = instance.get_typed_func::<(), ()>(&mut store, "trigger")?;
+    let (mut store, memory, _instance) = imported_memory_setup(65521)?;
     tamper_raw_byte(&memory, &mut store, 3, |b| b ^ 0x80);
-    let res = trigger.call(&mut store, ()).map(|()| 0i32);
-    expect_an_mismatch_trap(res, "imported memory raw bit flip");
+    // Host read of the owner memory (the import aliases its shadow) catches it.
+    expect_host_read_mismatch(&memory, &mut store, 0, "imported memory raw bit flip");
     Ok(())
 }
 
 #[test]
 fn imported_memory_tamper_shadow_traps() -> wasmtime::Result<()> {
-    let (mut store, memory, instance) = imported_memory_setup(65521)?;
-    let trigger = instance.get_typed_func::<(), ()>(&mut store, "trigger")?;
+    let (mut store, memory, _instance) = imported_memory_setup(65521)?;
     let shadow = memory
         .an_shadow_data_mut_for_test(&mut store)
         .expect("owner shadow allocated under AN");
+    // shadow[8] = shadow slot 1 = raw bytes [4, 8); read offset 4.
     shadow[8] ^= 0x01;
-    let res = trigger.call(&mut store, ()).map(|()| 0i32);
-    expect_an_mismatch_trap(res, "imported memory shadow bit flip");
+    expect_host_read_mismatch(&memory, &mut store, 4, "imported memory shadow bit flip");
     Ok(())
 }
 
@@ -3912,13 +4256,10 @@ fn imported_memory_bulk_ops_keep_shadow() -> wasmtime::Result<()> {
     let peek = instance.get_typed_func::<i32, i32>(&mut store, "peek")?;
     let fill = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "fill")?;
     let copy = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "copy")?;
-    let trigger = instance.get_typed_func::<(), ()>(&mut store, "trigger")?;
     fill.call(&mut store, (64, 0xAB, 10))?; // unaligned tail
-    trigger.call(&mut store, ())?;
     assert_eq!(peek.call(&mut store, 64)? as u32, 0xABAB_ABAB);
     poke.call(&mut store, (128, 0x0BAD_F00Du32 as i32))?;
     copy.call(&mut store, (200, 128, 4))?;
-    trigger.call(&mut store, ())?;
     assert_eq!(peek.call(&mut store, 200)? as u32, 0x0BAD_F00D);
     Ok(())
 }
@@ -3929,13 +4270,12 @@ fn imported_memory_grow_through_importer() -> wasmtime::Result<()> {
     let poke = instance.get_typed_func::<(i32, i32), ()>(&mut store, "poke")?;
     let peek = instance.get_typed_func::<i32, i32>(&mut store, "peek")?;
     let grow = instance.get_typed_func::<i32, i32>(&mut store, "grow")?;
-    let trigger = instance.get_typed_func::<(), ()>(&mut store, "trigger")?;
     poke.call(&mut store, (16, 0x5151_6262))?;
     assert_eq!(grow.call(&mut store, 1)?, 1, "grow should succeed");
     // The owner re-allocated its shadow; the importer must observe the new
-    // base through the slot indirection for both old and new pages.
+    // base through the slot indirection for both old and new pages. The `peek`
+    // loads below verify the shadow via the load-side check.
     poke.call(&mut store, (65_536 + 16, 0x7373_8484u32 as i32))?;
-    trigger.call(&mut store, ())?;
     assert_eq!(peek.call(&mut store, 16)?, 0x5151_6262);
     assert_eq!(peek.call(&mut store, 65_536 + 16)? as u32, 0x7373_8484);
     Ok(())
@@ -3947,14 +4287,11 @@ fn imported_memory_various_an_constants() -> wasmtime::Result<()> {
         let (mut store, memory, instance) = imported_memory_setup(a)?;
         let poke = instance.get_typed_func::<(i32, i32), ()>(&mut store, "poke")?;
         let peek = instance.get_typed_func::<i32, i32>(&mut store, "peek")?;
-        let trigger = instance.get_typed_func::<(), ()>(&mut store, "trigger")?;
         poke.call(&mut store, (8, 0x1234_5678))?;
-        trigger.call(&mut store, ())?;
         assert_eq!(peek.call(&mut store, 8)?, 0x1234_5678, "A={a}");
         if a > 1 {
             tamper_raw_byte(&memory, &mut store, 3, |b| b ^ 0x80);
-            let res = trigger.call(&mut store, ()).map(|()| 0i32);
-            expect_an_mismatch_trap(res, &format!("imported raw flip, A={a}"));
+            expect_host_read_mismatch(&memory, &mut store, 0, &format!("imported raw flip, A={a}"));
         }
     }
     Ok(())
@@ -3975,15 +4312,13 @@ fn host_created_memory_imported_under_an() -> wasmtime::Result<()> {
     let instance = linker.instantiate(&mut store, &importer)?;
     let poke = instance.get_typed_func::<(i32, i32), ()>(&mut store, "poke")?;
     let peek = instance.get_typed_func::<i32, i32>(&mut store, "peek")?;
-    let trigger = instance.get_typed_func::<(), ()>(&mut store, "trigger")?;
+    // Each `peek` guest load verifies the slot's shadow (load-side check); the
+    // host-side `data_mut` write is healed at the next wasm entry before peek.
     poke.call(&mut store, (8, 0x0BAD_F00Du32 as i32))?;
-    trigger.call(&mut store, ())?;
     assert_eq!(peek.call(&mut store, 8)? as u32, 0x0BAD_F00D);
     memory.write(&mut store, 32, &[1, 2, 3, 4])?;
-    trigger.call(&mut store, ())?;
     assert_eq!(peek.call(&mut store, 32)? as u32, u32::from_le_bytes([1, 2, 3, 4]));
     memory.data_mut(&mut store)[48] = 9;
-    trigger.call(&mut store, ())?;
     assert_eq!(peek.call(&mut store, 48)? & 0xff, 9);
     Ok(())
 }

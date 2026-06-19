@@ -247,6 +247,9 @@ impl From<wiggle::GuestError> for Error {
             InvalidUtf8 { .. } => Errno::Ilseq.into(),
             TryFromIntError { .. } => Errno::Overflow.into(),
             SliceLengthsDiffer { .. } => Errno::Fault.into(),
+            // An AN-encoding raw/shadow divergence over a read range is a
+            // memory-integrity fault, not a recoverable errno — trap.
+            AnMemoryMismatch => Error::trap(err.into()),
             InFunc { err, .. } => Error::from(*err),
         }
     }

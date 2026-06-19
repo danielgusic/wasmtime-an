@@ -1004,39 +1004,25 @@ impl<'a> TrampolineCompiler<'a> {
             }
         }
 
-        // AN-encoding host-boundary cross-check (component path).
+        // AN-encoding: gate the post-call host-boundary resync (emitted further
+        // below) on a real wasm→host import boundary.
         //
         // A wasm-in-a-component host import dispatches through this hostcall
         // trampoline, not the core `compile_wasm_to_array_trampoline` path, so
-        // the AN cross-check / resync libcalls wired into that path would never
-        // fire for components — letting a wasm store + host import diverge raw
-        // and shadow undetected.
-        //
+        // the AN resync wired into that path would never fire for components —
+        // leaving a host `data_mut` write un-re-encoded when wasm resumes.
         // Only `HostCallee::Lowering` is a wasm→host boundary at a user import;
         // the other `HostCallee::Libcall` arms are component-runtime helpers
-        // that don't reach embedder code, so they need no cross-check.
+        // that don't reach embedder code, so they need no heal. The resync
+        // libcall takes a core-wasm `VMContext`: `caller_vmctx` (`params[1]`)
+        // is exactly that — the core instance that emitted the call.
         //
-        // The libcalls take a core-wasm `VMContext`: `caller_vmctx`
-        // (`params[1]`) is exactly that — the core instance that emitted the
-        // call.
+        // No *pre-call* heal is emitted: nothing can be whole-dirty on the way
+        // *into* a host call (the wasm-entry heal and the previous call's
+        // post-call resync already covered every window in which a memory can
+        // become whole-dirty), and corruption is caught at use, not here.
         let an_lowering = matches!(host_callee, HostCallee::Lowering(_))
             && self.compiler.tunables().an_encoding;
-        if an_lowering {
-            let caller_vmctx = self.caller_vmctx();
-            let sigs = BuiltinFunctionSignatures::new(self.compiler);
-            let check_idx = BuiltinFunctionIndex::an_check_host_boundary();
-            let check_sig = sigs.host_signature(check_idx);
-            let check_call = self.compiler.call_builtin(
-                &mut self.builder,
-                caller_vmctx,
-                &[caller_vmctx],
-                check_idx,
-                check_sig,
-            );
-            let check_ok = self.builder.func.dfg.inst_results(check_call)[0];
-            self.compiler
-                .raise_if_host_trapped(&mut self.builder, caller_vmctx, check_ok);
-        }
 
         // Next perform the actual invocation of the host with `host_args`.
         let call = match host_callee {
@@ -1138,10 +1124,10 @@ impl<'a> TrampolineCompiler<'a> {
         // `Memory::data_mut`, WASI surfaces wired into component imports,
         // etc.) are reflected before wasm resumes.
         //
-        // Emitted symmetrically with the cross-check above; same gating on
-        // `HostCallee::Lowering` and the AN tunable. MUST run before
-        // `abi_store_results` because that helper emits the terminating
-        // `return_`, after which no further instructions can be added.
+        // Gated on `an_lowering` (real wasm→host import boundary + AN tunable),
+        // computed above. MUST run before `abi_store_results` because that
+        // helper emits the terminating `return_`, after which no further
+        // instructions can be added.
         if an_lowering {
             let caller_vmctx = self.caller_vmctx();
             let sigs = BuiltinFunctionSignatures::new(self.compiler);

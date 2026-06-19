@@ -1472,6 +1472,12 @@ pub(crate) fn invoke_wasm_and_catch_traps<T>(
         // `previous_runtime_state` implicitly dropped here
         return Err(trap);
     }
+    // AN-encoding: re-encode any whole-dirty memory from raw before guest code
+    // runs. A `Memory::data_mut` write performed between top-level calls leaves
+    // the shadow stale until the next host boundary; without this heal the
+    // guest's mandatory inline load-check would false-trap on the first read of
+    // that region. No-op when AN-encoding is off or nothing is whole-dirty.
+    store.0.an_heal_whole_dirty();
     let result = crate::runtime::vm::catch_traps(store, &mut previous_runtime_state, closure);
     #[cfg(feature = "component-model")]
     if result.is_err() {

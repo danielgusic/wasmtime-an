@@ -46,16 +46,16 @@ pub use self::code_builder::{CodeBuilder, CodeHint, HashedEngineCompileEnv};
 mod runtime;
 
 /// Reject (or warn about) module features that the AN-encoding linear-memory
-/// implementation does not yet support.
+/// implementation does not support.
 ///
 /// AN-encoding maintains an encoded "shadow" of every defined linear memory
-/// (sized at `ENC_MEM_GROWTH_FACTOR * raw_byte_size`). For v1 the shadow is
-/// only allocated for self-contained, non-shared defined memories.
-/// Imported memories cannot be doubled because we do not own their storage;
+/// (sized at `ENC_MEM_GROWTH_FACTOR * raw_byte_size`). The shadow is only
+/// allocated for self-contained, non-shared defined memories.
+/// Imported memories' shadows live in the owning instance, not doubled here;
 /// shared memories cannot be doubled because atomic operations would need a
 /// per-slot lock across both copies. Multi-memory is supported: every
-/// defined memory gets its own shadow and the host-boundary cross-check
-/// walks all of them.
+/// defined memory gets its own shadow, each verified independently at use
+/// (guest load / host read).
 ///
 /// Memory64 modules are allowed but the user receives a one-shot warning:
 /// values and memory contents stay protected, but the i64 addresses that
@@ -69,8 +69,8 @@ mod runtime;
 /// Reference types (externref, funcref-as-value, and the GC/exn/cont
 /// families) are refused as *value* types — in function signatures, globals,
 /// and locals. They are opaque host handles, not integers, so there is
-/// nothing to AN-encode and the shadow / boundary cross-check has no path for
-/// them. `funcref` *tables* are the one exception: they are core MVP
+/// nothing to AN-encode and no shadow path for them. `funcref` *tables* are
+/// the one exception: they are core MVP
 /// (`call_indirect` dispatch), carry no encodable payload, and every working
 /// linear-memory module (including trait-object dispatch) needs them, so they
 /// stay allowed; any non-`funcref` table element type is still refused.
@@ -88,8 +88,8 @@ fn validate_an_encoding_constraints(
     // Imported (non-shared) memories are supported: the importing instance
     // mirrors stores through the owning instance's shadow via the
     // `VMMemoryImport::an_enc_base_slot` indirection, the bulk-memory
-    // libcalls resolve the owner for their re-encode, and the host-boundary
-    // cross-check walks imported memories too. Shared memories (imported or
+    // libcalls resolve the owner for their re-encode, and verify-at-use reads
+    // cross-check the owner's shadow too. Shared memories (imported or
     // defined) are refused below.
 
     let mut saw_memory64 = false;
@@ -110,7 +110,7 @@ fn validate_an_encoding_constraints(
         );
     }
 
-    // Floats are refused wholesale under AN-encoding for v1. The shadow
+    // Floats are refused wholesale under AN-encoding. The shadow
     // memory only mirrors i32-family stores; float stores are out of
     // scope, the boundary codeword check has no symmetric path for
     // f32/f64, and the conversion-decode path

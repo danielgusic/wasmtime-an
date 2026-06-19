@@ -497,6 +497,47 @@ impl Instance {
         self.id.get(store).an_runtime_memory_identity(idx)
     }
 
+    /// Returns the AN-encoding shadow slice of the memory configured in the
+    /// given canonical options, paired with the constant `A`. `(None, 0)` when
+    /// AN-encoding is off or no shadow is allocated. Used by the lifting
+    /// read-verify (`LiftContext`) to cross-check lifted ranges against the
+    /// encoded shadow without exposing the shadow to embedder code.
+    pub(crate) fn an_options_shadow<'a>(
+        &self,
+        store: &'a StoreOpaque,
+        options: OptionsIndex,
+    ) -> (Option<&'a [u8]>, u64) {
+        let tunables = store.engine().tunables();
+        if !tunables.an_encoding {
+            return (None, 0);
+        }
+        let shadow = self
+            .an_options_memory(store, options)
+            .and_then(|m| m.an_shadow_slice(store));
+        (shadow, tunables.an_constant)
+    }
+
+    /// Whole-memory AN-encoding cross-check of the memory configured in the
+    /// given canonical options. Returns `true` when consistent, when
+    /// AN-encoding is off, or when no shadow is allocated. Used by
+    /// [`LowerContext::as_slice_mut`] to verify the whole memory once before
+    /// handing out an opaque whole-memory mutable borrow whose subsequent
+    /// re-encode would otherwise launder any pre-existing corruption (the
+    /// analogue of `Memory::data_mut`'s pre-borrow check).
+    pub(crate) fn an_options_whole_consistent(
+        &self,
+        store: &StoreOpaque,
+        options: OptionsIndex,
+    ) -> bool {
+        let (shadow, a) = self.an_options_shadow(store, options);
+        let Some(shadow) = shadow else {
+            return true;
+        };
+        let memory = self.options_memory(store, options);
+        let len = memory.len();
+        crate::component::func::an_subslice_consistent(memory, Some(shadow), a, 0, len)
+    }
+
     /// Re-encodes the AN-encoding shadow for `byte_len` bytes at the host
     /// pointer `ptr`, which is expected to point into one of this
     /// component's extracted runtime memories.
@@ -522,6 +563,55 @@ impl Instance {
                 return;
             }
         }
+    }
+
+    /// Verify-at-use read-twin of [`Self::an_resync_transcode_dst`]: the
+    /// transcode libcalls read their raw *source* bytes out of guest memory,
+    /// so cross-check `[ptr, ptr + byte_len)` against the encoded shadow
+    /// *before* transcoding them. Without this a raw/shadow divergence in the
+    /// source is transcoded into the destination and then laundered into a
+    /// valid destination codeword by `an_resync_transcode_dst`, so no later
+    /// check can catch it.
+    ///
+    /// The owning memory is found by scanning the recorded runtime-memory
+    /// identities (as the dst resync does). No-op (consistent) when
+    /// AN-encoding is off, the range is empty, or no AN memory contains it.
+    /// Mismatch → `Trap::AnMemoryMismatch`.
+    pub(crate) fn an_check_transcode_src(
+        &self,
+        store: &mut StoreOpaque,
+        ptr: usize,
+        byte_len: usize,
+    ) -> Result<()> {
+        if byte_len == 0 || !store.engine().tunables().an_encoding {
+            return Ok(());
+        }
+        let memories: alloc::vec::Vec<crate::Memory> =
+            self.id.get(store).an_runtime_memory_identities().collect();
+        for memory in memories {
+            match memory.an_cross_check_if_contains_ptr(store, ptr, byte_len) {
+                Some(true) => return Ok(()),
+                Some(false) => return Err(crate::Trap::AnMemoryMismatch.into()),
+                None => continue,
+            }
+        }
+        Ok(())
+    }
+
+    /// Test-only: exposes the `nth` extracted runtime (core) linear memory of
+    /// this component instance as a [`crate::Memory`], so AN-encoding
+    /// fault-injection tests can tamper the nested core memory that the public
+    /// component API otherwise hides. Returns `None` when AN-encoding is off
+    /// (no identities recorded) or `nth` is out of range. Embedders should not
+    /// use this — the core memory layout is an implementation detail.
+    #[doc(hidden)]
+    pub fn an_core_memory_for_test(
+        &self,
+        mut store: impl crate::AsContextMut,
+        nth: usize,
+    ) -> Option<crate::Memory> {
+        let store = store.as_context_mut().0;
+        self.id.get(store).an_runtime_memory_identities().nth(nth)
     }
 
     pub(crate) fn options_memory<'a>(

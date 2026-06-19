@@ -634,8 +634,8 @@ impl VMGlobalDefinition {
                 // AN-encoding: an i32 global is stored encoded as `A * v` in the
                 // 64-bit slot. A `ValRaw` carries the raw value, so encode at this
                 // boundary (mirrors host-side `Global::set`). NB: `from_val_raw` /
-                // `to_val_raw` currently have no callers; the AN handling here is
-                // kept so any future `ValRaw`-based global access stays correct.
+                // `to_val_raw` currently have no callers; the AN handling is kept
+                // to preserve the boundary invariant.
                 WasmValType::I32 => {
                     let tunables = store.engine().tunables();
                     if tunables.an_encoding {
