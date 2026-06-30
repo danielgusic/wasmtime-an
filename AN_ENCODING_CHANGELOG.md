@@ -224,9 +224,13 @@ For i64, these operators follow the same AN strategy as their i32 counterpart,
 only with `I128`, 64-bit raw values, and the canonical band `A·2⁶⁴`: `const`,
 `add`, `sub`, `eqz`, all integer compares, `extend8_s` / `extend16_s` /
 `extend32_s`, `clz`, `ctz`, `popcnt`, `shl`, `shr_u`, `shr_s`, `rotl`, `rotr`,
-`and`, `or`, `xor`, `local.{get,set,tee}`, guest-side `global.get/set`, and
-memory64 address decode. Signed comparisons use the same bias-remap idea at
-`A·2⁶³`; i64 boolean results are still encoded i32 booleans (`0` / `A`).
+`and`, `or`, `xor`, `local.{get,set,tee}`, guest-side `global.get/set`,
+memory64 address decode, and `load/store{,8,16,32}`. Signed comparisons use
+the same bias-remap idea at `A·2⁶³`; i64 boolean results are still encoded i32
+booleans (`0` / `A`). Full i64 memory accesses still follow the i32 shadow
+invariant: raw memory stores bytes, and the shadow mirrors each 4-byte raw slot
+as `A·u32_le(slot)`, so an 8-byte i64 access verifies or updates the touched
+i32-sized shadow slots.
 
 The i64 cases that differ from the i32 baseline are:
 
@@ -234,9 +238,8 @@ The i64 cases that differ from the i32 baseline are:
 |---|---|
 | `i64.mul` | Stays encoded, but building `A²·n·m` can exceed 128 bits. Because no 256-bit intermediate is materialized, overflow traps as `Trap::AnI64WidenOverflow`; otherwise the implementation divides by `A` to get the encoded product `A·n·m`, then canonicalizes modulo `A·2⁶⁴`. For a 128-bit `(q_hi, q_lo)` value this modulus is cheap: result = `(q_hi % A, q_lo)`, so the value never leaves the encoding. |
 | `i64.div_u/s`, `i64.rem_u/s` | Uses the software `emit_udivrem_i128` helper because Cranelift has no general `udiv.i128` lowering. The AN arithmetic mirrors i32 (`A` cancels for division, unsigned remainder keeps the factor), but the implementation is an I128 long-division path. |
-| `i64.load{,8,16,32}_{u,s}` / `i64.store{,8,16,32}` | Raw linear memory still stores bytes. A full i64 spans two 4-byte AN shadow slots: loads verify the touched slot(s), reconstruct the raw i64, then encode to `I128`; stores decode the `I128` value to raw bytes and update the affected i32-sized shadow slots. |
 | `i32.wrap_i64` | Reduces an encoded i64 modulo `A·2³²`, yielding an encoded i32. Wasm-spec: no trap. |
-| `i64.extend_i32_s/u` | Does not decode/re-encode. It checks the encoded i32 input, then widens in the encoded domain; the signed form adds `A·(2⁶⁴−2³²)` when the original i32 sign bit is set. |
+| `i64.extend_i32_s/u` | It checks the encoded i32 input, then widens in the encoded domain; the signed form adds `A·(2⁶⁴−2³²)` when the original i32 sign bit is set. |
 
 ### `i32.mul` note
 
