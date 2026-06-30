@@ -647,7 +647,17 @@ impl VMGlobalDefinition {
                         *global.as_i32_mut() = raw.get_i32();
                     }
                 }
-                WasmValType::I64 => *global.as_i64_mut() = raw.get_i64(),
+                WasmValType::I64 => {
+                    let tunables = store.engine().tunables();
+                    if tunables.an_encoding {
+                        global.set_u128(
+                            u128::from(raw.get_i64() as u64)
+                                .wrapping_mul(u128::from(tunables.an_constant)),
+                        );
+                    } else {
+                        *global.as_i64_mut() = raw.get_i64();
+                    }
+                }
                 WasmValType::F32 => *global.as_f32_bits_mut() = raw.get_f32(),
                 WasmValType::F64 => *global.as_f64_bits_mut() = raw.get_f64(),
                 WasmValType::V128 => global.set_u128(raw.get_v128()),
@@ -695,7 +705,15 @@ impl VMGlobalDefinition {
                         ValRaw::i32(*self.as_i32())
                     }
                 }
-                WasmValType::I64 => ValRaw::i64(*self.as_i64()),
+                WasmValType::I64 => {
+                    let tunables = store.engine().tunables();
+                    if tunables.an_encoding {
+                        let v = self.get_u128() / u128::from(tunables.an_constant);
+                        ValRaw::i64(v as u64 as i64)
+                    } else {
+                        ValRaw::i64(*self.as_i64())
+                    }
+                }
                 WasmValType::F32 => ValRaw::f32(*self.as_f32_bits()),
                 WasmValType::F64 => ValRaw::f64(*self.as_f64_bits()),
                 WasmValType::V128 => ValRaw::v128(self.get_u128()),

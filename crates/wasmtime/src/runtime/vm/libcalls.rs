@@ -574,17 +574,12 @@ fn memory_copy(
         let src_usize = usize::try_from(src).unwrap();
         let len_usize = usize::try_from(len).unwrap();
         let consistent = match def_src {
-            Some(def_idx) => {
-                store
-                    .instance(instance)
-                    .an_cross_check_range(def_idx, src_usize, len_usize, a)
-            }
-            None => store.instance(instance).an_cross_check_imported_range(
-                src_index,
-                src_usize,
-                len_usize,
-                a,
-            ),
+            Some(def_idx) => store
+                .instance(instance)
+                .an_cross_check_range(def_idx, src_usize, len_usize, a),
+            None => store
+                .instance(instance)
+                .an_cross_check_imported_range(src_index, src_usize, len_usize, a),
         };
         if !consistent {
             return Err(Trap::AnMemoryMismatch);

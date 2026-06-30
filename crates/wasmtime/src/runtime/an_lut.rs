@@ -1,5 +1,4 @@
-//! AN-encoding bitwise lookup tables, generated in-process per engine, as cost turned out
-//! negligible
+//! AN-encoding bitwise lookup tables, generated in-process per engine.
 //!
 //! For each binary bitwise op supported under AN-encoding (`AND`, `OR`,
 //! `XOR`), one 256×256 `i32` table is built whose entries hold the encoded
@@ -64,8 +63,7 @@ pub(crate) fn validate_a(a: u64) -> Result<(), AnLutError> {
     Ok(())
 }
 
-/// Bitwise binary operations covered by the LUT generator.
-/// They are the only one that appear in wasm.
+/// Bitwise binary operations covered by the LUT generator (the only ones in wasm).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinOp {
     And,

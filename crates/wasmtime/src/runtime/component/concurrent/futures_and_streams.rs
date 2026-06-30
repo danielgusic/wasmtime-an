@@ -269,8 +269,7 @@ fn lower<T: func::Lower + Send + 'static, B: WriteBuffer<T>, U: 'static>(
     if address % usize::try_from(T::ALIGN32)? != 0 {
         bail!("read pointer not aligned");
     }
-    // Bounds validation only (no write): untracked accessor so this doesn't
-    // record a whole-memory AN-shadow resync.
+    // Bounds validation only (no write): untracked accessor.
     lower
         .as_slice_mut_untracked()
         .get_mut(address..)
@@ -280,10 +279,6 @@ fn lower<T: func::Lower + Send + 'static, B: WriteBuffer<T>, U: 'static>(
     if let Some(ty) = ty.payload(lower.types) {
         T::linear_store_list_to_memory(lower, *ty, address, &buffer.remaining()[..count])?;
     }
-
-    // Wasm may resume after this: re-encode the AN-encoding shadow for the
-    // ranges the lowering above wrote.
-    lower.an_flush_dirty();
 
     if let Some(old_thread) = old_thread {
         store.0.set_thread(old_thread)?;
@@ -3373,9 +3368,6 @@ impl Instance {
                         None => bail_bug!("expected read payload type to be present"),
                     };
                     val.store(lower, *ty, ptr)?;
-                    // Re-encode the AN-encoding shadow for the lowered range
-                    // before wasm resumes.
-                    lower.an_flush_dirty();
                     store.set_thread(old_thread)?;
                 }
             }
@@ -3452,9 +3444,6 @@ impl Instance {
                         value.store(lower, *read_payload_ty, ptr)?;
                         ptr += usize::try_from(read_abi.size32)?;
                     }
-                    // Re-encode the AN-encoding shadow for the lowered ranges
-                    // before wasm resumes.
-                    lower.an_flush_dirty();
                     store.set_thread(old_thread)?;
                 }
             }
@@ -4344,9 +4333,6 @@ impl Instance {
         debug_msg
             .as_str()
             .linear_lower_to_memory(lower_cx, InterfaceType::String, offset)?;
-        // Re-encode the AN-encoding shadow for the lowered string before
-        // wasm resumes.
-        lower_cx.an_flush_dirty();
 
         Ok(())
     }

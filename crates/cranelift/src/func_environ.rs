@@ -2999,6 +2999,18 @@ impl FuncEnvironment<'_> {
                     Ok(builder.ins().iconst(ir::types::I64, encoded))
                 }
                 GlobalConstValue::I32(x) => Ok(builder.ins().iconst(ir::types::I32, i64::from(x))),
+                // AN-encoding: a constant-folded immutable i64 global enters the
+                // operand stack as the encoded `A*v` in `I128`, built from two
+                // halves since `iconst` is ≤64-bit.
+                GlobalConstValue::I64(x) if self.tunables().an_encoding => {
+                    let encoded =
+                        u128::from(x as u64).wrapping_mul(u128::from(self.tunables().an_constant));
+                    let lo = builder.ins().iconst(ir::types::I64, encoded as u64 as i64);
+                    let hi = builder
+                        .ins()
+                        .iconst(ir::types::I64, (encoded >> 64) as u64 as i64);
+                    Ok(builder.ins().iconcat(lo, hi))
+                }
                 GlobalConstValue::I64(x) => Ok(builder.ins().iconst(ir::types::I64, x)),
                 GlobalConstValue::F32(x) => {
                     Ok(builder.ins().f32const(ir::immediates::Ieee32::with_bits(x)))
@@ -3090,16 +3102,21 @@ impl FuncEnvironment<'_> {
                 // AN-encoding: a raw host-control global expects its un-encoded
                 // i32 value. Decode the encoded `A*v` (I64) operand back to raw
                 // i32 before storing, keeping the runtime's raw view intact.
-                let val = if self.tunables().an_encoding && self.module.is_an_raw_global(global_index)
-                {
-                    let an = builder
-                        .ins()
-                        .iconst(ir::types::I64, self.tunables().an_constant as i64);
-                    let decoded = builder.ins().udiv(val, an);
-                    builder.ins().ireduce(ir::types::I32, decoded)
-                } else {
-                    val
-                };
+                let val =
+                    if self.tunables().an_encoding && self.module.is_an_raw_global(global_index) {
+                        crate::translate::emit_an_codeword_validity_check(
+                            builder,
+                            self.tunables().an_constant,
+                            val,
+                        );
+                        let an = builder
+                            .ins()
+                            .iconst(ir::types::I64, self.tunables().an_constant as i64);
+                        let decoded = builder.ins().udiv(val, an);
+                        builder.ins().ireduce(ir::types::I32, decoded)
+                    } else {
+                        val
+                    };
                 debug_assert_eq!(ty, builder.func.dfg.value_type(val));
                 builder.ins().store(flags, val, addr, offset);
                 self.update_global(builder, global_index, val);
@@ -3957,11 +3974,13 @@ impl FuncEnvironment<'_> {
                 // stored encoded as `A*v` in `I64`. The `update_stack_pointer`
                 // builtin takes a raw `i32`, so decode before the call.
                 if self.tunables().an_encoding
-                    && matches!(
-                        self.module.globals[global_index].wasm_ty,
-                        WasmValType::I32
-                    )
+                    && matches!(self.module.globals[global_index].wasm_ty, WasmValType::I32)
                 {
+                    crate::translate::emit_an_codeword_validity_check(
+                        builder,
+                        self.tunables().an_constant,
+                        value,
+                    );
                     let a = builder
                         .ins()
                         .iconst(ir::types::I64, self.tunables().an_constant as i64);

@@ -515,7 +515,11 @@ impl Memory {
             return Some(true);
         }
         let a = store.engine().tunables().an_constant;
-        Some(self.instance.get(store).an_cross_check_range(self.index, ptr - base, len, a))
+        Some(
+            self.instance
+                .get(store)
+                .an_cross_check_range(self.index, ptr - base, len, a),
+        )
     }
 
     /// Returns this memory as a native Rust slice.
@@ -1502,7 +1506,11 @@ mod tests {
 
         // Write known bytes through the tracked host path so the shadow for
         // [16, 24) is brought in sync.
-        mem.write(&mut store, 16, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])?;
+        mem.write(
+            &mut store,
+            16,
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+        )?;
         let base = mem.data_ptr(&store) as usize;
 
         {

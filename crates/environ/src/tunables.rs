@@ -232,8 +232,7 @@ define_tunables! {
 
         /// AN-encoding constant `A`. Encoded i32 values are stored as `A*v`
         /// in widened i64 IR slots. Defaults to `DEFAULT_AN_CONSTANT`.
-        /// Constraints (caller-enforced via the `Config` setter): must be
-        /// ≥ 1 (A=0 would break everything)
+        /// Caller-enforced (via the `Config` setter) to be in `[1, 2^23)`.
         pub an_constant: u64,
 
         /// AN-encoding test-only fault injection at trampoline boundaries.

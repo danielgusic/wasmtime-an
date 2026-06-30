@@ -50,7 +50,16 @@ pub fn generate_global_export(
                     *global.as_i32_mut() = x;
                 }
             }
-            Val::I64(x) => *global.as_i64_mut() = x,
+            Val::I64(x) => {
+                let tunables = store.engine().tunables();
+                if tunables.an_encoding {
+                    global.set_u128(
+                        u128::from(x as u64).wrapping_mul(u128::from(tunables.an_constant)),
+                    );
+                } else {
+                    *global.as_i64_mut() = x;
+                }
+            }
             Val::F32(x) => *global.as_f32_bits_mut() = x,
             Val::F64(x) => *global.as_f64_bits_mut() = x,
             Val::V128(x) => global.set_u128(x.into()),

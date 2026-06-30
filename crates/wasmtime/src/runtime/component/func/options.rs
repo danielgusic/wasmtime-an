@@ -513,8 +513,8 @@ impl<'a> LiftContext<'a> {
         // Capture the encoded shadow + constant for verify-at-use on the read
         // side. Lifting never writes, and the host→wasm entry heal already ran,
         // so the shadow is consistent here; no whole-dirty handling is needed.
-        let (an_shadow, an_a) = instance_handle
-            .an_options_shadow(unsafe { &*(store as *const StoreOpaque) }, options);
+        let (an_shadow, an_a) =
+            instance_handle.an_options_shadow(unsafe { &*(store as *const StoreOpaque) }, options);
         let (task_state, host_table, host_resource_data, instance) =
             store.lift_context_parts(instance_handle);
         let (component, instance) = instance.component_and_self();

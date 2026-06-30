@@ -381,10 +381,7 @@ impl<'a> GuestMemory<'a> {
         let guest = self.validate_size_align::<T>(ptr.pointer.0, ptr.pointer.1)?;
         // Verify-at-use: cross-check exactly the bytes being copied out against
         // the AN-encoding shadow before the copy.
-        self.an_cross_check_read(
-            ptr.pointer.0,
-            ptr.pointer.1.saturating_mul(T::guest_size()),
-        )?;
+        self.an_cross_check_read(ptr.pointer.0, ptr.pointer.1.saturating_mul(T::guest_size()))?;
         let mut host = Vec::with_capacity(guest.len());
 
         // SAFETY: The `guest_slice` variable is already a valid pointer into

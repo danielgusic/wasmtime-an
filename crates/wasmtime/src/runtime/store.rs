@@ -1875,9 +1875,8 @@ impl StoreOpaque {
         let a = self.engine().tunables().an_constant;
         for id in self.an_all_instance_ids() {
             let mut instance = self.instance_mut(id);
-            let num_defined_memories =
-                u32::try_from(instance.env_module().num_defined_memories())
-                    .expect("number of defined memories fits in u32");
+            let num_defined_memories = u32::try_from(instance.env_module().num_defined_memories())
+                .expect("number of defined memories fits in u32");
             for i in 0..num_defined_memories {
                 let def_idx = wasmtime_environ::DefinedMemoryIndex::from_u32(i);
                 if instance.as_mut().an_take_whole_dirty(def_idx) {

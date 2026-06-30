@@ -282,7 +282,10 @@ impl<'data> Translator<'_, 'data> {
                     }
                     let g = GlobalIndex::from_u32(next_global);
                     next_global += 1;
-                    if matches!(def, dfg::CoreDef::InstanceFlags(_) | dfg::CoreDef::TaskMayBlock) {
+                    if matches!(
+                        def,
+                        dfg::CoreDef::InstanceFlags(_) | dfg::CoreDef::TaskMayBlock
+                    ) {
                         raw_globals.push(g);
                     }
                 }

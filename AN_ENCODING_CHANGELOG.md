@@ -30,7 +30,7 @@ Fetzer, Schiffel, Süßkraut, *AN-Encoding Compiler*, 2009.
 
 `A` defaults to `wasmtime_environ::DEFAULT_AN_CONSTANT` (`65521`, a 16-bit
 prime recommended by the paper). The setter validates `1 ≤ A < 2²³` (A=0 would
-be impossible to decode and cause further issues [don't even think about it!]; A ≥ 2²³ would let LUT entries `A · 0xFF` overflow `i32`).
+be impossible to decode and cause further issues [don't even think about it!]; A ≥ 2²³ allows us to encode the 8 bit LUT entries in 32 bit, thus halving their size).
 Pick a large odd value (preferably prime), powers of two weaken detection.
 
 ---
@@ -49,13 +49,13 @@ Pick a large odd value (preferably prime), powers of two weaken detection.
 - **`runtime/memory.rs`** — write hooks (`write` re-encodes its range; `data_mut`/`data_and_store_mut` mark the memory whole-dirty) and read-side verify-at-use: `read` cross-checks its exact range, `data`/`data_mut` cross-check the whole memory at borrow — the infallible accessors *panic* on a mismatch, the fallible `try_data`/`try_data_mut`/`try_data_and_store_mut` twins return `Err(Trap::AnMemoryMismatch)`. `Memory::read`'s `MemoryAccessError` names an AN mismatch rather than a generic "out of bounds". Plus `#[doc(hidden)]` shadow / cross-check accessors for the lifting, transcode-source, and wiggle paths, and a test-only shadow accessor.
 - **`runtime/store.rs`** — `an_all_instance_ids()` (all instances incl. dummy host-memory owners) drives the store-wide dirty sweep; `an_heal_whole_dirty()` runs that sweep at the host→wasm entry chokepoint (`invoke_wasm_and_catch_traps`) so a `data_mut` between top-level calls is re-encoded before the guest's mandatory load-check runs.
 - **`runtime/vm/libcalls.rs`** — `an_resync_host_boundary` libcall (emitted after a host call) dirty-sweeps `data_mut`-marked memories via `an_sweep_whole_dirty`. `memory.copy` cross-checks its source range before copying (so the destination re-encode cannot launder source corruption) and `memory.copy`/`memory.init` re-encode their written destination range after.
-- **`runtime/component/func/{options,host}.rs`, `func.rs`, `func/typed.rs`, `values.rs`, `concurrent/futures_and_streams.rs`** — Lowering: `LowerContext` records host-written ranges (`get`/`slice_mut` exact, `as_slice_mut` whole-memory) and `an_flush_dirty` re-encodes them before control re-enters wasm. Lifting: `LiftContext` carries the options memory's shadow + `A` and cross-checks every lifted range (`memory_checked`, plus the lazy `WasmStr::to_str` / `WasmList::as_le_slice` accessors); all list/string/record/map/param lift sites in `func/typed.rs`, `func/host.rs` and `values.rs` route through it. (**Note:** streams and futures are not supported. The changes are relics of an attempt.)
+- **`runtime/component/func/{options,host}.rs`, `func.rs`, `func/typed.rs`, `values.rs`** — Lowering: `LowerContext` records host-written ranges (`get`/`slice_mut` exact, `as_slice_mut` whole-memory) and `an_flush_dirty` re-encodes them before control re-enters wasm. Lifting: `LiftContext` carries the options memory's shadow + `A` and cross-checks every lifted range (`memory_checked`, plus the lazy `WasmStr::to_str` / `WasmList::as_le_slice` accessors); all list/string/record/map/param lift sites in `func/typed.rs`, `func/host.rs` and `values.rs` route through it.
 - **`runtime/component/instance.rs`, `runtime/vm/component.rs`** — per-`RuntimeMemoryIndex` AN identity map + lookups for the lowering flush and transcoder resync; `an_options_shadow` / `an_options_whole_consistent` (lifting + `as_slice_mut` verify) and `an_check_transcode_src` (transcode source verify); `an_core_memory_for_test` exposes a component's core memory for fault-injection tests.
 - **`runtime/vm/component/libcalls.rs`** — each string transcoder **cross-checks its source range** (`an_check_transcode_src`) before transcoding and re-encodes its written destination range after.
-- **`runtime/externals/global.rs`** — host-boundary i32 global encode/decode (`Global::get`/`set`), gated to wasm i32 globals. `Global::get` verifies codeword validity (`enc % A == 0`) before decoding: the infallible `get` *panics* on an invalid codeword, the fallible `try_get` returns `Err(Trap::AnCodewordInvalid)`. `an_corrupt_i64_slot_for_test` injects an invalid codeword for tests.
-- **`runtime/trampoline/global.rs`** — encodes the initial value of a host-created (`Global::new`) i32 global.
-- **`runtime/vm/vmcontext.rs`** — `VMGlobalDefinition::{from,to}_val_raw` encode/decode i32 `ValRaw` ↔ storage.
-- **`compile.rs`** — `validate_an_encoding_constraints` (core modules + component cores): refuse shared memory / float / atomics / reference-type *values* (signatures, globals, locals) / non-`funcref` tables, warn on memory64 + i32↔i64; SIMD/GC/exceptions/stack-switching/component-async refused via the `config.rs` feature mask. `funcref` tables stay allowed (`call_indirect` dispatch).
+- **`runtime/externals/global.rs`** — host-boundary integer global encode/decode (`Global::get`/`set`), gated to wasm i32/i64 globals. `Global::get` verifies codeword validity (`enc % A == 0`) before decoding: the infallible `get` *panics* on an invalid codeword, the fallible `try_get` returns `Err(Trap::AnCodewordInvalid)`. Test-only corruption hooks inject invalid i32/i64 codewords.
+- **`runtime/trampoline/global.rs`** — encodes the initial value of a host-created (`Global::new`) integer global.
+- **`runtime/vm/vmcontext.rs`** — `VMGlobalDefinition::{from,to}_val_raw` encode/decode i32/i64 `ValRaw` ↔ storage.
+- **`compile.rs`** — `validate_an_encoding_constraints` (core modules + component cores): refuse shared memory / float / atomics / reference-type *values* (signatures, globals, locals) / non-`funcref` tables; SIMD/GC/exceptions/stack-switching/component-async refused via the `config.rs` feature mask. `funcref` tables stay allowed (`call_indirect` dispatch).
 - **`config.rs`** — `an_encoding`/`an_constant` setters, test fault-inject knobs, the AN feature mask (incl. `CM_ASYNC`/`CM_ASYNC_STACKFUL`), and Winch refusal.
 - **`engine/serialization.rs`** — AN tunables included in cwasm compatibility validation.
 
@@ -74,21 +74,25 @@ Pick a large odd value (preferably prime), powers of two weaken detection.
 
 - **`vmoffsets.rs`** — three LUT pointer slots in `VMContext`, per-memory `defined_memories_enc_bases` array, `VMMemoryImport::an_enc_base_slot` (pointer to the owner's enc-base slot; address stable across `memory.grow`).
 - **`builtin.rs`** — declares the `an_resync_host_boundary` builtin (`-> bool`; falsy = trap).
-- **`trap_encoding.rs`** — new `Trap::AnMemoryMismatch` (48) / `AnCodewordInvalid` (49); `c-api/src/trap.rs` const-asserts updated to match.
+- **`trap_encoding.rs`** — new `Trap::AnMemoryMismatch` (48) / `AnCodewordInvalid` (49) / `AnI64WidenOverflow` (50).
 - **`tunables.rs`** — `DEFAULT_AN_CONSTANT = 65521`, `ENC_MEM_GROWTH_FACTOR = 2`, and the AN tunable fields.
 - **`module.rs`** — `Module::an_raw_globals` records imported host-control globals (`InstanceFlags` / `TaskMayBlock`) as a raw↔encoded boundary.
+- **`component/translate/adapt.rs`** — populates `an_raw_globals` when an adapter module is translated.
+
+### C API — `crates/c-api`
+
+- **`src/trap.rs`**, **`include/wasmtime/trap.h`** — mirror the AN trap codes (`AnMemoryMismatch`, `AnCodewordInvalid`, `AnI64WidenOverflow`) for the C API.
 
 ### Cranelift — `crates/cranelift`
 
-- **`lib.rs`** — `wasm_stack_value_type` widens i32→I64 under AN; `TRAP_AN_MEMORY_MISMATCH` / `TRAP_AN_CODEWORD_INVALID` codes.
-- **`translate/an_helpers.rs`** — all AN codegen helpers: encode/decode, bitwise-LUT, mul, shifts/rotates, shadow-store RMW, the per-load validity check, and boundary / conversion codeword checks.
-- **`translate/code_translator.rs`** — per-op AN encoding (see *Per-op behaviour*), shadow mirror for `i32.store{,8,16}`, i32 decode around `memory.*`/`table.*`/`call_indirect` and `br_table`, pass-through globals.
-- **`func_environ.rs`** — widen i32 global storage to I64 (+ const-fold `iconst.i64 A·v`); raw host-control globals kept native with encode-on-get / decode-on-set.
-- **`translate/func_translator.rs`, `translate/translation_utils.rs`** — widen the i32 local / block-param IR type under AN.
-- **`translate/mod.rs`** — re-exports `emit_an_codeword_validity_check` for trampoline codegen.
-- **`compiler.rs`** — wasm/host trampolines encode/decode i32 + boundary codeword check, and emit the `an_resync_host_boundary` post-call dirty-heal libcall.
+- **`lib.rs`** — `wasm_stack_value_type` widens i32→I64 and i64→I128 under AN; `TRAP_AN_MEMORY_MISMATCH` / `TRAP_AN_CODEWORD_INVALID` / `TRAP_AN_I64_WIDEN_OVERFLOW` codes.
+- **`translate/an_helpers.rs`** *(new)* — all AN codegen helpers: encode/decode, bitwise-LUT, mul, shifts/rotates, shadow-store RMW, the per-load validity check, and boundary / conversion codeword checks.
+- **`translate/code_translator.rs`** — per-op AN encoding (see *Per-op behaviour*), shadow mirror for integer stores, address/index decode around `memory.*`/`table.*`/`call_indirect` and `br_table`, pass-through globals.
+- **`func_environ.rs`** — widen i32 global storage to I64 and i64 global storage to I128 (+ const-fold encoded immediates); raw host-control globals kept native with encode-on-get / decode-on-set.
+- **`translate/func_translator.rs`, `translate/translation_utils.rs`** — widen integer local / block-param IR types under AN (`i32`→`I64`, `i64`→`I128`).
+- **`translate/mod.rs`** — re-exports AN helper entry points used outside the translator (`emit_an_codeword_validity_check`, i64 encode/decode helpers, and `iconst_i128`).
+- **`compiler.rs`** — wasm/host trampolines encode/decode integer scalars + boundary codeword check, and emit the `an_resync_host_boundary` post-call dirty-heal libcall.
 - **`compiler/component.rs`** — same treatment for `translate_hostcall`; plus i32 decode/encode in the transcode, `resource_drop`, and `UnsafeIntrinsic` (load/store/context) trampolines.
-- **`component/translate/adapt.rs`** — populates `an_raw_globals` when an adapter module is translated.
 
 ### CLI & tests
 
@@ -106,11 +110,9 @@ Representation inside an AN-encoded module:
 | Wasm type | IR type | Holds |
 |---|---|---|
 | `i32` | `I64` | `A·v` with canonical `v ∈ [0, 2³²)` |
-| `i64`, refs, v128 | unchanged | passed through, not encoded |
+| `i64` | `I128` | `A·v` with canonical `v ∈ [0, 2⁶⁴)`, so `A·v < 2⁸⁷` |
 
-`i64` support could be added in the future. Floating-point types (`f32`/`f64`)
-are refused outright when AN-encoding is on (see *Supported and unsupported
-features*).
+See *Supported and unsupported features* below for more information.
 
 **Memory model:** two linear memories, one mirroring the other but encoded
 
@@ -124,7 +126,7 @@ Everything done with the linear memory is unchanged, but mirrored and encoded in
 | host `Memory::read` | cross-checks exactly `[offset, offset+len)` before copying (`an_range_consistent`). Mismatch → `Err(MemoryAccessError)`; its typed return can't carry the `AnMemoryMismatch` trap *code*, but the error is enriched to name the AN mismatch (not a generic "out of bounds"). |
 | host `Memory::data` / `data_mut` | opaque whole-memory borrow → cross-checks the whole memory at borrow. Infallible: *panics* on mismatch. Fallible twins `try_data`/`try_data_mut`/`try_data_and_store_mut` → `Err(Trap::AnMemoryMismatch)` (`try_data_mut` cross-checks before marking whole-dirty). |
 | host `WasmList::as_le_slice` | cross-checks the list's bytes at borrow. Infallible: *panics*; fallible twin `try_as_le_slice` → `Err(Trap::AnMemoryMismatch)`. |
-| host `Global::get` (i32) | codeword validity check (`enc % A == 0`) before decode. Infallible: *panics* on an invalid codeword; fallible twin `try_get` → `Err(Trap::AnCodewordInvalid)`. |
+| host `Global::get` (i32/i64) | codeword validity check (`enc % A == 0`) before decode. Infallible: *panics* on an invalid codeword; fallible twin `try_get` → `Err(Trap::AnCodewordInvalid)`. |
 | component lifting (`LiftContext`) | per-range cross-check on every lifted value (`memory_checked` for the `cx` paths; `an_options_shadow` for the lazy `WasmStr::to_str` / `WasmList::as_le_slice`). Mismatch → `Trap::AnMemoryMismatch`. |
 | component transcoders (fused string adapters) | source range cross-checked before transcoding (`an_check_transcode_src`); destination re-encoded after. |
 | `memory.copy` | source range cross-checked before the copy (so the destination re-encode cannot launder source corruption). |
@@ -138,7 +140,7 @@ Host writes are tracked per path and the shadow is re-encoded for exactly what t
 | `Memory::write` | immediate exact-range re-encode at the write site (also works *outside* host calls — see semantics changes) |
 | `Memory::data_mut` / `data_and_store_mut` | whole-dirty flag on the memory; consumed (full re-encode + clear) at the next heal — host-call entry/exit *and* the host→wasm **entry** sweep (`an_heal_whole_dirty`), so a `data_mut` write between top-level calls is re-encoded before the guest's mandatory load-check runs (else it would false-trap on the stale shadow) |
 | WASI preview1 (wiggle) | `GuestMemory` records every written byte range (typed `write`, `copy_from_slice`, `as_slice_mut`); the generated hostcall wrapper drains the ranges after the host body returns and re-encodes exactly those bytes |
-| component canonical ABI (incl. WASI preview2) | `LowerContext` records ranges (`get` / `slice_mut` exact; raw `as_slice_mut` falls back to whole-memory) and flushes them with an immediate re-encode before control re-enters wasm: at `realloc` entry, after host→wasm argument lowering (`with_lower_context`), after host-result lowering (`lower_result_and_exit_call`), and at the async stream/future lowering sites |
+| component canonical ABI (incl. WASI preview2) | `LowerContext` records ranges (`get` / `slice_mut` exact; raw `as_slice_mut` falls back to whole-memory) and flushes them with an immediate re-encode before control re-enters wasm: at `realloc` entry, after host→wasm argument lowering (`with_lower_context`), and after host-result lowering (`lower_result_and_exit_call`) |
 | component transcode libcalls (fused adapters) | each transcoder re-encodes its destination range; the raw `dst` pointer is resolved back to the owning memory via the per-`RuntimeMemoryIndex` identity map captured at `extract_memory` |
 | raw `Memory::data_ptr` writes | **not tracked**, indistinguishable from corruption. Can be used for fault injection though. |
 
@@ -148,19 +150,18 @@ Some design decision regarding the memory:
 - Wasm-side stores keep the shadow in lockstep via the JIT mirror; host-side writes re-encode the touched ranges as described above
 - Unaligned/subword accesses use RMW like paper
 - Shared/atomic memories are refused when AN-encoding is on; multi-memory is supported. Imported (non-shared) memories are supported: the importing instance's JIT code reaches the owner's shadow through the stable `VMMemoryImport::an_enc_base_slot` pointer (one extra load), so an owner-side `memory.grow` — which re-allocates the shadow — stays transparent to importers
-- 64 bit memory operations are allowed, but not affected by the encoding, a warning is emitted
 
-**Function signatures:** Internal wasm function sigs are widened: every wasm
-`i32` param/result becomes IR `I64`. Trampolines convert at the wasm/host
-boundary so external observers (host functions, the embedder) keep seeing
-raw `i32`.
+**Function signatures:** Internal wasm function sigs are widened: wasm `i32`
+params/results become IR `I64`, and wasm `i64` params/results become IR
+`I128`. Trampolines convert at the wasm/host boundary so external observers
+(host functions, the embedder) keep seeing raw integer values.
 
 **AN-encoding injection:** The operations are modified when wasm is being translated to CLIF (Cranelift intermidiate representation), since information from wasm is needed (since we can't encode wasm linear memory, we need to know which memory accesses do what [to know if we can encode them], which would be lost in later stages)
 
-**Canonical invariant:** After every operation, encoded i32 values are
-brought back to `A·v with v ∈ [0, 2³²)`. This is what lets compares,
-addresses, and host-call args work directly on the encoded form without
-needing per-use decode.
+**Canonical invariant:** After every operation, encoded integer values are
+brought back to their canonical range (`i32`: `A·v` with `v ∈ [0, 2³²)`;
+`i64`: `A·v` with `v ∈ [0, 2⁶⁴)`). This is what lets compares, addresses, and
+host-call args work directly on the encoded form when the operation permits it.
 
 ### Supported and unsupported features
 
@@ -169,7 +170,7 @@ needing per-use decode.
 | `i32` | everything based on i32 should work, excepting conversions to not supported types and atomics, except i64 (see *Per-op behaviour*) |
 | linear memory (incl. multi-memory, bulk-memory, `memory.grow`) | encoded shadow, verified at use (per-slot on guest loads + host reads) |
 | tables, `call_indirect` | i32 index/length operands decoded around the builtin |
-| `i64` | allowed, but outside of encoding, warning emitted |
+| `i64` | encoded as `I128` (`A·v`), see the i64 notes under *Per-op behaviour* |
 | imported (non-shared) memories | stores mirror through the owner's shadow via `VMMemoryImport::an_enc_base_slot` |
 |floats|**refused** at compile time
 |SIMD|**refused** at compile time
@@ -179,48 +180,63 @@ needing per-use decode.
 | component-model async (futures / streams) | **refused** via the feature mask under AN |
 | GC / exceptions / stack switching proposals | **refused** via the feature mask under AN |
 | Winch | **refused** at config validation |
-|wmemcheck| nothing implemented yet, so probably breaks
+| wmemcheck | not part of the supported AN surface; the stack-pointer update path performs the same codeword check before its decode when the feature is built, but there is no full AN+wmemcheck coverage |
 
 ### Per-op behaviour
 
+The table below describes the i32 implementation. Encoded i64 values mostly use
+the same strategy on the wider canonical band (`A·v`, `v ∈ [0, 2⁶⁴)`) with IR
+type `I128`; the i64-specific notes follow the table.
+
 | Op | Strategy |
 |---|---|
-| `i32.const k` | emit `iconst.i64 (A·k)` |
+| `i32.const k` | Emit `iconst.i64 (A·k)` |
 | `i32.add` | `iadd` then canonicalize via overflow-check: `sum >= A·2³² ? sum - A·2³² : sum` |
 | `i32.sub` | `isub` then canonicalize via underflow-check: `diff < 0 ? diff + A·2³² : diff` |
 | `i32.mul` | `(P_hi, P_lo) = (umulhi, imul)(A·n, A·m) → udiv_u128_by_u64_const(·, A) → umod_u128_by_u64_const_to_i64(·, A·2³²)`. See *i32.mul* note below |
 | `i32.div_u` | `(arg1 udiv arg2) · A` (one A naturally cancels) |
-| `i32.rem_u` | unchanged: `A·n urem A·m = A·(n urem m)`  |
-| `i32.div_s` | sign detected via `enc ≥ A·2³¹`, encoded absolute via `aw − enc` (with `aw = A·2³²`), `udiv` on absolutes (A cancels), re-encode `· A`, re-apply result sign (`s1 ⊕ s2`). Explicit `INT_MIN/-1 -> INTEGER_OVERFLOW` trap on encoded operands before the abs step. `/0` trap via `translate_udiv` on `abs2` (`abs2 = 0` iff `arg2 = 0`). Zero-quotient negation special-cased to preserve canonical form. |
-| `i32.rem_s` | same sign-detect + abs trick, but uses `urem`, which preserves the `A` factor (`urem(A·\|n\|, A·\|m\|) = A·(\|n\| urem \|m\|)`), so no re-encode needed. Result takes the dividend's sign. `INT_MIN%-1` falls out as `urem(A·2³¹, A) = 0` (no trap, matches wasm). |
+| `i32.rem_u` | Unchanged: `A·n urem A·m = A·(n urem m)`  |
+| `i32.div_s` | Sign detected via `enc ≥ A·2³¹`, encoded absolute via `aw − enc` (with `aw = A·2³²`), `udiv` on absolutes (A cancels), re-encode `· A`, re-apply result sign (`s1 ⊕ s2`). Explicit `INT_MIN/-1 -> INTEGER_OVERFLOW` trap on encoded operands before the abs step. `/0` trap via `translate_udiv` on `abs2` (`abs2 = 0` iff `arg2 = 0`). Zero-quotient negation special-cased to preserve canonical form. |
+| `i32.rem_s` | Same sign-detect + abs trick, but uses `urem`, which preserves the `A` factor (`urem(A·\|n\|, A·\|m\|) = A·(\|n\| urem \|m\|)`), so no re-encode needed. Result takes the dividend's sign. `INT_MIN%-1` falls out as `urem(A·2³¹, A) = 0` (no trap, matches wasm). |
 | `i32.eqz` | `icmp_imm Equal arg 0` produces an i8 boolean, then `select(bool, A, 0)` to encode as `0`/`A` |
-| `i32.lt_u`, `le_u`, `gt_u`, `ge_u`, `eq`, `ne` | compare encoded operands directly (A preserves order + zero), then `select(bool, A, 0)` to encode the boolean result |
-| `i32.lt_s`, `le_s`, `gt_s`, `ge_s` | remap each operand to `c' = (c + A·2³¹) mod (A·2³²)`, then unsigned compare |
-| `i32.and`, `i32.or`, `i32.xor` | tabulated on functional 8-bit chunks via `emit_an_bitwise_i32` (like the paper). One `udiv` per operand decodes; four `(c1<<8)\|c2` indexes load `A·(c1 OP c2)` from a 256×256 `i32` table (zero-extended to `i64`), then `acc += entry << (8·i)` recombines to `A·(n OP m)`. Tables live on the `Engine` (per-A, generated by `crates/wasmtime/src/runtime/an_lut.rs`); their address is loaded from a fixed `VMContext` slot at op-site (`load.i64 [vmctx + offset]`), so the same machine code is portable across processes. |
-| `i32.not` | wasm has no native `i32.not`; written as `i32.const -1; i32.xor` and follows the `i32.xor` LUT path. |
-| `i32.shl` | decode count (`udiv enc_k, A`), mask `& 31`. Value stays encoded: helper `emit_an_shl_i32` computes `enc_v · 2^k`, then canonicalizes via the existing 128/64 `umod_u128_by_u64_const_to_i64` against `A·2³²`. |
-| `i32.shr_u` | decode count, mask `& 31`. `udiv(enc_v, A·2^k)` cancels `A` out of the dividend naturally, giving raw `v >> k`; re-encode with `· A`. **Note:** Paper decodes count and uses it as index to LUT  |
-| `i32.shr_s` | reuse `emit_an_shr_u_i32` for the logical part, then `iadd` an encoded sign-extension mask if `enc_v ≥ A·2³¹` (negative). Mask is `A·((1<<k)−1)·2^(32−k) = aw − (aw >> k_mod)` -> two instr., unlike paper's `signExt[]` table. Addition is exact because the logical shift result has top `k` bits clear. **Note:** same as above|
+| `i32.lt_u`, `le_u`, `gt_u`, `ge_u`, `eq`, `ne` | Compare encoded operands directly (A preserves order + zero), then `select(bool, A, 0)` to encode the boolean result |
+| `i32.lt_s`, `le_s`, `gt_s`, `ge_s` | Remap each operand to `c' = (c + A·2³¹) mod (A·2³²)`, then unsigned compare |
+| `i32.and`, `i32.or`, `i32.xor` | Tabulated on functional 8-bit chunks via `emit_an_bitwise_i32` (like the paper). One `udiv` per operand decodes; four `(c1<<8)\|c2` indexes load `A·(c1 OP c2)` from a 256×256 `i32` table (zero-extended to `i64`), then `acc += entry << (8·i)` recombines to `A·(n OP m)`. Tables live on the `Engine` (per-A, generated by `crates/wasmtime/src/runtime/an_lut.rs`); their address is loaded from a fixed `VMContext` slot at op-site (`load.i64 [vmctx + offset]`), so the same machine code is portable across processes. |
+| `i32.not` | Wasm has no native `i32.not`; written as `i32.const -1; i32.xor` and follows the `i32.xor` LUT path. |
+| `i32.shl` | Decode count (`udiv enc_k, A`), mask `& 31`. Value stays encoded: helper `emit_an_shl_i32` computes `enc_v · 2^k`, then canonicalizes via the existing 128/64 `umod_u128_by_u64_const_to_i64` against `A·2³²`. |
+| `i32.shr_u` | Decode count, mask `& 31`. `udiv(enc_v, A·2^k)` cancels `A` out of the dividend naturally, giving raw `v >> k`; re-encode with `· A`. **Note:** Paper decodes count and uses it as index to LUT  |
+| `i32.shr_s` | Reuse `emit_an_shr_u_i32` for the logical part, then `iadd` an encoded sign-extension mask if `enc_v ≥ A·2³¹` (negative). Mask is `A·((1<<k)−1)·2^(32−k) = aw − (aw >> k_mod)` -> two instr., unlike paper's `signExt[]` table. Addition is exact because the logical shift result has top `k` bits clear. **Note:** same as above|
 | `i32.rotl`, `i32.rotr` | `(v << k_mod) \| (v >> (32−k_mod))`,  bit ranges disjoint, so OR ≡ ADD on encoded sums. Implemented as `iadd(emit_an_shl_i32, emit_an_shr_u_i32)` with appropriate shift amounts. Both helpers support shift `[0, 32]`; at `k_mod = 0` the "complement" shift naturally returns 0 (shl(_, 32) ≡ 0 mod `aw`; shr_u(_, 32) ≡ 0 since `enc_v < aw`), so identity rotation falls out without special-case. |
 | `i32.clz`, `i32.ctz`, `i32.popcnt` | Decode once (`udiv enc, A`), `ireduce.i32`, native op, `uextend.i64`, re-encode by `· A`. **Note:** impossible without decode, as it is bit-level inspection (afaik) |
-| `i32.load{,8_u,16_u,8_s,16_s}` | for memory32 (i32 indices): decode addr (÷A → trunc.i32) → wasm load (raw) → `uextend.i64` → ·A. Loads pull from the raw buffer. **Verify-at-use (mandatory under AN):** an inline assertion (`enc_slot == A * u32_le(raw_slot)`) fires per touched shadow slot right after the raw load (after its bounds enforcement — so a guard-page-protected raw access traps first on OOB and the shadow heap buffer is never indexed out of bounds — but before the loaded value is used); mismatch → immediate `AnMemoryMismatch` trap. This is the guest-read half of verify-at-use (replaces the removed host-boundary cross-check). For memory64 the popped i64 address is raw and passes through; the loaded value is still encoded if the result type is i32. |
-| `i32.store` (4-byte) | decode addr, decode value (÷A → trunc.i32); wasm store raw. **Plus** AN-encoded mirror: runtime branch on `effective_addr & 3`. Aligned path (`byte_pos == 0`) does a single `store.i64 [enc_base + 2*effective_addr]` of the encoded operand `A*v`. Unaligned path decomposes into four byte-RMWs at consecutive byte addresses; each helper computes its own slot index so cross-slot transitions fall out automatically. |
-| `i32.store8` | decode addr, decode value; wasm store raw byte. **Plus** single byte-RMW on the shadow slot containing the target byte. `i32.store8` always fits in one slot. |
-| `i32.store16` | decode addr, decode value; wasm store raw half. **Plus** two byte-RMWs at `effective_addr` and `effective_addr + 1`. Covers in-slot (`byte_pos in 0..=2`) and cross-slot (`byte_pos == 3`) cases uniformly because each byte-RMW computes its own slot index. |
-| `i64.store{,8,16,32}` | decomposed into one or two raw i32 sub-stores (`translate_non_i32_store_an`), each mirrored into the shadow via the same aligned/unaligned dispatch as `i32.store{,8,16}` — keeps the shadow consistent for i64 data without encoding the i64 value itself |
-| `v128.store` (and lane stores) | loud translation error under AN (`wasm_unsupported!`); unreachable in practice since SIMD is feature-masked off |
-| `local.{get,set,tee}` (i32) | type widened to I64 by the sig/locals widening |
-| `global.get` (i32) | i32 globals are stored encoded, so no per-access tranform is needed for the guest. Their `VMGlobalDefinition` storage type is widened to `I64` in `make_global` (the slot is 16 bytes, so there is room). Imports, defined globals, and constant-folded immutable globals all load the encoded form (constant-folded ones emit `iconst.i64 (A·v)` directly). Decoding happens only at external boundaries |
-| `global.set` (i32) | the operand is already the canonical encoded `A·v` (`I64`), so no change is needed. Non-i32 globals pass through unchanged. Encoding/decoding happens only at external boundaries |
-| `i32.extend8_s` / `i32.extend16_s` | stays inside the encoding. Decode (`udiv → ireduce.i32`, no codeword check because of structural invariant, matches `clz`/`ctz`/`popcnt`), sign-extend the low byte/half-word to i32, re-encode via `emit_an_encode_raw_i32` (`uextend.i64 → · A`). |
-| `i32.wrap_i64` | raw i64 → encoded i32. Take low 32 bits (`ireduce.i32`), re-encode. Wasm-spec: no trap. Input is *not* a codeword (raw i64), so no codeword check. Compile emits a one-shot per-module warning ([Conversion warning](#conversion-warning)). |
-| `i64.extend_i32_s` / `i64.extend_i32_u` | encoded i32 → raw i64. Boundary codeword check via `emit_an_conversion_decode_i32` (optionally bumps by `an_inject_conversion_fault` first), then `urem` + `trapnz` against `Trap::AnCodewordInvalid`, then decode `udiv A → ireduce.i32`, then `sextend`/`uextend` to `I64`. Output leaves the AN encoding; warning emitted at compile time. |
-| `br_if` / `if` / `select` cond | unchanged |
-| host-import call (wasm → host) | decode i32 args, encode i32 returns at the `wasm_to_array` trampoline. After the call the trampoline emits the `an_resync_host_boundary` libcall — **dirty-heal only** (re-encode memories the host borrowed wholesale via `Memory::data_mut`; whole-dirty flag). The old whole-memory cross-check that ran pre-call is removed — corruption is caught at use (guest load / host read) — and the pre-call libcall itself is gone (a no-op: nothing is whole-dirty entering a host call). Range-tracked host writes (`Memory::write`, wiggle, component lowering) re-encode their exact ranges at the write site. **Boundary codeword check** is emitted on every encoded i32 arg before the `udiv` decode: `val % A != 0 → Trap::AnCodewordInvalid`. |
-| host → wasm entry call | encode i32 args, decode i32 returns at the `array_to_wasm` trampoline. **Boundary codeword check** is emitted on every encoded i32 result before the `udiv` decode. |
+| `i32.load{,8_u,16_u,8_s,16_s}` | For memory32 (i32 indices): decode addr (÷A → trunc.i32) → wasm load (raw) → `uextend.i64` → ·A. For memory64, decode the encoded i64 address (`I128` → raw `I64`) before the bounds check; the loaded value is still encoded if the result type is i32. Loads pull from the raw buffer. **Verify-at-use (mandatory under AN):** an inline assertion (`enc_slot == A * u32_le(raw_slot)`) fires per touched shadow slot right after the raw load (after its bounds enforcement — so a guard-page-protected raw access traps first on OOB and the shadow heap buffer is never indexed out of bounds — but before the loaded value is used); mismatch → immediate `AnMemoryMismatch` trap. This is the guest-read half of verify-at-use (replaces the removed host-boundary cross-check). |
+| `i32.store` (4-byte) | Decode addr, decode value (÷A → trunc.i32); wasm store raw. **Plus** AN-encoded mirror: runtime branch on `effective_addr & 3`. Aligned path (`byte_pos == 0`) does a single `store.i64 [enc_base + 2*effective_addr]` of the encoded operand `A*v`. Unaligned path decomposes into four byte-RMWs at consecutive byte addresses; each helper computes its own slot index so cross-slot transitions fall out automatically. |
+| `i32.store8` | Decode addr, decode value; wasm store raw byte. **Plus** single byte-RMW on the shadow slot containing the target byte. `i32.store8` always fits in one slot. |
+| `i32.store16` | Decode addr, decode value; wasm store raw half. **Plus** two byte-RMWs at `effective_addr` and `effective_addr + 1`. Covers in-slot (`byte_pos in 0..=2`) and cross-slot (`byte_pos == 3`) cases uniformly because each byte-RMW computes its own slot index. |
+| `local.{get,set,tee}` (i32) | Type widened to `I64` by the sig/locals widening. |
+| `global.get` (i32) | `I32` globals are stored encoded, so no per-access transform is needed for the guest. Storage is widened to `I64`; imports, defined globals, and constant-folded immutable globals all load the encoded form directly. Decoding happens only at external boundaries |
+| `global.set` (i32) | The operand is already the canonical encoded `A·v`, so no change is needed on the guest path. Non-integer globals pass through unchanged. Encoding/decoding happens only at external boundaries |
+| `i32.extend8_s` / `i32.extend16_s` | Codeword-check the operand, keep the low encoded byte/half-word with `enc mod (A·2^bits)`, then add the encoded sign-extension correction when the low sign bit is set. |
+| `br_if` / `if` / `select` cond | Unchanged |
+| host-import call (wasm → host) | Decode encoded integer args, encode integer returns at the `wasm_to_array` trampoline. After the call the trampoline emits the `an_resync_host_boundary` libcall — **dirty-heal only** (re-encode memories the host borrowed wholesale via `Memory::data_mut`; whole-dirty flag). The old whole-memory cross-check that ran pre-call is removed — corruption is caught at use (guest load / host read) — and the pre-call libcall itself is gone (a no-op: nothing is whole-dirty entering a host call). Range-tracked host writes (`Memory::write`, wiggle, component lowering) re-encode their exact ranges at the write site. **Boundary codeword check** is emitted on every encoded integer arg before the `udiv` decode: `val % A != 0 → Trap::AnCodewordInvalid`. |
+| host → wasm entry call | Encode integer args, decode encoded integer returns at the `array_to_wasm` trampoline. **Boundary codeword check** is emitted on every encoded integer result before the `udiv` decode. |
 
+For i64, these operators follow the same AN strategy as their i32 counterpart,
+only with `I128`, 64-bit raw values, and the canonical band `A·2⁶⁴`: `const`,
+`add`, `sub`, `eqz`, all integer compares, `extend8_s` / `extend16_s` /
+`extend32_s`, `clz`, `ctz`, `popcnt`, `shl`, `shr_u`, `shr_s`, `rotl`, `rotr`,
+`and`, `or`, `xor`, `local.{get,set,tee}`, guest-side `global.get/set`, and
+memory64 address decode. Signed comparisons use the same bias-remap idea at
+`A·2⁶³`; i64 boolean results are still encoded i32 booleans (`0` / `A`).
 
+The i64 cases that differ from the i32 baseline are:
 
+| Op(s) | Difference |
+|---|---|
+| `i64.mul` | Stays encoded, but building `A²·n·m` can exceed 128 bits. Because no 256-bit intermediate is materialized, overflow traps as `Trap::AnI64WidenOverflow`; otherwise the implementation divides by `A` to get the encoded product `A·n·m`, then canonicalizes modulo `A·2⁶⁴`. For a 128-bit `(q_hi, q_lo)` value this modulus is cheap: result = `(q_hi % A, q_lo)`, so the value never leaves the encoding. |
+| `i64.div_u/s`, `i64.rem_u/s` | Uses the software `emit_udivrem_i128` helper because Cranelift has no general `udiv.i128` lowering. The AN arithmetic mirrors i32 (`A` cancels for division, unsigned remainder keeps the factor), but the implementation is an I128 long-division path. |
+| `i64.load{,8,16,32}_{u,s}` / `i64.store{,8,16,32}` | Raw linear memory still stores bytes. A full i64 spans two 4-byte AN shadow slots: loads verify the touched slot(s), reconstruct the raw i64, then encode to `I128`; stores decode the `I128` value to raw bytes and update the affected i32-sized shadow slots. |
+| `i32.wrap_i64` | Reduces an encoded i64 modulo `A·2³²`, yielding an encoded i32. Wasm-spec: no trap. |
+| `i64.extend_i32_s/u` | Does not decode/re-encode. It checks the encoded i32 input, then widens in the encoded domain; the signed form adds `A·(2⁶⁴−2³²)` when the original i32 sign bit is set. |
 
 ### `i32.mul` note
 
@@ -232,26 +248,12 @@ High level overview (see `crates/cranelift/src/translate/an_helpers.rs` for more
 
 For this, several helper functions have been implemented.
 
-
-
-
-
-### Conversion warning
-
-When `tunables.an_encoding == true` and the module contains an `i32 ↔ i64`
-conversion op (e.g. `i32.wrap_i64`, `i64.extend_i32_s/u`),
-`validate_an_encoding_constraints` walks every function body once and emits a
-single `log::warn!` per module: i32 values crossing these ops leave the AN
-encoding and the resulting i64 operands are not AN-protected.
-The implementation lives in
-`crates/wasmtime/src/compile.rs::is_i32_i64_conversion_op`.
-
 ### Validity checks
 
 Codeword-validity (`val % A == 0`) is checked at the wasm/host trampoline
 boundaries (both directions — core-wasm trampolines in `compiler.rs` and the
 component-model `translate_hostcall` path in `compiler/component.rs`) and at
-the `i64.extend_i32_s/u` conversion decode sites. Additionally, it is checked in every operand that requires a decode (e.g. `clz`, `and`, subword/unaligned `i32.store`, ...) See *New traps* below.
+the `i64.extend_i32_s/u` conversion sites before widening. Additionally, it is checked in every operand that requires a decode (e.g. `clz`, `and`, subword/unaligned `i32.store`, ...) See *New traps* below.
 
 Errors occurring during the decoding operation itself are not detected.
 
@@ -272,20 +274,25 @@ shadow slot disagrees with raw bytes:
 `Trap::AnCodewordInvalid` (variant `49`) is raised by the boundary codeword
 validity check at every wasm/host trampoline decode site. Specifically:
 
-- `compile_wasm_to_array_trampoline` emits the check on every encoded i32
-  arg before the `udiv` decode (wasm caller invokes a host import).
-- `array_to_wasm_trampoline` emits the check on every encoded i32 result
-  before the `udiv` decode (host invokes wasm via the entry trampoline).
+- `compile_wasm_to_array_trampoline` emits the check on every encoded integer
+  scalar arg before decode (wasm caller invokes a host import).
+- `array_to_wasm_trampoline` emits the check on every encoded integer scalar
+  result before decode (host invokes wasm via the entry trampoline).
 - the component hostcall trampoline (`translate_hostcall`) emits the check
-  on every encoded i32 param before decode.
-- every `i64.extend_i32_s/u` conversion decode site emits the check before
-  taking the i32 out of the encoding.
+  on every encoded integer scalar param before decode.
+- every `i64.extend_i32_s/u` conversion site emits the check before widening
+  the encoded i32 to encoded i64.
 - every op-internal decode site (see *Validity checks* above: `clz`, `and`,
   subword/unaligned `i32.store`, ...) emits the check on the encoded operand
   before the decoding `udiv`.
-- the host boundary `Global::get` (i32) checks the encoded 64-bit slot before
+- the host boundary `Global::get` (i32 and i64) checks the encoded slot before
   decode; `get` *panics* on an invalid codeword, `try_get` returns
   `Err(Trap::AnCodewordInvalid)`.
+
+`Trap::AnI64WidenOverflow` (variant `50`) is raised by `i64.mul` when the
+stays-encoded product `A²·n·m` overflows 128 bits (no 256-bit intermediate is
+materialized). This is the one place AN-on and AN-off diverge for a non-refused
+op. Although it should be rare, as most `i64` values are probably pointers.
 
 
 
@@ -297,7 +304,10 @@ validity check at every wasm/host trampoline decode site. Specifically:
 
 The tests were generated with the help of AI.
 
-```cargo test -p wasmtime-cli --test all an_encoding::``` 
+```
+cargo test -p wasmtime-cli --test all an_encoding::
+```
+
 group with AN off and on:
 
 | Test | Coverage |
@@ -308,7 +318,17 @@ group with AN off and on:
 | `data_mut_between_calls_resynced_before_guest_load` | a legitimate `Memory::data_mut` write between top-level calls must be re-encoded at wasm entry before the guest's mandatory load-check runs, else it false-traps on a stale shadow (regression guard for the entry heal) |
 | `ops_{without_an,with_an}` | one wat module exporting one function per touched operator: add, sub, mul, divu, remu, divs, rems, addconst, lt_u, ge_u, gt_u, eq, ne, eqz, lt_s/le_s/gt_s/ge_s, and/or/xor/not/mask_merge, shl/shr_u/shr_s/rotl/rotr, clz/ctz/popcnt, max_u, loop_count, digits, memory load/store, mutable i32 global (g_get/g_set/g_inc) plus negative immutable initializer. Shifts/rotations cover 12 value patterns × 14 shift counts (including wraparound > 32). Includes trap assertions for `div_s` (`/0`, `INT_MIN/-1`) and `rem_s` (`/0`, `INT_MIN%-1 → 0`). |
 | `ops_with_an_custom_constants` | re-runs the `ops_*` assertions with several non-default values of `A` (1, 7, 1009, 2²³ − 1) to verify the codegen reads `A` from `Tunables` rather than baking the default in |
-| `global_boundary_{without,with}_an` / `global_import_{without,with}_an` / `global_boundary_various_an_constants` | host-boundary global encode/decode. `global_boundary_*` exports a mutable and an immutable i32 global directly and cross-checks the host view (`Global::get`/`set`) against the guest view (`global.get`/`set`) over a value matrix (incl. negatives, `i32::MIN/MAX`); the host always sees raw values while storage stays encoded. `global_import_*` imports a host-created (`Global::new`) i32 global into the module, exercising the `VMGlobalKind::Host` storage path (host init + `set`/`get` + guest mutation round-trip). `_various` re-runs both under `A ∈ {1, 7, 1009, 2²³ − 1}`. AN-off counterparts confirm identical behavior. |
+| `i64_addwrap_{without,with}_an` / `add64_{without,with}_an` / `i64ops_{without,with}_an` | core i64 ops, AN-off as oracle. `add64`/`i64_addwrap` cover `i64.add`/`i64.sub` with wraparound at the `A·2⁶⁴` band edge; `i64ops` covers the full compare set (`lt`/`le`/`gt`/`ge` signed+unsigned, `eq`/`ne`/`eqz`) over a MIN/MAX/-1 boundary matrix verified against a Rust oracle (signed vs unsigned must disagree on the high half — the `A·2⁶³` bias remap), plus `extend8_s`/`extend16_s`/`extend32_s`. |
+| `divrem_{without,with}_an` | `i64.div_u/div_s/rem_u/rem_s` over a sign-combination + MIN/MAX/-1-dividend pair matrix (vs a Rust oracle) via the software I128 long-division helper (`emit_udivrem_i128`); asserts the exact trap **code** — `IntegerDivisionByZero` for `/0` (every op, six dividends) and `IntegerOverflow` for `INT_MIN/-1` (div_s) — and `INT_MIN % -1 = 0`. |
+| `i64_bitwise_{without,with}_an` / `i64_shift_{without,with}_an` | `i64.and/or/xor` via the 8-chunk LUT + I128 accumulator over chunk-crossing operand pairs, and `clz/ctz/popcnt` — all vs a Rust oracle. `i64.shl/shr_u/shr_s/rotl/rotr` over an 8-value × 13-count matrix (counts incl. `≥ 64` to exercise the `&63` mask on every op, negative values for `shr_s`/`rotr`) checked against the Rust oracle. |
+| `mul64_{without,with}_an` / `mul64_overflow_traps_under_an` / `mul64_no_overflow_with_an_constant_1` | stays-encoded `i64.mul` matches AN-off on products kept within the 128-bit band; `mul64_overflow_traps_under_an` asserts the overflowing product `(1<<62)²` raises `Trap::AnI64WidenOverflow` across every legal `A > 4`; `mul64_no_overflow_with_an_constant_1` confirms `A=1` (identity encoding) never overflows the 128-bit product. |
+| `i64_mem_{without,with}_an` / `i64_load_validity_check_traps_on_raw_tamper` | `i64.load`/`i64.store` (the two-independent-i32-shadow-slot decomposition) over aligned/unaligned/cross-slot (the unaligned 8-byte span straddles three slots) offsets × a MIN/MAX/all-ones/zero value set, plus the narrow `i64.store{8,16,32}` round-tripped through `i64.load{8,16,32}_{u,s}` at aligned/unaligned/cross-slot offsets. `i64_load_validity_check_traps_on_raw_tamper`: an untracked `data_ptr` tamper in either 4-byte half of a stored i64 makes the load trap `AnMemoryMismatch`. |
+| `i64_global_{without,with}_an` | guest-side mutable i64 global (`get`/`set`/`inc`) stored in the widened `I128` slot + immutable const-folded i64, AN-off as oracle. |
+| `i64_ops_various_an_constants` | the i64 analogue of `ops_with_an_custom_constants`: re-runs the entire guest-side i64 surface (add/sub/wrap, the op battery, div/rem, bitwise, shift/rotate, mul, memory, globals) across `A ∈ {1, 7, 1009, 2²³ − 1}`, proving the i64 codegen reads `A` from `Tunables` — in particular the software I128 long-division helper and the bitwise-LUT scaling. |
+| `global_i64_boundary_{without,with}_an` / `global_i64_import_{without,with}_an` / `global_i64_codeword_setup` driving `global_i64_try_get_{clean_passes,invalid_codeword_traps}` / `global_i64_get_panics_on_invalid_codeword` | host-boundary i64 globals: `boundary` cross-checks the host `Global::get`/`set` view against the guest view over a value matrix (incl. min/max/negatives); `import` exercises the `Global::new` host-storage path; the codeword trio asserts a non-multiple-of-`A` i64 slot makes `try_get` return `Err(Trap::AnCodewordInvalid)` and `get` panic. `boundary`/`import` re-run across `A ∈ {1, 7, 1009, 2²³ − 1}` via `global_boundary_various_an_constants`. |
+| `codeword_check::codeword_check_clean_wasm_to_host_i64_params` / `codeword_check_clean_host_to_wasm_i64_returns` / `codeword_check_traps_wasm_to_host_i64_args_with_injection` / `codeword_check_traps_host_to_wasm_i64_returns_with_injection` | i64 boundary codeword check, both directions: clean i64 args/results pass; with `an_inject_codeword_fault` the trampoline bumps the first encoded i64 arg/result so the modulo check traps `Trap::AnCodewordInvalid`. |
+| `component_codeword::component_i64_arg_passthrough_{without,with}_an` / `component_i64_various_an_constants` / `component_i64_codeword_check_traps_with_injection` | component-model i64 *scalar* params at the canonical-ABI hostcall trampoline: round-trip across the full i64 range (incl. MIN/MAX) under AN, swept over `A ∈ {1, 7, 1009, 65521, 2²³ − 1}`; the fault-inject case confirms the component boundary codeword check fires like the core path. |
+| `global_boundary_{without,with}_an` / `global_import_{without,with}_an` / `global_boundary_various_an_constants` | host-boundary global encode/decode. `global_boundary_*` exports mutable and immutable i32/i64 globals directly and cross-checks the host view (`Global::get`/`set`) against the guest view (`global.get`/`set`) over a value matrix (incl. negatives and min/max); the host always sees raw values while storage stays encoded. `global_import_*` imports host-created (`Global::new`) integer globals into the module, exercising the `VMGlobalKind::Host` storage path (host init + `set`/`get` + guest mutation round-trip). `_various` re-runs both under `A ∈ {1, 7, 1009, 2²³ − 1}`. AN-off counterparts confirm identical behavior. |
 | `refuse_float_{param,result,local,global,op}_under_an` | a float in a function signature, global, local, or operator stream must fail compilation under AN with a "floating-point" message |
 | `refuse_shared_memory_under_an` | compiles a shared-memory wat module under AN and asserts the error mentions AN-encoding |
 | `imported_memory_compiles_under_an` / `imported_memory_stores_mirror_owner_shadow` / `imported_memory_tamper_{raw,shadow}_traps` / `imported_memory_bulk_ops_keep_shadow` / `imported_memory_grow_through_importer` / `imported_memory_various_an_constants` / `host_created_memory_imported_under_an` | imported-memory support matrix: an exporting instance owns the memory and the importer stores/loads/fills/copies/grows through it; verify-at-use covers the import (clean runs pass via guest-load read-backs; raw/shadow tampering is caught by a host `Memory::read` of the owner); a host-created `Memory::new` import works incl. the `Memory::write`/`data_mut` host-write paths; re-run across `A ∈ {1, 7, 1009, 65521, 2²³−1}` |
@@ -321,9 +341,10 @@ group with AN off and on:
 | `component_an::transcode_string_roundtrip_{without,with}_an` | end-to-end: lowers a host `&str` into a component and reads back its UTF-8 byte length (ASCII `"hello"` → 5; multi-byte `"héllo"` → 6). Exercises the whole string-ABI path under AN: transcoder trampoline arg-decode/result-encode, the realloc call into AN-compiled core wasm, and the raw `may_enter`/`may_leave` instance-flag globals (encode-on-get / decode-on-set). Before the flag fix this trapped "cannot leave component instance". |
 | `component_an::resource_new_drop_{without,with}_an` | end-to-end `resource.new` + `resource.drop` under AN, returning the handle index. Guards `translate_resource_drop`'s hand-written trampoline decoding its i32 handle index; before the fix the encoded handle reached the host as "unknown handle index 65521" (`A·1`). |
 | `refuse_atomic_{load,store,rmw_add,rmw_cmpxchg,fence}_under_an` / `refuse_memory_atomic_{notify,wait32}_under_an` | each compiles a wat module exercising a representative threads-proposal atomic operator and asserts compilation fails with "AN-encoding" in the message |
-| `memory64_with_an_is_allowed_with_warning` | memory64 + AN compiles (warning-only) |
+| `memory32_address_codeword_check_traps` | memory32 + AN checks the encoded i32 address before decoding it for bounds/address calculation; corrupting the address global to a non-codeword traps as `AnCodewordInvalid` before the memory access |
+| `memory64_with_an_is_allowed_and_encoded` / `memory64_address_codeword_check_traps` | memory64 + AN executes i32/i64 store/load round-trips through encoded i64 addresses, including nonzero/unaligned offsets; corrupting the encoded i64 address traps as `AnCodewordInvalid` before the memory access |
 | `instantiate_data_segment_under_an` | smoke test: AN-encoding shadow init does not panic when a data segment is present at instantiation |
-| `fault_inject_flip_in_raw_traps` / `fault_inject_flip_in_shadow_traps` | flip a bit in raw memory (untracked, via `Memory::data_ptr` — `data_mut` would mark whole-dirty and be legitimately resynced) resp. in the encoded shadow (`an_shadow_data_mut_for_test`) after instantiation; a host `Memory::read` of the tampered slot fails its verify-at-use cross-check (and reports the AN mismatch in the error message, not a generic "out of bounds") |
+| `fault_inject_flip_in_raw_traps` / `fault_inject_flip_in_shadow_traps` / `subword_store_checks_old_shadow_codeword` | flip a bit in raw memory (untracked, via `Memory::data_ptr` — `data_mut` would mark whole-dirty and be legitimately resynced) resp. in the encoded shadow (`an_shadow_data_mut_for_test`) after instantiation; a host `Memory::read` of the tampered slot fails its verify-at-use cross-check (and reports the AN mismatch in the error message, not a generic "out of bounds"). The subword-store regression corrupts an old shadow slot and confirms the byte-RMW path traps `AnCodewordInvalid` before decoding/merging it. |
 | `try_data_traps_on_tamper` / `try_data_mut_traps_on_tamper` / `try_data_clean_passes` | fallible `Memory` twins: a pre-existing raw/shadow divergence makes `try_data`/`try_data_mut` return `Err(Trap::AnMemoryMismatch)` (where `data`/`data_mut` would panic); `try_data_mut` cross-checks before marking whole-dirty; the clean case returns `Ok` with the live bytes |
 | `global_try_get_clean_passes` / `global_try_get_invalid_codeword_traps` / `global_get_panics_on_invalid_codeword` | host-boundary `Global::get` codeword validity: a slot corrupted to a non-multiple of `A` (injected via `an_corrupt_i64_slot_for_test`) makes `try_get` return `Err(Trap::AnCodewordInvalid)` and `get` panic; the clean case round-trips |
 | `component_an::try_as_le_slice_clean_and_tamper` / `component_an::as_le_slice_panics_on_tamper` | fallible `WasmList` twin: a `list<u32>` lifted from core memory reads back clean via `try_as_le_slice`; tampering a raw byte in the list's range makes `try_as_le_slice` return `Err(Trap::AnMemoryMismatch)` while `as_le_slice` panics |
@@ -354,7 +375,7 @@ group with AN off and on:
 | `memory64_mixed_copy_len_decodes` | `memory.copy` with memory64 destination ← memory32 source: the i32-typed `len` (the *min* of the two index types) is decoded — the gate consults both memories |
 | `simd_refused_under_an` / `gc_ops_refused_under_an` / `exceptions_refused_under_an` / `explicit_simd_enable_conflicts_with_an` / `winch_strategy_refused_under_an` | the feature mask refuses SIMD/GC/exception modules under AN; explicitly enabling a masked feature, or selecting the Winch strategy, alongside AN is a config error |
 | `component_core_module_float_refused_under_an` | component core modules pass through the same AN validation as plain core modules (float refusal) |
-| `int_conversions::int_conversions_codeword_check_traps_with_injection` / `int_conversions_codeword_check_traps_various_an_constants` / `int_conversions_no_codeword_trap_without_injection` | conversion boundary-codeword check coverage on `i64.extend_i32_s/u`. `Config::an_inject_conversion_fault(1)` bumps the encoded i32 by 1 at the decode site (harness funcs source their i32 from `i32.const`, so the conversion site is the first decode boundary), guaranteeing a `Trap::AnCodewordInvalid` for `A > 1`. `_various` covers `A ∈ {7, 1009, 65521, 2^23 − 1}`. The no-injection counterpart confirms no false-positive at any legal A. |
+| `int_conversions::int_conversions_codeword_check_traps_with_injection` / `int_conversions_codeword_check_traps_various_an_constants` / `int_conversions_no_codeword_trap_without_injection` | conversion boundary-codeword check coverage on `i64.extend_i32_s/u`. `Config::an_inject_conversion_fault(1)` bumps the encoded i32 by 1 at the conversion site before widening (harness funcs source their i32 from `i32.const`, so no trampoline-side check intercepts first), guaranteeing a `Trap::AnCodewordInvalid` for `A > 1`. `_various` covers `A ∈ {7, 1009, 65521, 2^23 − 1}`. The no-injection counterpart confirms no false-positive at any legal A. |
 | `memory_copy_source_tamper_traps` | **host-read verify-at-use (memory.copy source).** A consistent source region is filled, then a source byte is tampered via the untracked `data_ptr` path; `memory.copy` to a disjoint destination must trap `AnMemoryMismatch` at the source cross-check — before the copy laundered the divergence into a valid destination codeword (which it did pre-fix: the test was RED with `got Ok`). Clean copies (`bulk_memory_copy_keeps_shadow_consistent`) still pass. |
 | `component_an::component_lift_clean_run_passes` / `component_lift_tamper_traps` | **host-read verify-at-use (component lifting).** A core module's `start` writes `"hello"` at offset 16 (mirrored into the shadow); a host import `sink(string)` lifts it. Clean: the host receives `"hello"` with no false trap. Tamper: a raw byte flipped via `data_ptr` (reached through the new `Instance::an_core_memory_for_test`) makes the lift trap `AnMemoryMismatch`. RED pre-fix (`got Ok`). |
 | `data_mut_whole_verify_detects_pre_existing_corruption` | **`Memory::data_mut` pre-borrow whole verify.** A raw byte tampered via `data_ptr` before a `data_mut` borrow must be caught by the whole-memory cross-check that runs *before* the borrow's laundering whole-re-encode. Infallible accessor → asserted via `#[should_panic(expected = "AnMemoryMismatch")]`. |
@@ -404,4 +425,3 @@ WASMTIME_LOG=warn ./target/debug/wasmtime run --dir . -C an-encoding=y -C cache=
 ```
 
 Add `--target pulley64` to compile for the Pulley interpreter backend.
-

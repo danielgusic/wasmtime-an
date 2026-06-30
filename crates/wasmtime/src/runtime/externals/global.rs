@@ -150,11 +150,11 @@ impl Global {
     /// Fallible counterpart to [`Global::get`].
     ///
     /// Behaves exactly like [`Global::get`] but, when AN-encoding is on and
-    /// this is an encoded i32 global whose 64-bit slot fails the codeword
+    /// this is an encoded integer global whose storage slot fails the codeword
     /// validity check (`encoded % A != 0`, i.e. the slot is not a valid `A*v`),
     /// returns `Err(`[`Trap::AnCodewordInvalid`]`)` instead of panicking. When
     /// propagated out of a host call it raises the `AnCodewordInvalid` wasm
-    /// trap. With AN-encoding off (or for non-i32 globals) this never fails.
+    /// trap. With AN-encoding off (or for non-integer globals) this never fails.
     pub fn try_get(&self, mut store: impl AsContextMut) -> Result<Val> {
         let mut store = AutoAssertNoGc::new(store.as_context_mut().0);
         self._try_get(&mut store)
@@ -164,7 +164,7 @@ impl Global {
         unsafe {
             let definition = self.definition(store).as_ref();
             match self._ty(&store).content() {
-                ValType::I32 => match self.an_constant_for_i32(&store) {
+                ValType::I32 => match self.an_constant_for_encoded_global(&store) {
                     // AN-encoded storage holds `A * v` in the 64-bit slot;
                     // decode back to the raw i32 the host expects.
                     //
@@ -185,7 +185,20 @@ impl Global {
                     }
                     None => Val::from(*definition.as_i32()),
                 },
-                ValType::I64 => Val::from(*definition.as_i64()),
+                ValType::I64 => match self.an_constant_for_encoded_global(&store) {
+                    // Storage holds `A * v` across the 128-bit slot; codeword-
+                    // check and decode back to the raw i64 the host expects.
+                    Some(a) => {
+                        let enc = definition.get_u128();
+                        assert!(
+                            a == 1 || enc % u128::from(a) == 0,
+                            "AN-encoding: Global::get over an invalid i64 codeword \
+                             (AnCodewordInvalid); use try_get to handle"
+                        );
+                        Val::from((enc / u128::from(a)) as u64 as i64)
+                    }
+                    None => Val::from(*definition.as_i64()),
+                },
                 ValType::F32 => Val::F32(*definition.as_u32()),
                 ValType::F64 => Val::F64(*definition.as_u64()),
                 ValType::V128 => Val::V128(definition.get_u128().into()),
@@ -247,16 +260,25 @@ impl Global {
 
     /// Fallible decode used by [`Global::try_get`].
     ///
-    /// Only the AN-encoded i32 path can fail (an invalid codeword in the 64-bit
-    /// slot); every other value type is read verbatim. Validate the codeword up
-    /// front so the otherwise-infallible [`Global::_get`] below never reaches
-    /// its panic, then delegate to it for the actual read.
+    /// Only AN-encoded integer paths can fail (an invalid codeword in their
+    /// storage slot); every other value type is read verbatim. Validate the
+    /// codeword up front so the otherwise-infallible [`Global::_get`] below
+    /// never reaches its panic, then delegate to it for the actual read.
     pub(crate) fn _try_get(&self, store: &mut AutoAssertNoGc<'_>) -> Result<Val> {
         if let ValType::I32 = self._ty(store).content() {
-            if let Some(a) = self.an_constant_for_i32(store) {
+            if let Some(a) = self.an_constant_for_encoded_global(store) {
                 // SAFETY: same definition access as `_get`; reading the slot.
                 let enc = unsafe { *self.definition(store).as_ref().as_i64() } as u64;
                 if a != 1 && enc % a != 0 {
+                    return Err(crate::Trap::AnCodewordInvalid.into());
+                }
+            }
+        }
+        if let ValType::I64 = self._ty(store).content() {
+            if let Some(a) = self.an_constant_for_encoded_global(store) {
+                // SAFETY: same definition access as `_get`; reading the 128-bit slot.
+                let enc = unsafe { self.definition(store).as_ref().get_u128() };
+                if a != 1 && enc % u128::from(a) != 0 {
                     return Err(crate::Trap::AnCodewordInvalid.into());
                 }
             }
@@ -267,8 +289,7 @@ impl Global {
     /// Test-only: overwrite this global's raw 64-bit storage slot, bypassing
     /// AN-encoding. Lets a test inject an invalid codeword (a value that is not
     /// `A * v`) so the host-boundary validity check in
-    /// [`Global::get`]/[`Global::try_get`] can be exercised. No-op safety: only
-    /// meaningful for i32 globals under AN-encoding.
+    /// [`Global::get`]/[`Global::try_get`] can be exercised.
     #[doc(hidden)]
     pub fn an_corrupt_i64_slot_for_test(&self, mut store: impl AsContextMut, raw: i64) {
         let store = store.as_context_mut().0;
@@ -277,6 +298,20 @@ impl Global {
         // performs.
         unsafe {
             *self.definition(store).as_mut().as_i64_mut() = raw;
+        }
+    }
+
+    /// Test-only: overwrite this global's raw 128-bit storage slot, bypassing
+    /// AN-encoding. Lets tests inject invalid i64 codewords across the full
+    /// widened slot.
+    #[doc(hidden)]
+    pub fn an_corrupt_u128_slot_for_test(&self, mut store: impl AsContextMut, raw: u128) {
+        let store = store.as_context_mut().0;
+        // SAFETY: the definition pointer is valid for this global within the
+        // store and writing its 128-bit slot is the same storage access used by
+        // encoded i64 globals.
+        unsafe {
+            self.definition(store).as_mut().set_u128(raw);
         }
     }
 
@@ -323,13 +358,20 @@ impl Global {
         unsafe {
             let definition = self.definition(&store).as_mut();
             match val {
-                Val::I32(i) => match self.an_constant_for_i32(&store) {
+                Val::I32(i) => match self.an_constant_for_encoded_global(&store) {
                     // Encode the raw i32 as `A * v` and widen into the 64-bit
                     // slot so guest `global.get` observes a canonical codeword.
-                    Some(a) => *definition.as_i64_mut() = a.wrapping_mul(u64::from(*i as u32)) as i64,
+                    Some(a) => {
+                        *definition.as_i64_mut() = a.wrapping_mul(u64::from(*i as u32)) as i64
+                    }
                     None => *definition.as_i32_mut() = *i,
                 },
-                Val::I64(i) => *definition.as_i64_mut() = *i,
+                Val::I64(i) => match self.an_constant_for_encoded_global(&store) {
+                    // Encode the raw i64 as `A * v` across the full 128-bit slot
+                    // so guest `global.get` observes a canonical codeword.
+                    Some(a) => definition.set_u128((*i as u64 as u128).wrapping_mul(u128::from(a))),
+                    None => *definition.as_i64_mut() = *i,
+                },
                 Val::F32(f) => *definition.as_u32_mut() = *f,
                 Val::F64(f) => *definition.as_u64_mut() = *f,
                 Val::V128(i) => definition.set_u128((*i).into()),
@@ -517,9 +559,10 @@ impl Global {
     /// Returns `Some(A)` when this global's storage is AN-encoded. Only real
     /// wasm-module globals (`Instance`/`Host`) use encoded storage. The
     /// component-internal flag globals (`ComponentFlags`/`TaskMayBlock`) are
-    /// manipulated raw by the runtime trampolines and are excluded. Callers
-    /// must only consult this from an i32 context.
-    fn an_constant_for_i32(&self, store: &StoreOpaque) -> Option<u64> {
+    /// manipulated raw by the runtime trampolines and are excluded. Consulted
+    /// from both i32 (storage `A*v` in the low 64 bits) and i64 (storage `A*v`
+    /// across the full 128-bit slot) contexts.
+    fn an_constant_for_encoded_global(&self, store: &StoreOpaque) -> Option<u64> {
         let tunables = store.engine().tunables();
         if tunables.an_encoding
             && matches!(self.kind, VMGlobalKind::Instance(_) | VMGlobalKind::Host(_))

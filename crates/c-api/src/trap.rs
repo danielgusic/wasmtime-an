@@ -56,6 +56,7 @@ const _: () = {
     assert!(Trap::StreamOpTooBig as u8 == 47);
     assert!(Trap::AnMemoryMismatch as u8 == 48);
     assert!(Trap::AnCodewordInvalid as u8 == 49);
+    assert!(Trap::AnI64WidenOverflow as u8 == 50);
 };
 
 #[repr(C)]

@@ -1,6 +1,6 @@
 //! Helpers for the AN-encoding paths in `code_translator.rs`.
 //!
-//! Two families of helpers live here:
+//! The i32 helpers here:
 //!
 //! 1. **`i32.mul`**: stays-encoded multiply via Möller-Granlund 2-by-1 division
 //!    (see below).
@@ -12,6 +12,12 @@
 //!    lives in a fixed `VMContext` slot; JIT'd code loads it via
 //!    `vmctx + offset` so the same machine code is portable across processes
 //!    (cwasm-friendly).
+//!
+//! The i64 family (`emit_an_*_i64`, `emit_udivrem_i128`, `iconst_i128`) mirrors
+//! the i32 ops one width up: i64 values are held as `I128` codewords (`A*v`), so
+//! these helpers do materialize `I128` values, build 64x64->128 partial
+//! products (`emit_an_mul_i64`), and run a full 128-bit long division
+//! (`emit_udivrem_i128`).
 //!
 //! Stays-encoded `i32.mul` is implemented as:
 //!
@@ -29,9 +35,10 @@
 //! `udiv.i64`-by-constant; the resulting `(r1, n_lo)` pair (with `r1 < d`) is
 //! then handed to the 2-by-1 step.
 //!
-//! All emitted IR is plain `i64` arithmetic plus `umulhi.i64` and
-//! `uadd_overflow.i64`. We never materialize an `i128` value, never compute a
-//! 128*128-bit product, and never invoke `udiv` on anything wider than `i64`.
+//! The i32.mul IR is plain `i64` arithmetic plus `umulhi.i64` and
+//! `uadd_overflow.i64`: it never materializes an `i128`, never computes a
+//! 128*128-bit product, and never invokes `udiv` on anything wider than `i64`.
+//! (The i64 family above does use `I128`.)
 
 use crate::func_environ::FuncEnvironment;
 use crate::translate::TargetEnvironment;
@@ -396,6 +403,7 @@ pub(crate) fn emit_an_byte_store_rmw(
 
     let mem_flags = MemFlags::trusted();
     let old_enc = builder.ins().load(I64, mem_flags, enc_slot_addr, 0);
+    emit_an_codeword_validity_check(builder, a, old_enc);
     let old_raw = builder.ins().udiv(old_enc, a_const);
     let raw_cleared = builder.ins().band(old_raw, slot_keep_mask);
     let new_raw_unmasked = builder.ins().bor(raw_cleared, byte_value_shifted);
@@ -536,7 +544,9 @@ fn check_one_slot_validity(
     let expected = builder.ins().imul(raw_slot_u64, a_const);
 
     let mismatch = builder.ins().icmp(IntCC::NotEqual, enc_slot, expected);
-    builder.ins().trapnz(mismatch, crate::TRAP_AN_MEMORY_MISMATCH);
+    builder
+        .ins()
+        .trapnz(mismatch, crate::TRAP_AN_MEMORY_MISMATCH);
 }
 
 /// Emit a boundary-side AN codeword validity check.
@@ -568,34 +578,6 @@ pub(crate) fn emit_an_codeword_validity_check(
     let a_const = builder.ins().iconst(I64, a as i64);
     let r = builder.ins().urem(val_i64, a_const);
     builder.ins().trapnz(r, crate::TRAP_AN_CODEWORD_INVALID);
-}
-
-/// Conversion-boundary decode of an AN-encoded i32: optionally inject a
-/// fault offset (test-only `tunables.an_inject_conversion_fault`), assert
-/// codeword validity (`val % A == 0`), then decode to a raw `I32`.
-///
-/// Use this at every cross-type conversion op that hands an encoded i32 to
-/// a non-i32 sink (`i64.extend_i32_s/u`). For ops that keep the i32 inside
-/// the encoding (e.g. `i32.extend8_s/16_s`), use the plain `udiv`/`ireduce`
-/// pattern from `clz`/`ctz`/`popcnt` — no check needed since the invariant
-/// is structurally maintained. (Float conversions are refused wholesale, so
-/// they never reach this helper.)
-pub(crate) fn emit_an_conversion_decode_i32(
-    builder: &mut FunctionBuilder,
-    environ: &mut FuncEnvironment<'_>,
-    enc_v: Value,
-) -> Value {
-    let a = environ.tunables().an_constant;
-    let fault = environ.tunables().an_inject_conversion_fault;
-    let bumped = if fault != 0 {
-        builder.ins().iadd_imm(enc_v, fault as i64)
-    } else {
-        enc_v
-    };
-    emit_an_codeword_validity_check(builder, a, bumped);
-    let a_const = builder.ins().iconst(I64, a as i64);
-    let raw_i64 = builder.ins().udiv(bumped, a_const);
-    builder.ins().ireduce(I32, raw_i64)
 }
 
 /// Encode a wasm-`i32` boolean (Cranelift `I8` result of `icmp`/`fcmp`/
@@ -716,8 +698,7 @@ pub(crate) fn emit_an_bitwise_i32(
     let a = environ.tunables().an_constant;
     debug_assert!(a >= 1, "AN constant must be positive");
 
-    // Load the LUT base pointer from this op's VMContext slot. Single load per
-    // op (could be hoisted by GVN if multiple ops share a basic block).
+    // Load the LUT base pointer from this op's VMContext slot.
     let table_offset = op.vmctx_offset(&environ.offsets.ptr);
     let vmctx_gv = environ.vmctx(&mut builder.func);
     let vmctx_val = builder.ins().global_value(I64, vmctx_gv);
@@ -780,4 +761,325 @@ pub(crate) fn emit_an_bitwise_i32(
     }
 
     acc.expect("loop runs four iterations")
+}
+
+// i64 AN-encoding helpers. An encoded i64 is a clif `I128` holding `A*v` with
+// `v in [0, 2^64)`, so the canonical band is `[0, A*2^64) ⊂ [0, 2^87)`. These
+// mirror the i32 helpers above, widened to I128. Only x64 + aarch64 are
+// targeted; both lower every I128 op used here. Note `A*2^64 > u64::MAX`, so
+// canonicalization mod `A*2^64` is done with I128 compare+subtract by callers,
+// not via `umod_u128_by_u64_const_to_i64` (whose divisor must fit in `u64`).
+
+/// Materialize a 128-bit integer constant as an `I128` value. `iconst` only
+/// accepts ≤64-bit immediates, so build the two halves and `iconcat`.
+pub(crate) fn iconst_i128(builder: &mut FunctionBuilder, val: u128) -> Value {
+    let lo = builder.ins().iconst(I64, val as u64 as i64);
+    let hi = builder.ins().iconst(I64, (val >> 64) as u64 as i64);
+    builder.ins().iconcat(lo, hi)
+}
+
+/// Encode a raw `I64` value `v` into the canonical AN-encoded `I128` form
+/// `A * v`. Fits in 128 bits because `A < 2^23` ⇒ `A * v < 2^87`. Takes `A`
+/// directly so it works from the wasm/host trampolines (which have no
+/// `FuncEnvironment`).
+pub(crate) fn emit_an_encode_raw_i64(
+    builder: &mut FunctionBuilder,
+    a: u64,
+    raw_i64: Value,
+) -> Value {
+    let a_const = iconst_i128(builder, a as u128);
+    let zext = builder.ins().uextend(I128, raw_i64);
+    builder.ins().imul(zext, a_const)
+}
+
+/// I128 analogue of [`emit_an_codeword_validity_check`]: assert an encoded i64
+/// (`I128` holding `A*v`) is a valid codeword (`enc % A == 0`). Uses the
+/// limb-based `umod_u128_by_u64_const_to_i64` since i128 `urem` is not lowered.
+pub(crate) fn emit_an_codeword_validity_check_i128(
+    builder: &mut FunctionBuilder,
+    a: u64,
+    enc_i128: Value,
+) {
+    if a == 1 {
+        return;
+    }
+    let (lo, hi) = builder.ins().isplit(enc_i128);
+    let r = umod_u128_by_u64_const_to_i64(builder, hi, lo, a);
+    builder.ins().trapnz(r, crate::TRAP_AN_CODEWORD_INVALID);
+}
+
+/// Decode an AN-encoded i64 (`I128` holding `A*v`) back to a raw `I64`. Emits
+/// the codeword validity check first. Inverse of [`emit_an_encode_raw_i64`].
+/// Takes `A` directly so it works from the wasm/host trampolines.
+pub(crate) fn emit_an_decode_i64(builder: &mut FunctionBuilder, a: u64, enc_i128: Value) -> Value {
+    emit_an_codeword_validity_check_i128(builder, a, enc_i128);
+    let (lo, hi) = builder.ins().isplit(enc_i128);
+    // v = (A*v)/A < 2^64, so the quotient's high half is 0 and the low half is v.
+    let (_q_hi, q_lo) = udiv_u128_by_u64_const(builder, hi, lo, a);
+    q_lo
+}
+
+/// Count leading zeros of an `I128`, returned as an `I64` in `[0, 128]`. Built
+/// from `clz.i64` on the halves to avoid depending on `clz.i128` lowering.
+fn clz_i128(builder: &mut FunctionBuilder, x: Value) -> Value {
+    let (lo, hi) = builder.ins().isplit(x);
+    let clz_hi = builder.ins().clz(hi);
+    let clz_lo = builder.ins().clz(lo);
+    let lo_plus = builder.ins().iadd_imm(clz_lo, 64);
+    let hi_is_zero = builder.ins().icmp_imm(IntCC::Equal, hi, 0);
+    builder.ins().select(hi_is_zero, lo_plus, clz_hi)
+}
+
+/// General unsigned `(a / b, a % b)` on `I128` values (normalized
+/// shift-subtract). Iterates only over the quotient's bit-length
+/// (`clz(b) − clz(a) + 1` steps), not a fixed 128. Traps
+/// `INTEGER_DIVISION_BY_ZERO` when `b == 0`. Returns `(quotient, remainder)`.
+pub(crate) fn emit_udivrem_i128(
+    builder: &mut FunctionBuilder,
+    a: Value,
+    b: Value,
+) -> (Value, Value) {
+    let zero = iconst_i128(builder, 0);
+    let one = iconst_i128(builder, 1);
+
+    let b_is_zero = builder.ins().icmp(IntCC::Equal, b, zero);
+    builder
+        .ins()
+        .trapnz(b_is_zero, ir::TrapCode::INTEGER_DIVISION_BY_ZERO);
+
+    let setup = builder.create_block();
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(done, I128); // quotient
+    builder.append_block_param(done, I128); // remainder
+
+    // a < b  ⇒  (0, a); else fall through to the division setup.
+    let a_lt_b = builder.ins().icmp(IntCC::UnsignedLessThan, a, b);
+    builder
+        .ins()
+        .brif(a_lt_b, done, &[zero.into(), a.into()], setup, &[]);
+
+    // setup: align the divisor to the dividend's top set bit.
+    builder.switch_to_block(setup);
+    builder.seal_block(setup);
+    let clz_a = clz_i128(builder, a);
+    let clz_b = clz_i128(builder, b);
+    let sh = builder.ins().isub(clz_b, clz_a); // ≥ 0 since a ≥ b here
+    let d0 = builder.ins().ishl(b, sh);
+    builder.append_block_param(header, I64); // i: counter, sh down to 0
+    builder.append_block_param(header, I128); // q
+    builder.append_block_param(header, I128); // rem
+    builder.append_block_param(header, I128); // d (aligned divisor)
+    builder
+        .ins()
+        .jump(header, &[sh.into(), zero.into(), a.into(), d0.into()]);
+
+    // header: loop while i ≥ 0.
+    builder.switch_to_block(header);
+    let i = builder.block_params(header)[0];
+    let q = builder.block_params(header)[1];
+    let rem = builder.block_params(header)[2];
+    let d = builder.block_params(header)[3];
+    let i_neg = builder.ins().icmp_imm(IntCC::SignedLessThan, i, 0);
+    builder
+        .ins()
+        .brif(i_neg, done, &[q.into(), rem.into()], body, &[]);
+
+    // body: one long-division step, then back to the header.
+    builder.switch_to_block(body);
+    builder.seal_block(body);
+    let q_shl = builder.ins().ishl_imm(q, 1);
+    let ge = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, rem, d);
+    let rem_sub = builder.ins().isub(rem, d);
+    let rem_next = builder.ins().select(ge, rem_sub, rem);
+    let q_set = builder.ins().bor(q_shl, one);
+    let q_next = builder.ins().select(ge, q_set, q_shl);
+    let d_next = builder.ins().ushr_imm(d, 1);
+    let i_next = builder.ins().iadd_imm(i, -1);
+    builder.ins().jump(
+        header,
+        &[i_next.into(), q_next.into(), rem_next.into(), d_next.into()],
+    );
+    builder.seal_block(header); // predecessors: setup + body
+
+    builder.switch_to_block(done);
+    builder.seal_block(done); // predecessors: entry + header
+    let q_res = builder.block_params(done)[0];
+    let r_res = builder.block_params(done)[1];
+    (q_res, r_res)
+}
+
+/// i64 analogue of [`emit_an_bitwise_i32`]. Decodes both encoded i64 operands
+/// to raw i64, tabulates the op on eight 8-bit chunks via the same 256×256
+/// `A*(c1 OP c2)` table, and recombines into an encoded `I128` accumulator
+/// `A*(n OP m)` (bounded by `A*(2^64-1) < 2^87`, fits I128). Decoding is
+/// inherent here — the LUT is indexed by the raw bytes.
+pub(crate) fn emit_an_bitwise_i64(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+    op: AnBitwiseOp,
+    arg1: Value,
+    arg2: Value,
+) -> Value {
+    let a = environ.tunables().an_constant;
+    debug_assert!(a >= 1, "AN constant must be positive");
+
+    // Load the LUT base pointer from this op's VMContext slot.
+    let table_offset = op.vmctx_offset(&environ.offsets.ptr);
+    let vmctx_gv = environ.vmctx(&mut builder.func);
+    let vmctx_val = builder.ins().global_value(I64, vmctx_gv);
+    let mut readonly_mem = MemFlags::trusted();
+    readonly_mem.set_readonly();
+    let base = builder.ins().load(
+        I64,
+        readonly_mem,
+        vmctx_val,
+        ir::immediates::Offset32::new(table_offset.into()),
+    );
+
+    // Decode both operands to raw i64 (codeword-checked inside the decode).
+    let n = emit_an_decode_i64(builder, a, arg1);
+    let m = emit_an_decode_i64(builder, a, arg2);
+
+    let mut acc: Option<Value> = None;
+    for i in 0..8u32 {
+        let shift = (i * 8) as i64;
+        let n_shifted = if shift == 0 {
+            n
+        } else {
+            builder.ins().ushr_imm(n, shift)
+        };
+        let m_shifted = if shift == 0 {
+            m
+        } else {
+            builder.ins().ushr_imm(m, shift)
+        };
+        let c1 = builder.ins().band_imm(n_shifted, 0xff);
+        let c2 = builder.ins().band_imm(m_shifted, 0xff);
+
+        let c1_hi = builder.ins().ishl_imm(c1, 8);
+        let idx = builder.ins().bor(c1_hi, c2);
+        let byte_off = builder.ins().ishl_imm(idx, 2);
+        let entry_addr = builder.ins().iadd(base, byte_off);
+
+        let entry_i32 = builder.ins().load(I32, readonly_mem, entry_addr, 0);
+        // Widen to I128 for the accumulator; entries are non-negative.
+        let entry = builder.ins().uextend(I128, entry_i32);
+        let term = if shift == 0 {
+            entry
+        } else {
+            builder.ins().ishl_imm(entry, shift)
+        };
+
+        acc = Some(match acc {
+            None => term,
+            Some(prev) => builder.ins().iadd(prev, term),
+        });
+    }
+    acc.expect("loop runs eight iterations")
+}
+
+/// i64 analogue of [`emit_an_shl_i32`]. Computes `A * ((v << k) mod 2^64)` from
+/// `enc_v = A*v` and a raw (decoded) count `k` in `[0, 64]`. Stays encoded for
+/// all `k`: `(v<<k) mod 2^64 = (v mod 2^(64-k)) << k`, so the result is
+/// `(enc_v mod (A*2^(64-k))) << k`, which is always `< A*2^64` (no overflow, no
+/// trap). The mod by the runtime divisor `A*2^j` (with `j = 64-k`) uses the
+/// limb const-divide: `x mod (A*2^j) = x - ((⌊x/2^j⌋ / A) * A << j)`.
+pub(crate) fn emit_an_shl_i64(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+    enc_v: Value,
+    k_mod: Value,
+) -> Value {
+    let a = environ.tunables().an_constant;
+    let sixtyfour = builder.ins().iconst(I64, 64);
+    let j = builder.ins().isub(sixtyfour, k_mod); // 64 - k, in [0, 64]
+    let xs = builder.ins().ushr(enc_v, j); // ⌊enc_v / 2^j⌋
+    let (xs_lo, xs_hi) = builder.ins().isplit(xs);
+    let (q_hi, q_lo) = udiv_u128_by_u64_const(builder, xs_hi, xs_lo, a);
+    let q = builder.ins().iconcat(q_lo, q_hi);
+    let a128 = iconst_i128(builder, a as u128);
+    let qa = builder.ins().imul(q, a128);
+    let sub = builder.ins().ishl(qa, j);
+    let lowpart = builder.ins().isub(enc_v, sub); // enc_v mod (A*2^j)
+    builder.ins().ishl(lowpart, k_mod)
+}
+
+/// i64 analogue of [`emit_an_shr_u_i32`]. Computes `A * (v >> k)` from
+/// `enc_v = A*v` and a raw count `k` in `[0, 64]`. Since
+/// `⌊enc_v/(A*2^k)⌋ = ⌊⌊enc_v/2^k⌋/A⌋ = v>>k` (raw), divide by `2^k` then by the
+/// constant `A`, and re-encode. Codeword-checks the value first.
+pub(crate) fn emit_an_shr_u_i64(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+    enc_v: Value,
+    k_mod: Value,
+) -> Value {
+    let a = environ.tunables().an_constant;
+    emit_an_codeword_validity_check_i128(builder, a, enc_v);
+    let xs = builder.ins().ushr(enc_v, k_mod); // ⌊A*v / 2^k⌋
+    let (xs_lo, xs_hi) = builder.ins().isplit(xs);
+    let (_q_hi, q_lo) = udiv_u128_by_u64_const(builder, xs_hi, xs_lo, a); // v>>k (raw, < 2^64)
+    emit_an_encode_raw_i64(builder, a, q_lo)
+}
+
+/// Stays-encoded i64 multiply with an overflow trap. The full product
+/// `P = (A*n)*(A*m) = A^2*n*m` can reach 2^174, which has no 128-bit
+/// representation; rather than carry a 256-bit intermediate we build the
+/// product from i64 limbs and trap (`TRAP_AN_I64_WIDEN_OVERFLOW`) when its high
+/// 128 bits are non-zero. When it fits, divide by `A` to produce the encoded
+/// product `A*n*m`, then canonicalize it modulo `A*2^64`. Since that modulus is
+/// exactly `A` whole 64-bit limbs, canonicalization is just `(q_hi % A, q_lo)`;
+/// the value never leaves the encoding. The operands' high limbs are `< 2^23`
+/// (`enc < 2^87`), so the bits at/above 128 collapse to a single i64 (`r2`);
+/// overflow iff `r2 != 0`.
+pub(crate) fn emit_an_mul_i64(
+    builder: &mut FunctionBuilder,
+    a: u64,
+    enc_n: Value,
+    enc_m: Value,
+) -> Value {
+    let (n_lo, n_hi) = builder.ins().isplit(enc_n);
+    let (m_lo, m_hi) = builder.ins().isplit(enc_m);
+
+    // Four i64*i64 -> 128 partial products as (hi, lo).
+    let ll_lo = builder.ins().imul(n_lo, m_lo);
+    let ll_hi = builder.ins().umulhi(n_lo, m_lo);
+    let lh_lo = builder.ins().imul(n_lo, m_hi);
+    let lh_hi = builder.ins().umulhi(n_lo, m_hi);
+    let hl_lo = builder.ins().imul(n_hi, m_lo);
+    let hl_hi = builder.ins().umulhi(n_hi, m_lo);
+    let hh = builder.ins().imul(n_hi, m_hi); // n_hi,m_hi < 2^23 -> < 2^46, no high part
+
+    // Limb at bits [64,128): ll_hi + lh_lo + hl_lo, tracking carry into [128,...).
+    let (s1, c1) = builder.ins().uadd_overflow(ll_hi, lh_lo);
+    let (r1, c2) = builder.ins().uadd_overflow(s1, hl_lo);
+    let c1_64 = builder.ins().uextend(I64, c1);
+    let c2_64 = builder.ins().uextend(I64, c2);
+    let carry_r1 = builder.ins().iadd(c1_64, c2_64);
+
+    // Bits [128, ...): lh_hi + hl_hi + hh + carry_r1. All small (< 2^47), so this
+    // single i64 holds the entire high part; non-zero means overflow.
+    let t = builder.ins().iadd(lh_hi, hl_hi);
+    let t = builder.ins().iadd(t, hh);
+    let r2 = builder.ins().iadd(t, carry_r1);
+    let overflow = builder.ins().icmp_imm(IntCC::NotEqual, r2, 0);
+    builder
+        .ins()
+        .trapnz(overflow, crate::TRAP_AN_I64_WIDEN_OVERFLOW);
+
+    // Low 128 bits of the product = (r1, ll_lo) = A^2*n*m. Divide by A to get
+    // Q = A*n*m, then compute Q mod (A*2^64). For Q = (q_hi, q_lo), this
+    // modulus only affects the high limb: result = (q_hi % A, q_lo).
+    let (q_hi, q_lo) = udiv_u128_by_u64_const(builder, r1, ll_lo, a);
+    let r_hi = if a == 1 {
+        builder.ins().iconst(I64, 0)
+    } else {
+        let a_const = builder.ins().iconst(I64, a as i64);
+        builder.ins().urem(q_hi, a_const)
+    };
+    builder.ins().iconcat(q_lo, r_hi)
 }

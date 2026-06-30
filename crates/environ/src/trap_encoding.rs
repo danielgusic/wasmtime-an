@@ -241,6 +241,11 @@ generate_trap_type! {
         /// stack.
         AnCodewordInvalid = "AN-encoding codeword validity check failed",
 
+        /// AN-encoding i64 multiply overflowed the 128-bit encoded product
+        /// (`A^2 * n * m >= 2^128`). The stays-encoded i64 multiply has no
+        /// 256-bit intermediate, so it traps rather than truncate.
+        AnI64WidenOverflow = "AN-encoding i64 multiply product overflowed 128 bits",
+
         // if adding a variant here be sure to update `trap.rs` and `trap.h` as
         // mentioned above
     }

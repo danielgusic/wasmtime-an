@@ -27,3 +27,4 @@ pub use self::table::{TableData, TableSize};
 pub use self::translation_utils::*;
 
 pub(crate) use self::an_helpers::emit_an_codeword_validity_check;
+pub(crate) use self::an_helpers::{emit_an_decode_i64, emit_an_encode_raw_i64, iconst_i128};

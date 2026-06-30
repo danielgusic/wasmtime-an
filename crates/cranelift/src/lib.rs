@@ -77,6 +77,8 @@ pub const TRAP_AN_MEMORY_MISMATCH: TrapCode =
     TrapCode::unwrap_user(Trap::AnMemoryMismatch as u8 + TRAP_OFFSET);
 pub const TRAP_AN_CODEWORD_INVALID: TrapCode =
     TrapCode::unwrap_user(Trap::AnCodewordInvalid as u8 + TRAP_OFFSET);
+pub const TRAP_AN_I64_WIDEN_OVERFLOW: TrapCode =
+    TrapCode::unwrap_user(Trap::AnI64WidenOverflow as u8 + TRAP_OFFSET);
 
 /// Creates a new cranelift `Signature` with no wasm params/results for the
 /// given calling convention.
@@ -146,9 +148,10 @@ fn value_type(isa: &dyn TargetIsa, ty: WasmValType) -> ir::types::Type {
 }
 
 /// Like `value_type` but applies AN-encoding widening: wasm `i32` becomes IR
-/// `I64` when `tunables.an_encoding` is on, so the encoded value `A*v` fits
-/// losslessly. Use this for wasm-internal contexts: function signatures,
-/// locals, block params — places where values flow on the operand stack.
+/// `I64` and wasm `i64` becomes IR `I128` when `tunables.an_encoding` is on, so
+/// the encoded value `A*v` fits losslessly. Use this for wasm-internal contexts:
+/// function signatures, locals, block params — places where values flow on the
+/// operand stack.
 fn wasm_stack_value_type(
     isa: &dyn TargetIsa,
     tunables: &Tunables,
@@ -156,6 +159,7 @@ fn wasm_stack_value_type(
 ) -> ir::types::Type {
     match ty {
         WasmValType::I32 if tunables.an_encoding => ir::types::I64,
+        WasmValType::I64 if tunables.an_encoding => ir::types::I128,
         _ => value_type(isa, ty),
     }
 }

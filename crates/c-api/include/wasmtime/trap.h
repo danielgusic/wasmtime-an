@@ -138,6 +138,12 @@ enum wasmtime_trap_code_enum {
   WASMTIME_TRAP_CODE_REFERENCE_COUNT_OVERFLOW = 46,
   /// A read/write on a stream must be <2**28 items.
   WASMTIME_TRAP_CODE_STREAM_OP_TOO_BIG = 47,
+  /// AN-encoding detected a raw/encoded memory mismatch.
+  WASMTIME_TRAP_CODE_AN_MEMORY_MISMATCH = 48,
+  /// AN-encoding detected an invalid integer codeword.
+  WASMTIME_TRAP_CODE_AN_CODEWORD_INVALID = 49,
+  /// AN-encoding i64 multiply overflowed the 128-bit encoded product.
+  WASMTIME_TRAP_CODE_AN_I64_WIDEN_OVERFLOW = 50,
 };
 
 /**

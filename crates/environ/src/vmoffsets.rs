@@ -497,14 +497,14 @@ pub trait PtrSize {
         self.vmctx_gc_heap_data() + self.size()
     }
 
-    /// AN-encoding bitwise lookup-table base pointers.
-    ///
-    /// Three fixed pointer slots, one per binary bitwise op. When AN-encoding
-    /// is enabled on the engine, instance init writes the address of the
-    /// engine's per-A LUT (`[i32; 256 * 256]`) into each slot. JIT code for
-    /// `i32.{and,or,xor}` reads its base from `vmctx + offset` and indexes
-    /// into the table without any further indirection. When AN-encoding is
-    /// off these slots are left null.
+    // AN-encoding bitwise lookup-table base pointers.
+    //
+    // Three fixed pointer slots, one per binary bitwise op. When AN-encoding
+    // is enabled on the engine, instance init writes the address of the
+    // engine's per-A LUT (`[i32; 256 * 256]`) into each slot. JIT code for
+    // `i32.{and,or,xor}` reads its base from `vmctx + offset` and indexes
+    // into the table without any further indirection. When AN-encoding is
+    // off these slots are left null.
 
     /// Offset of the AN-encoding `i32.and` LUT base pointer.
     #[inline]

@@ -1578,7 +1578,8 @@ fn lower_string<T>(cx: &mut LowerContext<'_, T>, string: &str) -> Result<(usize,
                 );
             }
             let ptr = cx.realloc(0, 0, 1, string.len())?;
-            cx.slice_mut(ptr, string.len()).copy_from_slice(string.as_bytes());
+            cx.slice_mut(ptr, string.len())
+                .copy_from_slice(string.as_bytes());
             Ok((ptr, string.len()))
         }
 

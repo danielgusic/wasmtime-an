@@ -3,7 +3,8 @@
 use crate::func_environ::BuiltinFunctions;
 use crate::trap::TranslateTrap;
 use crate::{
-    BuiltinFunctionSignatures, TRAP_CANNOT_LEAVE_COMPONENT, TRAP_INTERNAL_ASSERT, compiler::Compiler,
+    BuiltinFunctionSignatures, TRAP_CANNOT_LEAVE_COMPONENT, TRAP_INTERNAL_ASSERT,
+    compiler::Compiler,
 };
 use cranelift_codegen::cursor::FuncCursor;
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -925,44 +926,53 @@ impl<'a> TrampolineCompiler<'a> {
         let params = self.abi_load_params();
         let vmctx = params[0];
 
-        // AN-encoding boundary (wasm → host, component path): each wasm `i32`
-        // param arrives widened to `I64` holding `A*v`, but the host expects
-        // raw `i32`. For every i32 param, assert the codeword (`val % A == 0`)
-        // and decode via `udiv` + `ireduce`, mirroring the core-wasm
-        // `compile_wasm_to_array_trampoline` hook.
+        // AN-encoding boundary (wasm → host, component path): wasm integer
+        // scalars arrive encoded (`i32` widened to I64, `i64` widened to I128),
+        // but the host expects raw values. Check each codeword and decode it,
+        // mirroring the core-wasm `compile_wasm_to_array_trampoline` hook.
         //
-        // `an_inject_codeword_fault` (test-only) perturbs the first i32 param
-        // before the check. It is gated on `HostCallee::Lowering` so the
+        // `an_inject_codeword_fault` (test-only) perturbs the first integer
+        // scalar param before the check. It is gated on `HostCallee::Lowering` so the
         // component-runtime libcalls don't false-trap during normal flow.
         let mut wasm_params_owned: Vec<ir::Value> = params[2..].to_vec();
         if self.compiler.tunables().an_encoding {
             let a = self.compiler.tunables().an_constant;
-            let an_const = self
-                .builder
-                .ins()
-                .iconst(ir::types::I64, a as i64);
+            let an_const = self.builder.ins().iconst(ir::types::I64, a as i64);
             let inject_fault = matches!(host_callee, HostCallee::Lowering(_))
                 && self.compiler.tunables().an_inject_codeword_fault != 0;
             let fault_offset = self.compiler.tunables().an_inject_codeword_fault;
-            let mut first_i32_corrupted = false;
+            let mut first_scalar_corrupted = false;
             for (i, ty) in self.signature.params().iter().enumerate() {
                 if matches!(ty, WasmValType::I32) {
-                    if inject_fault && !first_i32_corrupted {
+                    if inject_fault && !first_scalar_corrupted {
                         wasm_params_owned[i] = self
                             .builder
                             .ins()
                             .iadd_imm(wasm_params_owned[i], fault_offset as i64);
-                        first_i32_corrupted = true;
+                        first_scalar_corrupted = true;
                     }
                     crate::translate::emit_an_codeword_validity_check(
                         &mut self.builder,
                         a,
                         wasm_params_owned[i],
                     );
-                    let decoded =
-                        self.builder.ins().udiv(wasm_params_owned[i], an_const);
-                    wasm_params_owned[i] =
-                        self.builder.ins().ireduce(ir::types::I32, decoded);
+                    let decoded = self.builder.ins().udiv(wasm_params_owned[i], an_const);
+                    wasm_params_owned[i] = self.builder.ins().ireduce(ir::types::I32, decoded);
+                } else if matches!(ty, WasmValType::I64) {
+                    if inject_fault && !first_scalar_corrupted {
+                        let offset = crate::translate::iconst_i128(
+                            &mut self.builder,
+                            u128::from(fault_offset),
+                        );
+                        wasm_params_owned[i] =
+                            self.builder.ins().iadd(wasm_params_owned[i], offset);
+                        first_scalar_corrupted = true;
+                    }
+                    wasm_params_owned[i] = crate::translate::emit_an_decode_i64(
+                        &mut self.builder,
+                        a,
+                        wasm_params_owned[i],
+                    );
                 }
             }
         }
@@ -1021,8 +1031,8 @@ impl<'a> TrampolineCompiler<'a> {
         // *into* a host call (the wasm-entry heal and the previous call's
         // post-call resync already covered every window in which a memory can
         // become whole-dirty), and corruption is caught at use, not here.
-        let an_lowering = matches!(host_callee, HostCallee::Lowering(_))
-            && self.compiler.tunables().an_encoding;
+        let an_lowering =
+            matches!(host_callee, HostCallee::Lowering(_)) && self.compiler.tunables().an_encoding;
 
         // Next perform the actual invocation of the host with `host_args`.
         let call = match host_callee {
@@ -1101,12 +1111,11 @@ impl<'a> TrampolineCompiler<'a> {
             }
         };
 
-        // AN-encoding boundary (host → wasm, component path): each `i32`
-        // result from the host (raw `I32`) needs to be re-encoded as
-        // widened `I64` holding `A*v` before being returned to the wasm
-        // caller (whose signature is widened by `wasm_call_signature`
-        // under AN). Mirrors the core-wasm `compile_wasm_to_array_trampoline`
-        // result-encode hook.
+        // AN-encoding boundary (host → wasm, component path): raw integer
+        // scalar results from the host need to be re-encoded before being
+        // returned to the wasm caller (whose signature is widened by
+        // `wasm_call_signature` under AN). Mirrors the core-wasm
+        // `compile_wasm_to_array_trampoline` result-encode hook.
         if self.compiler.tunables().an_encoding {
             let a = self.compiler.tunables().an_constant;
             let an_const = self.builder.ins().iconst(ir::types::I64, a as i64);
@@ -1114,6 +1123,9 @@ impl<'a> TrampolineCompiler<'a> {
                 if matches!(ty, WasmValType::I32) {
                     let widened = self.builder.ins().uextend(ir::types::I64, to_store[i]);
                     to_store[i] = self.builder.ins().imul(widened, an_const);
+                } else if matches!(ty, WasmValType::I64) {
+                    to_store[i] =
+                        crate::translate::emit_an_encode_raw_i64(&mut self.builder, a, to_store[i]);
                 }
             }
         }
@@ -2120,15 +2132,15 @@ impl TrampolineCompiler<'_> {
     // Helper function to cast an input parameter to the host pointer type.
     fn len_param(&mut self, param: usize, is64: bool) -> ir::Value {
         let val = self.builder.func.dfg.block_params(self.block0)[2 + param];
-        // AN-encoding boundary (wasm → host): an i32 wasm param (`!is64`)
-        // arrives widened to `I64` holding `A*v`. The host transcode libcall
-        // wants the raw pointer/length, so decode it. The decoded value
-        // already occupies the full `I64` (`v ∈ [0, 2^32)`) and so is exactly
-        // the zero-extended pointer-width form `cast_to_pointer` would
-        // otherwise produce — no further extension is needed. `i64` params
-        // (memory64) are not encoded and pass straight through.
-        if self.compiler.tunables().an_encoding && !is64 {
-            return self.an_decode_i32_param(val);
+        // AN-encoding boundary (wasm → host): pointer/length core wasm params
+        // arrive encoded and widened. The host transcode libcall wants raw
+        // pointer/length values, so decode before pointer-size casting.
+        if self.compiler.tunables().an_encoding {
+            return if is64 {
+                self.an_decode_i64_param(val)
+            } else {
+                self.an_decode_i32_param(val)
+            };
         }
         self.cast_to_pointer(val, is64)
     }
@@ -2143,6 +2155,16 @@ impl TrampolineCompiler<'_> {
         self.builder.ins().udiv(val, an_const)
     }
 
+    // Decode one AN-encoded i64 wasm param (`A*v`, widened to `I128`) to its
+    // raw value as an `I64`, asserting the codeword is valid first.
+    fn an_decode_i64_param(&mut self, val: ir::Value) -> ir::Value {
+        crate::translate::emit_an_decode_i64(
+            &mut self.builder,
+            self.compiler.tunables().an_constant,
+            val,
+        )
+    }
+
     // Encode a raw `I32` value as the widened `I64` (`A*v`) the wasm caller
     // expects under AN-encoding. Mirrors `an_decode_i32_param` and the
     // host→wasm result-encode in `translate_hostcall`. Used by the hand-written
@@ -2155,16 +2177,27 @@ impl TrampolineCompiler<'_> {
         self.builder.ins().imul(widened, an_const)
     }
 
-    // Re-encode an i32 host result as the widened `I64` (`A*v`) the wasm caller
-    // expects under AN-encoding; `i64` results (memory64) pass through. Used for
-    // the transcode results that flow back into wasm.
+    // Encode a raw `I64` value as the widened `I128` (`A*v`) the wasm caller
+    // expects under AN-encoding.
+    fn an_encode_i64_result(&mut self, raw_i64: ir::Value) -> ir::Value {
+        crate::translate::emit_an_encode_raw_i64(
+            &mut self.builder,
+            self.compiler.tunables().an_constant,
+            raw_i64,
+        )
+    }
+
+    // Re-encode a host pointer/length result as the widened AN value the wasm
+    // caller expects under AN-encoding. Used for transcode results that flow
+    // back into wasm.
     fn encode_result(&mut self, val: ir::Value, is64: bool) -> ir::Value {
         let raw = self.cast_from_pointer(val, is64);
-        if self.compiler.tunables().an_encoding && !is64 {
-            let a = self.compiler.tunables().an_constant;
-            let an_const = self.builder.ins().iconst(ir::types::I64, a as i64);
-            let widened = self.builder.ins().uextend(ir::types::I64, raw);
-            return self.builder.ins().imul(widened, an_const);
+        if self.compiler.tunables().an_encoding {
+            return if is64 {
+                self.an_encode_i64_result(raw)
+            } else {
+                self.an_encode_i32_result(raw)
+            };
         }
         raw
     }
@@ -2259,12 +2292,16 @@ impl TrampolineCompiler<'_> {
             value = self.builder.ins().uextend(wasm_clif_ty, value);
         }
 
-        // AN-encoding (native/host → wasm): an i32 result must be re-encoded as
-        // the widened `I64` (`A*v`) the wasm caller's signature expects. i64
-        // results are outside the encoding and pass through. This hand-written
-        // trampoline bypasses `translate_hostcall`, so it must encode itself.
-        if self.compiler.tunables().an_encoding && wasm_ty == WasmValType::I32 {
-            value = self.an_encode_i32_result(value);
+        // AN-encoding (native/host → wasm): integer scalar results must be
+        // re-encoded to the widened value the wasm caller's signature expects.
+        // This hand-written trampoline bypasses `translate_hostcall`, so it
+        // must encode itself.
+        if self.compiler.tunables().an_encoding {
+            match wasm_ty {
+                WasmValType::I32 => value = self.an_encode_i32_result(value),
+                WasmValType::I64 => value = self.an_encode_i64_result(value),
+                _ => {}
+            }
         }
 
         self.abi_store_results(&[value]);
@@ -2290,14 +2327,19 @@ impl TrampolineCompiler<'_> {
             p => bail!("unsupported architecture: no support for {p}-bit pointers"),
         };
 
-        // AN-encoding (wasm → native/host): an i32 value arrives encoded
-        // (`A*v`, widened to `I64`); decode it to a raw `I32` before narrowing
-        // to the native store width below. i64 values are outside the encoding
-        // and pass through. This hand-written trampoline bypasses
+        // AN-encoding (wasm → native/host): integer scalar values arrive
+        // encoded and widened; decode before narrowing to the native store
+        // width below. This hand-written trampoline bypasses
         // `translate_hostcall`, so it must decode itself.
-        if self.compiler.tunables().an_encoding && wasm_ty == WasmValType::I32 {
-            let decoded = self.an_decode_i32_param(value);
-            value = self.builder.ins().ireduce(ir::types::I32, decoded);
+        if self.compiler.tunables().an_encoding {
+            match wasm_ty {
+                WasmValType::I32 => {
+                    let decoded = self.an_decode_i32_param(value);
+                    value = self.builder.ins().ireduce(ir::types::I32, decoded);
+                }
+                WasmValType::I64 => value = self.an_decode_i64_param(value),
+                _ => {}
+            }
         }
 
         // Truncate the value, if necessary. For example, with

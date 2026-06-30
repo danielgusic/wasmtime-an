@@ -421,15 +421,14 @@ impl wasmtime_environ::Compiler for Compiler {
                 .ins()
                 .iconst(ir::types::I64, self.tunables.an_constant as i64);
             let fault_offset = self.tunables.an_inject_codeword_fault;
-            let mut first_i32_corrupted = false;
+            let mut first_scalar_corrupted = false;
             for (i, ty) in wasm_func_ty.params().iter().enumerate() {
                 if matches!(ty, WasmValType::I32) {
-                    // Test-only fault injection: bump the FIRST i32 arg by the
-                    // configured offset before the codeword check fires.
-                    if fault_offset != 0 && !first_i32_corrupted {
-                        spill_args[i] =
-                            builder.ins().iadd_imm(spill_args[i], fault_offset as i64);
-                        first_i32_corrupted = true;
+                    // Test-only fault injection: bump the first integer scalar
+                    // by the configured offset before the codeword check fires.
+                    if fault_offset != 0 && !first_scalar_corrupted {
+                        spill_args[i] = builder.ins().iadd_imm(spill_args[i], fault_offset as i64);
+                        first_scalar_corrupted = true;
                     }
                     crate::translate::emit_an_codeword_validity_check(
                         &mut builder,
@@ -438,6 +437,20 @@ impl wasmtime_environ::Compiler for Compiler {
                     );
                     let decoded = builder.ins().udiv(spill_args[i], an_const);
                     spill_args[i] = builder.ins().ireduce(ir::types::I32, decoded);
+                } else if matches!(ty, WasmValType::I64) {
+                    if fault_offset != 0 && !first_scalar_corrupted {
+                        let offset =
+                            crate::translate::iconst_i128(&mut builder, u128::from(fault_offset));
+                        spill_args[i] = builder.ins().iadd(spill_args[i], offset);
+                        first_scalar_corrupted = true;
+                    }
+                    // Encoded i64 (`I128` = A*v) → raw I64 for the host's
+                    // `ValRaw` slot. The codeword check runs inside the decode.
+                    spill_args[i] = crate::translate::emit_an_decode_i64(
+                        &mut builder,
+                        self.tunables.an_constant,
+                        spill_args[i],
+                    );
                 }
             }
         }
@@ -530,6 +543,14 @@ impl wasmtime_environ::Compiler for Compiler {
                 if matches!(ty, WasmValType::I32) {
                     let zext = builder.ins().uextend(ir::types::I64, results[i]);
                     results[i] = builder.ins().imul(zext, an_const);
+                } else if matches!(ty, WasmValType::I64) {
+                    // Host returned raw I64 into the `ValRaw` slot; the wasm
+                    // caller expects encoded `I128` (`A*v`).
+                    results[i] = crate::translate::emit_an_encode_raw_i64(
+                        &mut builder,
+                        self.tunables.an_constant,
+                        results[i],
+                    );
                 }
             }
         }
@@ -1424,6 +1445,14 @@ impl Compiler {
                 if matches!(ty, WasmValType::I32) {
                     let zext = builder.ins().uextend(ir::types::I64, args[i]);
                     args[i] = builder.ins().imul(zext, an_const);
+                } else if matches!(ty, WasmValType::I64) {
+                    // Raw I64 from the host's `ValRaw` slot → encoded `I128`
+                    // (`A*v`) for the wasm callee.
+                    args[i] = crate::translate::emit_an_encode_raw_i64(
+                        &mut builder,
+                        self.tunables.an_constant,
+                        args[i],
+                    );
                 }
             }
         }
@@ -1513,14 +1542,14 @@ impl Compiler {
                 .ins()
                 .iconst(ir::types::I64, self.tunables.an_constant as i64);
             let fault_offset = self.tunables.an_inject_codeword_fault;
-            let mut first_i32_corrupted = false;
+            let mut first_scalar_corrupted = false;
             for (i, ty) in callee_sig.results().iter().enumerate() {
                 if matches!(ty, WasmValType::I32) {
-                    if fault_offset != 0 && !first_i32_corrupted {
+                    if fault_offset != 0 && !first_scalar_corrupted {
                         decoded_returns[i] = builder
                             .ins()
                             .iadd_imm(decoded_returns[i], fault_offset as i64);
-                        first_i32_corrupted = true;
+                        first_scalar_corrupted = true;
                     }
                     crate::translate::emit_an_codeword_validity_check(
                         &mut builder,
@@ -1529,6 +1558,20 @@ impl Compiler {
                     );
                     let decoded = builder.ins().udiv(decoded_returns[i], an_const);
                     decoded_returns[i] = builder.ins().ireduce(ir::types::I32, decoded);
+                } else if matches!(ty, WasmValType::I64) {
+                    if fault_offset != 0 && !first_scalar_corrupted {
+                        let offset =
+                            crate::translate::iconst_i128(&mut builder, u128::from(fault_offset));
+                        decoded_returns[i] = builder.ins().iadd(decoded_returns[i], offset);
+                        first_scalar_corrupted = true;
+                    }
+                    // Wasm returned encoded `I128` (`A*v`); the host's `ValRaw`
+                    // slot expects raw I64. Codeword check runs in the decode.
+                    decoded_returns[i] = crate::translate::emit_an_decode_i64(
+                        &mut builder,
+                        self.tunables.an_constant,
+                        decoded_returns[i],
+                    );
                 }
             }
         }

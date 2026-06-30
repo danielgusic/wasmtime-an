@@ -57,9 +57,8 @@ mod runtime;
 /// defined memory gets its own shadow, each verified independently at use
 /// (guest load / host read).
 ///
-/// Memory64 modules are allowed but the user receives a one-shot warning:
-/// values and memory contents stay protected, but the i64 addresses that
-/// flow through memory64 ops are not encoded and therefore not cross-checked.
+/// Memory64 modules are allowed: values, memory contents, and i64 addresses
+/// that flow through memory64 ops are encoded.
 ///
 /// Atomic memory operators (threads proposal) are refused: their shadow
 /// update path is not wired and they would either leave the shadow stale or
@@ -92,31 +91,16 @@ fn validate_an_encoding_constraints(
     // cross-check the owner's shadow too. Shared memories (imported or
     // defined) are refused below.
 
-    let mut saw_memory64 = false;
     for (_, mem) in module.memories.iter() {
         if mem.shared {
-            bail!(
-                "AN-encoding does not support shared (threads proposal) memories."
-            );
+            bail!("AN-encoding does not support shared (threads proposal) memories.");
         }
-        if mem.idx_type == wasmtime_environ::IndexType::I64 {
-            saw_memory64 = true;
-        }
-    }
-    if saw_memory64 {
-        log::warn!(
-            "AN-encoding: module uses memory64; the i64 addresses work but are \
-             not encoded or cross-checked."
-        );
     }
 
-    // Floats are refused wholesale under AN-encoding. The shadow
-    // memory only mirrors i32-family stores; float stores are out of
-    // scope, the boundary codeword check has no symmetric path for
-    // f32/f64, and the conversion-decode path
-    // (`emit_an_conversion_decode_i32`) only handles i32↔float as a one-way
-    // exit (never re-entering AN protection). The refusal below catches
-    // floats at four layers: function signatures, globals, locals, and
+    // Floats are refused wholesale under AN-encoding. The shadow memory mirrors
+    // integer stores; float stores are out of scope, and boundary codeword
+    // checks have no symmetric encode/decode path for f32/f64. The refusal below
+    // catches floats at four layers: function signatures, globals, locals, and
     // operators. Any one is enough to fail; we report the first hit. The
     // reference-type refusal rides the same signature/global/local layers
     // (plus a table-element check), see `wasm_val_type_ref_name`.
@@ -188,7 +172,6 @@ fn validate_an_encoding_constraints(
         }
     }
 
-    let mut saw_i64_conversion = false;
     for (def_func_index, body_data) in translation.function_body_inputs.iter() {
         // 3) Local declarations inside the function body.
         let mut locals_reader = body_data
@@ -241,16 +224,7 @@ fn validate_an_encoding_constraints(
                      Found `{name}` in function {func_index}."
                 );
             }
-            if is_i32_i64_conversion_op(&op) {
-                saw_i64_conversion = true;
-            }
         }
-    }
-    if saw_i64_conversion {
-        log::warn!(
-            "AN-encoding: module contains i32↔i64 conversion ops which work but \
-             are not encoded."
-        );
     }
 
     Ok(())
@@ -301,18 +275,6 @@ fn wasmparser_val_type_float_name(ty: &wasmparser::ValType) -> Option<&'static s
         F64 => Some("f64"),
         _ => None,
     }
-}
-
-/// Return `true` if the operator is a cross-type `i32 ↔ i64` conversion
-/// (`i32.wrap_i64`, `i64.extend_i32_s/u`) — one that takes an i32 out of the AN
-/// encoding into a raw i64, or brings a raw i64 in as an encoded i32. Used by
-/// [`validate_an_encoding_constraints`] to emit a once-per-module warning.
-/// `i32.extend8_s/16_s` stay inside the encoding (i32 → i32) and are
-/// deliberately *not* reported. (Float conversions are refused wholesale, so
-/// they never reach this check.)
-fn is_i32_i64_conversion_op(op: &wasmparser::Operator<'_>) -> bool {
-    use wasmparser::Operator::*;
-    matches!(op, I32WrapI64 | I64ExtendI32S | I64ExtendI32U)
 }
 
 /// Return the operator name for any scalar float-typed wasm operator (`f32.*`
@@ -609,9 +571,9 @@ pub(crate) fn build_component_artifacts<T: FinishedObject>(
         .translate(binary)
         .context("failed to parse WebAssembly module")?;
 
-    // AN-encoding: apply the same refusals to every core module inside the
-    // component (floats, atomics, shared memories, memory64 warning) that
-    // `build_module_artifacts` applies to plain core modules.
+    // AN-encoding: apply the same refusals (floats, atomics, shared memories)
+    // to every core module inside the component that `build_module_artifacts`
+    // applies to plain core modules.
     for (_, translation) in module_translations.iter() {
         validate_an_encoding_constraints(translation, tunables, types.module_types_builder())?;
     }
