@@ -239,7 +239,18 @@ pub fn translate_operator(
                 arg2 = optionally_bitcast_vector(arg2, I8X16, builder);
             }
 
-            let val = builder.ins().select(cond, arg1, arg2);
+            let val = if builder.func.dfg.value_type(arg1) == I128 {
+                // Split into two selects for `I128` codewords, as cranelift fuses
+                // it into `umin`/`umax`/`smin`/`smax` otherwise, which is neither
+                // lowered by aarch64 nor x86_64.
+                let (a_lo, a_hi) = builder.ins().isplit(arg1);
+                let (b_lo, b_hi) = builder.ins().isplit(arg2);
+                let lo = builder.ins().select(cond, a_lo, b_lo);
+                let hi = builder.ins().select(cond, a_hi, b_hi);
+                builder.ins().iconcat(lo, hi)
+            } else {
+                builder.ins().select(cond, arg1, arg2)
+            };
 
             // If either of the input types need inclusion in stack maps, then
             // the result will as well.
