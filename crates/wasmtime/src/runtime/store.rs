@@ -862,6 +862,19 @@ impl<T> Store<T> {
         self.inner.data_mut()
     }
 
+    /// Returns the Wasmtime-managed native stack window for the current guest
+    /// activation as raw host-address-space parts.
+    ///
+    /// This is a test/fault-injection escape hatch. The returned range is
+    /// `[stack_limit, last_wasm_entry_sp)`, so it is the stack area made
+    /// available to the guest for the active host-to-wasm call. It is only
+    /// meaningful while a guest activation is live, and it may include unused
+    /// stack capacity in addition to currently live Wasm frames.
+    #[doc(hidden)]
+    pub fn wasm_stack_raw_parts_for_test(&self) -> Option<(*mut u8, usize)> {
+        self.inner.wasm_stack_raw_parts_for_test()
+    }
+
     fn run_manual_drop_routines(&mut self) {
         StoreData::run_manual_drop_routines(StoreContextMut(&mut self.inner));
 
@@ -1375,6 +1388,19 @@ impl<'a, T> StoreContext<'a, T> {
         self.0.data()
     }
 
+    /// Returns the Wasmtime-managed native stack window for the current guest
+    /// activation as raw host-address-space parts.
+    ///
+    /// This is a test/fault-injection escape hatch. The returned range is
+    /// `[stack_limit, last_wasm_entry_sp)`, so it is the stack area made
+    /// available to the guest for the active host-to-wasm call. It is only
+    /// meaningful while a guest activation is live, and it may include unused
+    /// stack capacity in addition to currently live Wasm frames.
+    #[doc(hidden)]
+    pub fn wasm_stack_raw_parts_for_test(&self) -> Option<(*mut u8, usize)> {
+        self.0.wasm_stack_raw_parts_for_test()
+    }
+
     /// Returns the remaining fuel in this store.
     ///
     /// For more information see [`Store::get_fuel`].
@@ -1423,6 +1449,19 @@ impl<'a, T> StoreContextMut<'a, T> {
     /// For more information see [`Store::get_fuel`]
     pub fn get_fuel(&self) -> Result<u64> {
         self.0.get_fuel()
+    }
+
+    /// Returns the Wasmtime-managed native stack window for the current guest
+    /// activation as raw host-address-space parts.
+    ///
+    /// This is a test/fault-injection escape hatch. The returned range is
+    /// `[stack_limit, last_wasm_entry_sp)`, so it is the stack area made
+    /// available to the guest for the active host-to-wasm call. It is only
+    /// meaningful while a guest activation is live, and it may include unused
+    /// stack capacity in addition to currently live Wasm frames.
+    #[doc(hidden)]
+    pub fn wasm_stack_raw_parts_for_test(&self) -> Option<(*mut u8, usize)> {
+        self.0.wasm_stack_raw_parts_for_test()
     }
 
     /// Set the amount of fuel in this store.
@@ -1960,6 +1999,17 @@ impl StoreOpaque {
     #[inline]
     pub fn vm_store_context_mut(&mut self) -> &mut VMStoreContext {
         &mut self.vm_store_context
+    }
+
+    #[doc(hidden)]
+    pub fn wasm_stack_raw_parts_for_test(&self) -> Option<(*mut u8, usize)> {
+        let cx = self.vm_store_context();
+        let stack_limit = unsafe { *cx.stack_limit.get() };
+        let entry_sp = unsafe { *cx.last_wasm_entry_sp.get() };
+        if entry_sp == 0 || stack_limit == usize::MAX || stack_limit >= entry_sp {
+            return None;
+        }
+        Some((stack_limit as *mut u8, entry_sp - stack_limit))
     }
 
     /// Performs a lazy allocation of the `GcStore` within this store, returning
