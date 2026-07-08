@@ -252,9 +252,11 @@ pub(crate) fn umod_u128_by_u64_const_to_i64(
 ///
 /// At `k_mod = 0` the multiplication is identity, mod is identity, result is
 /// `enc_v`. At `k_mod = 32` the multiplication gives `enc_v * 2^32 =
-/// A*v*2^32`, which is `0 mod (A*2^32)` (matches wasm: shl-by-32 = shl-by-0
-/// for `k_mod = k & 31`, but the [0, 32] support is useful for the rotation
-/// helpers that pass `32 - k_mod`).
+/// A*v*2^32`, which is `0 mod (A*2^32)`. Note that returning 0 at 32 does
+/// *not* match wasm's `shl` (which masks `k & 31`, so shl-by-32 is the
+/// identity) — wasm callers never pass 32; the [0, 32] support exists for the
+/// rotation helpers, whose complement shift `32 - k_mod` needs the
+/// contributes-nothing 0 at the endpoints.
 pub(crate) fn emit_an_shl_i32(
     builder: &mut FunctionBuilder,
     environ: &mut FuncEnvironment<'_>,
@@ -416,9 +418,9 @@ pub(crate) fn emit_an_byte_store_rmw(
 /// Emit `n` byte-RMW operations that mirror an `n`-byte store
 /// (`n in [1, 4]`) into the shadow, regardless of alignment.
 ///
-/// Byte `i` of `raw_value_i64` (from low to high) is written to wasm byte
-/// address `base_addr_i64 + i`. Decoded once; each byte then shifted out
-/// and passed to `emit_an_byte_store_rmw`. Cross-slot transitions handled
+/// Byte `i` of the already-raw `raw_value_i64` (from low to high) is written
+/// to wasm byte address `base_addr_i64 + i`: each byte is shifted out and
+/// passed to `emit_an_byte_store_rmw`. Cross-slot transitions are handled
 /// automatically by the per-byte slot computation inside the helper.
 pub(crate) fn emit_an_multi_byte_decomposed_store(
     builder: &mut FunctionBuilder,
@@ -686,8 +688,9 @@ impl AnBitwiseOp {
 /// The recombined sum is bounded by `A * (2^32 − 1) < A * 2^32 < 2^55`, so it
 /// fits in an `i64` and matches the rest of the AN-encoding invariant.
 ///
-/// The base pointer is loaded from the engines `VMContext` slot, so
-/// no absolute address ends up baked into the machine code.
+/// The base pointer of the engine-owned table is loaded from a per-instance
+/// `VMContext` slot, so no absolute address ends up baked into the machine
+/// code.
 pub(crate) fn emit_an_bitwise_i32(
     builder: &mut FunctionBuilder,
     environ: &mut FuncEnvironment<'_>,
@@ -1042,6 +1045,13 @@ pub(crate) fn emit_an_mul_i64(
     enc_n: Value,
     enc_m: Value,
 ) -> Value {
+    // The divide by `A` below decodes: without this check a corrupted operand
+    // whose error `e` satisfies `e*m ≡ 0 (mod A)` (e.g. the other operand
+    // encodes 0 or a multiple of A) would be laundered into a *valid* codeword
+    // for the wrong product.
+    emit_an_codeword_validity_check_i128(builder, a, enc_n);
+    emit_an_codeword_validity_check_i128(builder, a, enc_m);
+
     let (n_lo, n_hi) = builder.ins().isplit(enc_n);
     let (m_lo, m_hi) = builder.ins().isplit(enc_m);
 

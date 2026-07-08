@@ -603,8 +603,8 @@ impl Instance {
     }
 
     /// Raw `(base, len)` of the AN-encoding shadow buffer for one defined
-    /// memory. Returns `None` when no shadow is allocated (AN off, shared,
-    /// or imported). The returned pointer is valid until the next
+    /// memory. Returns `None` when no shadow is allocated (AN off or shared;
+    /// a defined index of this instance is never imported). The returned pointer is valid until the next
     /// `an_grow_shadow` call on this memory or instance drop. Test-only:
     /// embedders should not depend on the shadow layout.
     pub fn an_shadow_raw_parts_for_test(
@@ -667,24 +667,113 @@ impl Instance {
     /// invariant `decode(enc_slot) == u32_le(raw_slot)` holds before wasm
     /// resumes.
     ///
-    /// No-op if `len == 0`, if the memory has no shadow allocated (AN off,
-    /// shared, or imported), or if `start >= raw_len`.
+    /// No-op if `len == 0`, if the memory has no shadow allocated (AN off or shared;
+    /// a defined index of this instance is never imported), or if `start >= raw_len`.
+    ///
+    /// Returns `false` — *without* re-encoding — when the retained bytes of a
+    /// partially covered boundary slot disagree with the shadow (see
+    /// [`Self::an_boundary_slots_consistent_parts`]); the divergence evidence
+    /// is preserved for the caller to surface as `Trap::AnMemoryMismatch`.
+    /// The check is skipped while the memory is whole-dirty (shadow
+    /// legitimately stale, raw is the source of truth).
+    #[must_use]
     pub(crate) fn an_encode_range_from_raw(
         mut self: Pin<&mut Self>,
         memory_index: DefinedMemoryIndex,
         start: usize,
         len: usize,
         a: u64,
-    ) {
+    ) -> bool {
         let mem_def = self.memories[memory_index].1.vmmemory();
         let raw_base: *const u8 = mem_def.base.as_ptr();
         let raw_len = mem_def.current_length();
+        let whole_dirty = self.an_whole_dirty[memory_index];
 
         let shadow = match self.as_mut().an_enc_shadows_mut()[memory_index].as_deref_mut() {
             Some(s) => s,
-            None => return,
+            None => return true,
         };
+        if !whole_dirty
+            && !Self::an_boundary_slots_consistent_parts(shadow, raw_base, raw_len, start, len, a)
+        {
+            return false;
+        }
         Self::an_encode_range_parts(shadow, raw_base, raw_len, start, len, a);
+        true
+    }
+
+    /// Verify the *retained* bytes of the partially covered boundary slots of
+    /// `[start, start + len)` against the encoded shadow, before a range
+    /// re-encode rebuilds those slots wholly from raw.
+    ///
+    /// A range re-encode rounds outward to 4-byte slots, so the boundary
+    /// slots' bytes *outside* the written range are also re-read from raw.
+    /// Without this check, raw corruption in those neighbor bytes would be
+    /// re-encoded into a fresh valid codeword — laundered — while the guest's
+    /// equivalent path (the JIT sub-word store byte-RMW) validates the old
+    /// shadow codeword before merging. Bytes inside `[start, end)` are the
+    /// host's new data and are skipped; fully covered slots need no check.
+    ///
+    /// Returns `true` when consistent or when there is nothing to check.
+    fn an_boundary_slots_consistent_parts(
+        shadow: &[u8],
+        raw_base: *const u8,
+        raw_len: usize,
+        start: usize,
+        len: usize,
+        a: u64,
+    ) -> bool {
+        if len == 0 || start >= raw_len {
+            return true;
+        }
+        let end = start.saturating_add(len).min(raw_len);
+
+        let slot_retained_consistent = |slot: usize| -> bool {
+            let raw_off = slot * 4;
+            let slot_len = (raw_len - raw_off).min(4);
+            let enc_off = slot * 8;
+            let Some(enc_bytes) = shadow.get(enc_off..enc_off + 8) else {
+                return false;
+            };
+            let enc = u64::from_le_bytes(enc_bytes.try_into().unwrap());
+            if enc % a != 0 {
+                return false;
+            }
+            let word = enc / a;
+            if word > u64::from(u32::MAX) {
+                return false;
+            }
+            let word_bytes = (word as u32).to_le_bytes();
+            for i in 0..slot_len {
+                let pos = raw_off + i;
+                if pos >= start && pos < end {
+                    // Being overwritten: raw is the new truth here.
+                    continue;
+                }
+                // SAFETY: `pos < raw_len`; `raw_base` is valid for `raw_len`
+                // bytes.
+                if unsafe { raw_base.add(pos).read() } != word_bytes[i] {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let first_slot = start / 4;
+        let last_slot = (end - 1) / 4;
+        // Front-partial first slot; back-partial last slot (nothing retained
+        // at the back when the range runs to the end of memory). A single
+        // slot partial on both sides is checked once — the closure skips only
+        // `[start, end)`, so it covers both retained pieces.
+        if start % 4 != 0 && !slot_retained_consistent(first_slot) {
+            return false;
+        }
+        if end % 4 != 0 && end < raw_len && (last_slot != first_slot || start % 4 == 0) {
+            if !slot_retained_consistent(last_slot) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Slot-encode core shared by [`Self::an_encode_range_from_raw`], the
@@ -715,11 +804,14 @@ impl Instance {
                 // `raw_len` bytes.
                 u32::from_le(unsafe { raw_base.add(raw_off).cast::<u32>().read_unaligned() })
             } else {
-                // Tail slot shorter than 4 raw bytes: zero-pad. This matches
-                // the layout invariant because `raw_len` is normally a
-                // multiple of 4 (wasm pages are 64 KiB) and the only way the
-                // loop reaches a partial-tail slot is on a custom page-size
-                // memory64.
+                // Tail slot shorter than 4 raw bytes: zero-pad. Only
+                // reachable when `raw_len` is not a multiple of 4, i.e. with
+                // the custom-page-sizes proposal (any index type). NB: the
+                // shadow is sized `2 * raw_len`, which is too small for the
+                // rounded-up slot count in that case — see the
+                // custom-page-sizes finding; until that is fixed (or the
+                // proposal refused under AN) this arm can index past the
+                // shadow and panic.
                 let mut bytes = [0u8; 4];
                 let to_copy = raw_len - raw_off;
                 // SAFETY: `raw_off + to_copy <= raw_len`. `raw_base` is valid
@@ -741,8 +833,8 @@ impl Instance {
     /// already-encoded bytes into it, swaps it in, and updates the
     /// `vmctx_an_enc_memory_base` slot.
     ///
-    /// No-op when the memory has no shadow allocated (AN off, shared, or
-    /// imported).
+    /// No-op when the memory has no shadow allocated (AN off or shared;
+    /// a defined index of this instance is never imported).
     pub(crate) fn an_grow_shadow(mut self: Pin<&mut Self>, memory_index: DefinedMemoryIndex) {
         if self.an_enc_shadows[memory_index].is_none() {
             return;
@@ -800,8 +892,7 @@ impl Instance {
     }
 
     /// The AN-encoding shadow buffer of one defined memory as an immutable
-    /// slice, or `None` when no shadow is allocated (AN off / shared /
-    /// imported). Used by the component lifting read-verify to cross-check a
+    /// slice, or `None` when no shadow is allocated (AN off / shared). Used by the component lifting read-verify to cross-check a
     /// lifted range against the encoded shadow before the bytes reach the host.
     pub(crate) fn an_shadow_slice(&self, memory_index: DefinedMemoryIndex) -> Option<&[u8]> {
         self.an_enc_shadows[memory_index].as_deref()
@@ -836,22 +927,33 @@ impl Instance {
     /// into the owning instance's shadow. Used by the bulk-memory libcalls
     /// whose destination resolves to an imported memory. No-op when no
     /// shadow exists.
+    ///
+    /// Like [`Self::an_encode_range_from_raw`], returns `false` without
+    /// re-encoding when a partially covered boundary slot's retained bytes
+    /// disagree with the shadow. No whole-dirty consultation is needed: this
+    /// runs only from bulk-memory libcalls (i.e. during wasm execution), and
+    /// whole-dirty is always healed before wasm re-enters.
+    #[must_use]
     pub(crate) fn an_encode_imported_range_from_raw(
         &self,
         index: MemoryIndex,
         start: usize,
         len: usize,
         a: u64,
-    ) {
+    ) -> bool {
         let Some((shadow_base, raw_base, raw_len)) = self.an_imported_memory_shadow_parts(index)
         else {
-            return;
+            return true;
         };
         // SAFETY: the owner's shadow is `2 * raw_len` bytes by the layout
         // invariant and alive for the owner's lifetime; exclusive store
         // access makes the temporary `&mut` to the owner's shadow unique.
         let shadow = unsafe { core::slice::from_raw_parts_mut(shadow_base, raw_len * 2) };
+        if !Self::an_boundary_slots_consistent_parts(shadow, raw_base, raw_len, start, len, a) {
+            return false;
+        }
         Self::an_encode_range_parts(shadow, raw_base, raw_len, start, len, a);
+        true
     }
 
     /// Cross-check `[start, start + len)` of an *imported* memory's raw bytes
@@ -884,8 +986,8 @@ impl Instance {
     /// (`Memory::data_mut` / `Memory::data_and_store_mut`); the host may
     /// write anywhere through that borrow, so the next
     /// `an_resync_host_boundary` must re-encode the whole memory from raw.
-    /// No-op when the memory has no shadow allocated (AN off, shared, or
-    /// imported).
+    /// No-op when the memory has no shadow allocated (AN off or shared;
+    /// a defined index of this instance is never imported).
     pub(crate) fn an_mark_whole_dirty(self: Pin<&mut Self>, memory_index: DefinedMemoryIndex) {
         if self.an_enc_shadows[memory_index].is_none() {
             return;
@@ -926,7 +1028,7 @@ impl Instance {
     ///
     /// Asserts every 8-byte shadow slot equals `A * u32_le(raw[4i..4i+4])`.
     /// Returns `false` on the first mismatch, `true` if all agree or the
-    /// memory has no shadow (AN off / shared / imported). Used by the opaque
+    /// memory has no shadow (AN off / shared). Used by the opaque
     /// whole-memory host borrows (`Memory::data` / `data_mut`), whose read
     /// range cannot be known. Thin wrapper over [`Self::an_cross_check_range`]
     /// (whole memory = the full range) so there is a single slot-compare
@@ -952,7 +1054,7 @@ impl Instance {
     /// `enc_slot == A * raw` is exactly equivalent to
     /// `enc_slot % A == 0 && enc_slot / A == raw` because `A < 2^23` keeps the
     /// product below `2^55` (no u64 wrap). Returns `true` when consistent, when
-    /// the memory has no shadow (AN off / shared / imported), or when the range
+    /// the memory has no shadow (AN off / shared), or when the range
     /// is empty / entirely past the end.
     ///
     /// Mirrors [`Self::an_encode_range_parts`] for slot selection and tail

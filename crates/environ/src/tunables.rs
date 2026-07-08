@@ -43,10 +43,15 @@ pub const DEFAULT_AN_CONSTANT: u64 = 65521;
 ///
 /// `memory.size` continues to report raw page counts (wasm-visible size).
 /// `memory.grow` grows both. Bounds checks always apply to the raw size; the
-/// shadow address is derived as `raw_addr << 1` after the bounds check.
+/// shadow slot offset is derived from the effective address as
+/// `(addr >> 2) << 3` (i.e. `2 * (addr & !3)`) after the bounds check.
 ///
-/// This applies only to AN-encoding's defined, non-shared, non-imported
-/// memories.
+/// This applies only to AN-encoding's defined, non-shared memories (an
+/// *imported* memory's shadow lives on its owning instance).
+///
+/// Despite the name this is the raw-to-shadow *size ratio*, not a
+/// reallocation growth factor: on `memory.grow` the shadow is reallocated to
+/// exactly `ratio * new_raw_size`.
 pub const ENC_MEM_GROWTH_FACTOR: u64 = 2;
 
 macro_rules! define_tunables {
@@ -247,8 +252,8 @@ define_tunables! {
         pub an_inject_codeword_fault: u64,
 
         /// AN-encoding test-only fault injection at cross-type conversion
-        /// op decode sites (`i64.extend_i32_s/u`, `f*.convert_i32_s/u`,
-        /// `f32.reinterpret_i32`).
+        /// op decode sites (`i64.extend_i32_s/u`; the float conversions are
+        /// unreachable under AN — floats are refused wholesale).
         ///
         /// When non-zero AND `an_encoding` is on, each conversion op that
         /// decodes an encoded i32 adds this offset (as `u64`) to the

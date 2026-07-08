@@ -141,23 +141,40 @@ impl<'a, T: 'static> LowerContext<'a, T> {
     /// This will panic if memory has not been configured for this lowering
     /// (e.g. it wasn't present during the specification of canonical options).
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
+        // Infallible accessor (`-> &mut [u8]`), so like `Memory::data_mut` a
+        // detected corruption can only panic here; `try_as_slice_mut` is the
+        // fallible twin.
+        match self.try_as_slice_mut() {
+            Ok(slice) => slice,
+            Err(_) => panic!(
+                "AN-encoding: LowerContext::as_slice_mut over a raw/shadow mismatch (AnMemoryMismatch)"
+            ),
+        }
+    }
+
+    /// Fallible twin of [`LowerContext::as_slice_mut`]: returns
+    /// `Err(Trap::AnMemoryMismatch)` instead of panicking when the
+    /// AN-encoding pre-borrow cross-check detects a raw/shadow divergence.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if memory has not been configured for this lowering
+    /// (e.g. it wasn't present during the specification of canonical options).
+    pub fn try_as_slice_mut(&mut self) -> Result<&mut [u8]> {
         // Verify-at-use: this hands out an opaque whole-memory mutable borrow
         // and records the whole memory dirty, so the next `an_flush_dirty`
         // re-encodes everything from raw — which would silently launder any
         // pre-existing raw/shadow divergence. Cross-check the whole memory
         // once before the borrow (the analogue of `Memory::data_mut`'s
-        // pre-borrow check). Infallible accessor (`-> &mut [u8]`), so like
-        // `Memory::data_mut` a detected corruption can only panic here.
+        // pre-borrow check).
         if !self
             .instance
             .an_options_whole_consistent(self.store.0, self.options)
         {
-            panic!(
-                "AN-encoding: LowerContext::as_slice_mut over a raw/shadow mismatch (AnMemoryMismatch)"
-            );
+            return Err(crate::Trap::AnMemoryMismatch.into());
         }
         self.an_record_write(0, usize::MAX);
-        self.as_slice_mut_untracked()
+        Ok(self.as_slice_mut_untracked())
     }
 
     /// Like [`LowerContext::as_slice_mut`] but records nothing for the
@@ -231,18 +248,25 @@ impl<'a, T: 'static> LowerContext<'a, T> {
     /// Ranges past the end of memory are clamped by the re-encode itself,
     /// so the conservative whole-memory record (`0..usize::MAX`) from
     /// [`LowerContext::as_slice_mut`] simply re-encodes everything.
-    pub(crate) fn an_flush_dirty(&mut self) {
+    ///
+    /// Mismatch (a partially covered boundary slot's retained bytes disagree
+    /// with the shadow — pre-existing corruption the re-encode would launder)
+    /// → `Trap::AnMemoryMismatch`.
+    pub(crate) fn an_flush_dirty(&mut self) -> Result<()> {
         if self.an_dirty.is_empty() {
-            return;
+            return Ok(());
         }
         let ranges = core::mem::take(&mut self.an_dirty);
         let memory = match self.instance.an_options_memory(self.store.0, self.options) {
             Some(m) => m,
-            None => return,
+            None => return Ok(()),
         };
         for r in ranges {
-            memory.an_resync_range(&mut self.store, r.start, r.end - r.start);
+            if !memory.an_resync_range(&mut self.store, r.start, r.end - r.start) {
+                return Err(crate::Trap::AnMemoryMismatch.into());
+            }
         }
+        Ok(())
     }
 
     /// Invokes the memory allocation function (which is style after `realloc`)
@@ -264,7 +288,7 @@ impl<'a, T: 'static> LowerContext<'a, T> {
         // Control re-enters wasm: anything lowered so far must be visible in
         // the AN-encoding shadow before guest code runs (the mandatory
         // per-load validity check reads the shadow at every i32 load).
-        self.an_flush_dirty();
+        self.an_flush_dirty()?;
 
         let (component, store) = self.instance.component_and_store_mut(self.store.0);
         let instance = self.instance.id().get(store);

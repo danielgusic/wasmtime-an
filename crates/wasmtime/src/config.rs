@@ -2317,8 +2317,8 @@ impl Config {
     ///
     /// When `offset != 0` AND `an_encoding(true)` is set, every
     /// cross-type conversion op that decodes an encoded i32
-    /// (`i64.extend_i32_s/u`, `f*.convert_i32_s/u`,
-    /// `f32.reinterpret_i32`) adds `offset` to the operand BEFORE the
+    /// (`i64.extend_i32_s/u`; float conversions are unreachable under AN)
+    /// adds `offset` to the operand BEFORE the
     /// modulo-`A` codeword check fires at the conversion boundary. Any
     /// offset in `(0, A)` guarantees a non-multiple-of-`A`, which raises
     /// `Trap::AnCodewordInvalid`.

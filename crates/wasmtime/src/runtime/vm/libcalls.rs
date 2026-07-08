@@ -591,19 +591,22 @@ fn memory_copy(
     if an_on {
         let dst_usize = usize::try_from(dst).unwrap();
         let len_usize = usize::try_from(len).unwrap();
-        match def_dst {
+        let consistent = match def_dst {
             Some(def_idx) => {
                 store
                     .instance_mut(instance)
-                    .an_encode_range_from_raw(def_idx, dst_usize, len_usize, a);
+                    .an_encode_range_from_raw(def_idx, dst_usize, len_usize, a)
             }
             // Imported destination: re-encode the owning instance's shadow
             // through the `VMMemoryImport` enc-base indirection.
-            None => {
-                store
-                    .instance(instance)
-                    .an_encode_imported_range_from_raw(dst_index, dst_usize, len_usize, a);
-            }
+            None => store.instance(instance).an_encode_imported_range_from_raw(
+                dst_index, dst_usize, len_usize, a,
+            ),
+        };
+        // Boundary-slot mismatch: pre-existing corruption next to the
+        // written range that the re-encode would otherwise launder.
+        if !consistent {
+            return Err(Trap::AnMemoryMismatch);
         }
     }
     Ok(())
@@ -628,12 +631,16 @@ fn memory_fill(
     if an_on {
         let dst_usize = usize::try_from(dst).unwrap();
         let len_usize = usize::try_from(len).unwrap();
-        store.instance_mut(instance).an_encode_range_from_raw(
+        // Boundary-slot mismatch: pre-existing corruption next to the
+        // written range that the re-encode would otherwise launder.
+        if !store.instance_mut(instance).an_encode_range_from_raw(
             memory_index,
             dst_usize,
             len_usize,
             a,
-        );
+        ) {
+            return Err(Trap::AnMemoryMismatch);
+        }
     }
     Ok(())
 }
@@ -662,22 +669,25 @@ fn memory_init(
     if an_on {
         let dst_usize = usize::try_from(dst).unwrap();
         let len_usize = usize::try_from(len).unwrap();
-        match def_dst {
+        let consistent = match def_dst {
             Some(def_idx) => {
                 store
                     .instance_mut(instance)
-                    .an_encode_range_from_raw(def_idx, dst_usize, len_usize, a);
+                    .an_encode_range_from_raw(def_idx, dst_usize, len_usize, a)
             }
             // Imported destination: re-encode the owning instance's shadow
             // through the `VMMemoryImport` enc-base indirection.
-            None => {
-                store.instance(instance).an_encode_imported_range_from_raw(
-                    memory_index,
-                    dst_usize,
-                    len_usize,
-                    a,
-                );
-            }
+            None => store.instance(instance).an_encode_imported_range_from_raw(
+                memory_index,
+                dst_usize,
+                len_usize,
+                a,
+            ),
+        };
+        // Boundary-slot mismatch: pre-existing corruption next to the
+        // written range that the re-encode would otherwise launder.
+        if !consistent {
+            return Err(Trap::AnMemoryMismatch);
         }
     }
     Ok(())
@@ -1822,24 +1832,6 @@ fn breakpoint(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
     Ok(())
 }
 
-/// Re-encodes every whole-dirty memory in the store from raw bytes,
-/// consuming the flags. Walks every instance — including dummy instances
-/// backing host-created memories — because `Memory::data_mut` can dirty any
-/// memory in the store, not just the calling instance's.
-fn an_sweep_whole_dirty(store: &mut dyn VMStore, a: u64) {
-    for id in store.an_all_instance_ids() {
-        let mut instance = store.instance_mut(id);
-        let num_defined_memories = u32::try_from(instance.env_module().num_defined_memories())
-            .expect("number of defined memories fits in u32");
-        for i in 0..num_defined_memories {
-            let def_idx = DefinedMemoryIndex::from_u32(i);
-            if instance.as_mut().an_take_whole_dirty(def_idx) {
-                instance.as_mut().an_encode_full_memory_from_raw(def_idx, a);
-            }
-        }
-    }
-}
-
 /// AN-encoding resync at the wasm-to-host trampoline boundary.
 ///
 /// Called immediately after the host returns. Dirty-driven: only memories
@@ -1859,13 +1851,9 @@ fn an_sweep_whole_dirty(store: &mut dyn VMStore, a: u64) {
 /// host read of the range) as `Trap::AnMemoryMismatch`.
 fn an_resync_host_boundary(store: &mut dyn VMStore, instance: InstanceId) -> Result<(), Trap> {
     let _ = instance;
-    if !store.engine().tunables().an_encoding {
-        return Ok(());
-    }
-    let a = store.engine().tunables().an_constant;
     // Store-wide: the host may have dirtied any memory in the store during
     // the call (it can reach every `Memory` handle), not just the calling
-    // instance's.
-    an_sweep_whole_dirty(store, a);
+    // instance's. Shares the sweep with the host-to-wasm entry heal.
+    store.an_heal_whole_dirty();
     Ok(())
 }

@@ -595,9 +595,10 @@ where
             // Wasm resumes after this hostcall: re-encode the AN-encoding
             // shadow for everything the result lowering wrote into guest
             // memory. Run on the error path too — partial writes may have
-            // landed.
-            lower.an_flush_dirty();
+            // landed. A lowering error takes precedence over a flush mismatch.
+            let flush = lower.an_flush_dirty();
             result?;
+            flush?;
             unsafe {
                 flags.set_may_leave(true);
             }

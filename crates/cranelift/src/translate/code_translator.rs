@@ -231,6 +231,12 @@ pub fn translate_operator(
             ty: _,
         } => {
             let (mut arg1, mut arg2, cond) = environ.stacks.pop3();
+            // Branch/select conditions consume the codeword without producing
+            // one, so corruption would be laundered through the selection
+            // without the validity check (see `translate_br_if`).
+            if environ.tunables().an_encoding {
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, cond);
+            }
 
             if builder.func.dfg.value_type(arg1).is_vector() {
                 arg1 = optionally_bitcast_vector(arg1, I8X16, builder);
@@ -315,6 +321,12 @@ pub fn translate_operator(
         }
         Operator::If { blockty } => {
             let val = environ.stacks.pop1();
+            // Branch conditions consume the codeword without producing one, so
+            // corruption would be laundered through the control-flow decision
+            // without the validity check (see `translate_br_if`).
+            if environ.tunables().an_encoding {
+                emit_an_codeword_validity_check(builder, environ.tunables().an_constant, val);
+            }
 
             let next_block = builder.create_block();
             let (params, results) = blocktype_params_results(validator, *blockty)?;
@@ -1283,8 +1295,8 @@ pub fn translate_operator(
             environ.stacks.push1(builder.ins().fcvt_from_uint(F64, val));
         }
         Operator::F64ConvertI32U => {
-            // Float ops are refused wholesale under AN-encoding, so the i32
-            // operand here is always raw (never encoded).
+            // Unreachable under AN-encoding (float ops are refused wholesale
+            // at compile validation), so no AN transform is needed here.
             let val = environ.stacks.pop1();
             environ.stacks.push1(builder.ins().fcvt_from_uint(F64, val));
         }
@@ -1690,6 +1702,11 @@ pub fn translate_operator(
             if environ.tunables().an_encoding && matches!(op, Operator::I32Mul) {
                 let a = environ.tunables().an_constant;
                 let aw = a << 32;
+                // The divide by `A` below decodes: check both operands so a
+                // corrupted operand can't be laundered into a valid codeword
+                // when the other operand's raw value is a multiple of A.
+                emit_an_codeword_validity_check(builder, a, arg1);
+                emit_an_codeword_validity_check(builder, a, arg2);
                 let p_lo = builder.ins().imul(arg1, arg2);
                 let p_hi = builder.ins().umulhi(arg1, arg2);
                 let (q_hi, q_lo) = udiv_u128_by_u64_const(builder, p_hi, p_lo, a);
@@ -1967,10 +1984,16 @@ pub fn translate_operator(
             let arg = environ.stacks.pop1();
             // `A*v == 0` iff `v == 0`. For an encoded i64 the operand is I128,
             // so compare against an I128 zero (`icmp_imm` is i32/i64-only).
+            // The boolean result is a *fresh* codeword, so a corrupted operand
+            // would be laundered without the validity check.
             let val = if environ.tunables().an_encoding && matches!(op, Operator::I64Eqz) {
+                emit_an_codeword_validity_check_i128(builder, environ.tunables().an_constant, arg);
                 let zero = iconst_i128(builder, 0);
                 builder.ins().icmp(IntCC::Equal, arg, zero)
             } else {
+                if environ.tunables().an_encoding {
+                    emit_an_codeword_validity_check(builder, environ.tunables().an_constant, arg);
+                }
                 builder.ins().icmp_imm(IntCC::Equal, arg, 0)
             };
             // Both produce a wasm-`i32` result. Under AN the bool encodes to
@@ -4988,6 +5011,11 @@ fn translate_icmp_i32_an(
     let (arg0, arg1) = environ.stacks.pop2();
     let a = environ.tunables().an_constant;
 
+    // The boolean result is a *fresh* codeword ({0, A}), so corruption in the
+    // operands would be laundered through the compare without these checks.
+    emit_an_codeword_validity_check(builder, a, arg0);
+    emit_an_codeword_validity_check(builder, a, arg1);
+
     let (cmp_lhs, cmp_rhs, cmp_cc) = match cc {
         IntCC::SignedLessThan
         | IntCC::SignedLessThanOrEqual
@@ -5036,6 +5064,11 @@ fn translate_icmp_i64_an(
 ) {
     let (arg0, arg1) = environ.stacks.pop2();
     let a = environ.tunables().an_constant;
+
+    // The boolean result is a *fresh* codeword ({0, A}), so corruption in the
+    // operands would be laundered through the compare without these checks.
+    emit_an_codeword_validity_check_i128(builder, a, arg0);
+    emit_an_codeword_validity_check_i128(builder, a, arg1);
 
     let (cmp_lhs, cmp_rhs, cmp_cc) = match cc {
         IntCC::SignedLessThan
@@ -5374,6 +5407,13 @@ fn translate_br_if(
     env: &mut FuncEnvironment<'_>,
 ) {
     let val = env.stacks.pop1();
+    // Under AN the condition is an encoded i32 (`A*v != 0` iff `v != 0`, so it
+    // can drive the branch untested-decoded), but the branch consumes the
+    // codeword without producing one, so corruption would be laundered through
+    // the control-flow decision without the validity check.
+    if env.tunables().an_encoding {
+        emit_an_codeword_validity_check(builder, env.tunables().an_constant, val);
+    }
     let (br_destination, inputs) = translate_br_if_args(relative_depth, env);
     let next_block = builder.create_block();
     canonicalise_brif(builder, val, br_destination, inputs, next_block, &[]);

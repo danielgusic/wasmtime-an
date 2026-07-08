@@ -194,12 +194,16 @@ impl<'a> GuestMemory<'a> {
     /// on a raw/shadow divergence. No-op unless this view was built with
     /// [`GuestMemory::unshared_an_verified`] (i.e. the memory has a shadow).
     ///
-    /// Skipped, per 4-byte slot, for any slot the host has already written this
-    /// call (recorded in `an_dirty`): those bytes are host-authored and their
-    /// shadow stays stale until the post-call resync, so checking them against
-    /// the captured shadow would false-trap. The slot-compare mirrors
-    /// `Instance::an_cross_check_range_parts` in the `wasmtime` crate (the
-    /// canonical implementation); keep them in sync.
+    /// Bytes the host has already written this call (recorded in `an_dirty`)
+    /// are host-authored and their shadow stays stale until the post-call
+    /// resync, so checking them against the captured shadow would false-trap
+    /// — they are skipped. The skip is *per byte*, not per slot: a slot only
+    /// partially written by this call still has its untouched bytes compared
+    /// against the shadow-decoded word, so a pre-existing divergence there
+    /// traps instead of being laundered by the post-call whole-slot resync.
+    /// The full-slot compare mirrors `Instance::an_cross_check_range_parts`
+    /// in the `wasmtime` crate (the canonical implementation); keep them in
+    /// sync.
     pub(crate) fn an_cross_check_read(&self, offset: u32, byte_len: u32) -> Result<(), GuestError> {
         let Some(an) = self.an_read.as_ref() else {
             return Ok(());
@@ -222,8 +226,10 @@ impl<'a> GuestMemory<'a> {
         let last_slot = (end + 3) / 4;
         for slot in first_slot..last_slot {
             let raw_off = slot * 4;
-            // Skip slots the host wrote this call (shadow stale until resync).
-            if self.an_slot_overlaps_dirty(raw_off) {
+            let dirty = self.an_slot_dirty_bytes(raw_off);
+            // Fully host-written slot: nothing left to verify against the
+            // (stale-until-resync) shadow.
+            if dirty == [true; 4] {
                 continue;
             }
             let enc_off = slot * 8;
@@ -233,28 +239,58 @@ impl<'a> GuestMemory<'a> {
             let Some(enc_bytes) = an.shadow.get(enc_off..enc_off + 8) else {
                 break;
             };
-            // Raw word with zero-padded tail (matches the encoder for memories
-            // whose length is not a multiple of 4, e.g. custom page sizes).
-            let mut word = [0u8; 4];
-            let avail = (raw.len() - raw_off).min(4);
-            word[..avail].copy_from_slice(&raw[raw_off..raw_off + avail]);
-            let raw_u32 = u32::from_le_bytes(word);
             let enc_slot = u64::from_le_bytes(enc_bytes.try_into().unwrap());
-            if enc_slot != an.a.wrapping_mul(u64::from(raw_u32)) {
-                return Err(GuestError::AnMemoryMismatch);
+            let avail = (raw.len() - raw_off).min(4);
+            if dirty == [false; 4] {
+                // Untouched slot: full-slot compare, one multiply.
+                // Raw word with zero-padded tail (matches the encoder for
+                // memories whose length is not a multiple of 4, e.g. custom
+                // page sizes).
+                let mut word = [0u8; 4];
+                word[..avail].copy_from_slice(&raw[raw_off..raw_off + avail]);
+                let raw_u32 = u32::from_le_bytes(word);
+                if enc_slot != an.a.wrapping_mul(u64::from(raw_u32)) {
+                    return Err(GuestError::AnMemoryMismatch);
+                }
+            } else {
+                // Partially host-written slot: recover the pre-call raw word
+                // from the shadow (`enc = A * word`) and compare only the
+                // bytes this call did *not* write.
+                if enc_slot % an.a != 0 {
+                    return Err(GuestError::AnMemoryMismatch);
+                }
+                let word = enc_slot / an.a;
+                if word > u64::from(u32::MAX) {
+                    return Err(GuestError::AnMemoryMismatch);
+                }
+                let word_bytes = (word as u32).to_le_bytes();
+                for i in 0..4 {
+                    if dirty[i] {
+                        continue;
+                    }
+                    let raw_byte = if i < avail { raw[raw_off + i] } else { 0 };
+                    if raw_byte != word_bytes[i] {
+                        return Err(GuestError::AnMemoryMismatch);
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    /// Whether the 4-byte slot at raw byte offset `raw_off` overlaps any range
-    /// the host has written this call (recorded in `an_dirty`).
-    fn an_slot_overlaps_dirty(&self, raw_off: usize) -> bool {
-        let slot_start = raw_off as u64;
-        let slot_end = slot_start + 4;
-        self.an_dirty
-            .iter()
-            .any(|r| u64::from(r.start) < slot_end && slot_start < u64::from(r.end))
+    /// Per-byte dirty map of the 4-byte slot at raw byte offset `raw_off`
+    /// against the ranges the host has written this call (`an_dirty`).
+    fn an_slot_dirty_bytes(&self, raw_off: usize) -> [bool; 4] {
+        let mut dirty = [false; 4];
+        for r in &self.an_dirty {
+            for i in 0..4 {
+                let pos = (raw_off + i) as u64;
+                if u64::from(r.start) <= pos && pos < u64::from(r.end) {
+                    dirty[i] = true;
+                }
+            }
+        }
+        dirty
     }
 
     /// Read a value from the provided pointer.

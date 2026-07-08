@@ -198,7 +198,7 @@ unsafe fn utf8_to_utf8(
     log::trace!("utf8-to-utf8 {len}");
     let src = core::str::from_utf8(src).map_err(|_| format_err!("invalid utf8 encoding"))?;
     dst.copy_from_slice(src.as_bytes());
-    instance.an_resync_transcode_dst(store, an_dst, len);
+    instance.an_resync_transcode_dst(store, an_dst, len)?;
     Ok(())
 }
 
@@ -222,7 +222,7 @@ unsafe fn utf16_to_utf16(
     instance.an_check_transcode_src(store, src.as_ptr() as usize, 2 * len)?;
     log::trace!("utf16-to-utf16 {len}");
     run_utf16_to_utf16(src, dst)?;
-    instance.an_resync_transcode_dst(store, an_dst, 2 * len);
+    instance.an_resync_transcode_dst(store, an_dst, 2 * len)?;
     Ok(())
 }
 
@@ -262,7 +262,7 @@ unsafe fn latin1_to_latin1(
     instance.an_check_transcode_src(store, src.as_ptr() as usize, len)?;
     log::trace!("latin1-to-latin1 {len}");
     dst.copy_from_slice(src);
-    instance.an_resync_transcode_dst(store, an_dst, len);
+    instance.an_resync_transcode_dst(store, an_dst, len)?;
     Ok(())
 }
 
@@ -287,7 +287,7 @@ unsafe fn latin1_to_utf16(
         *dst = u16::from(*src).to_le();
     }
     log::trace!("latin1-to-utf16 {len}");
-    instance.an_resync_transcode_dst(store, an_dst, 2 * len);
+    instance.an_resync_transcode_dst(store, an_dst, 2 * len)?;
     Ok(())
 }
 
@@ -321,7 +321,7 @@ unsafe fn utf8_to_utf16(
 
     let result = run_utf8_to_utf16(src, dst)?;
     log::trace!("utf8-to-utf16 {len} => {result}");
-    instance.an_resync_transcode_dst(store, an_dst, 2 * result);
+    instance.an_resync_transcode_dst(store, an_dst, 2 * result)?;
     Ok(CopySizeReturn(result))
 }
 
@@ -407,7 +407,7 @@ unsafe fn utf16_to_utf8(
     }
 
     log::trace!("utf16-to-utf8 {src_len}/{dst_len} => {src_read}/{dst_written}");
-    instance.an_resync_transcode_dst(store, an_dst, dst_written);
+    instance.an_resync_transcode_dst(store, an_dst, dst_written)?;
     Ok(SizePair {
         src_read,
         dst_written,
@@ -444,7 +444,7 @@ unsafe fn latin1_to_utf8(
     };
     let (read, written) = encoding_rs::mem::convert_latin1_to_utf8_partial(&src[..stop], dst);
     log::trace!("latin1-to-utf8 {src_len}/{dst_len} => ({read}, {written})");
-    instance.an_resync_transcode_dst(store, an_dst, written);
+    instance.an_resync_transcode_dst(store, an_dst, written)?;
     Ok(SizePair {
         src_read: read,
         dst_written: written,
@@ -480,11 +480,11 @@ unsafe fn utf16_to_compact_probably_utf16(
             dst[i] = dst[2 * i];
         }
         log::trace!("utf16-to-compact-probably-utf16 {len} => latin1 {len}");
-        instance.an_resync_transcode_dst(store, an_dst, 2 * len);
+        instance.an_resync_transcode_dst(store, an_dst, 2 * len)?;
         Ok(CopySizeReturn(len))
     } else {
         log::trace!("utf16-to-compact-probably-utf16 {len} => utf16 {len}");
-        instance.an_resync_transcode_dst(store, an_dst, 2 * len);
+        instance.an_resync_transcode_dst(store, an_dst, 2 * len)?;
         Ok(CopySizeReturn(len | UTF16_TAG))
     }
 }
@@ -515,7 +515,7 @@ unsafe fn utf8_to_latin1(
     let read = encoding_rs::mem::utf8_latin1_up_to(src);
     let written = encoding_rs::mem::convert_utf8_to_latin1_lossy(&src[..read], dst);
     log::trace!("utf8-to-latin1 {len} => ({read}, {written})");
-    instance.an_resync_transcode_dst(store, an_dst, written);
+    instance.an_resync_transcode_dst(store, an_dst, written)?;
     Ok(SizePair {
         src_read: read,
         dst_written: written,
@@ -549,7 +549,7 @@ unsafe fn utf16_to_latin1(
         size += 1;
     }
     log::trace!("utf16-to-latin1 {len} => {size}");
-    instance.an_resync_transcode_dst(store, an_dst, size);
+    instance.an_resync_transcode_dst(store, an_dst, size)?;
     Ok(SizePair {
         src_read: size,
         dst_written: size,
@@ -590,7 +590,7 @@ unsafe fn utf8_to_compact_utf16(
     let dst = inflate_latin1_bytes(dst, latin1_bytes_so_far);
     let result = run_utf8_to_utf16(src, dst)?;
     log::trace!("utf8-to-compact-utf16 {src_len}/{dst_len}/{latin1_bytes_so_far} => {result}");
-    instance.an_resync_transcode_dst(store, an_dst, 2 * (result + latin1_bytes_so_far));
+    instance.an_resync_transcode_dst(store, an_dst, 2 * (result + latin1_bytes_so_far))?;
     Ok(CopySizeReturn(result + latin1_bytes_so_far))
 }
 
@@ -615,7 +615,7 @@ unsafe fn utf16_to_compact_utf16(
     run_utf16_to_utf16(src, dst)?;
     let result = src.len();
     log::trace!("utf16-to-compact-utf16 {src_len}/{dst_len}/{latin1_bytes_so_far} => {result}");
-    instance.an_resync_transcode_dst(store, an_dst, 2 * (result + latin1_bytes_so_far));
+    instance.an_resync_transcode_dst(store, an_dst, 2 * (result + latin1_bytes_so_far))?;
     Ok(CopySizeReturn(result + latin1_bytes_so_far))
 }
 

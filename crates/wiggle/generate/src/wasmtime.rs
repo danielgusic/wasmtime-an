@@ -155,7 +155,12 @@ fn generate_func(
         let an_dirty = mem.an_take_dirty();
         if let Some(m) = an_memory {
             for r in an_dirty {
-                m.an_resync_range(&mut caller, r.start as usize, (r.end - r.start) as usize);
+                // `false`: a partially covered boundary slot's retained bytes
+                // disagree with the shadow — pre-existing corruption the
+                // re-encode would otherwise launder.
+                if !m.an_resync_range(&mut caller, r.start as usize, (r.end - r.start) as usize) {
+                    wiggle::error::bail!("AN-encoding memory mismatch at hostcall write resync");
+                }
             }
         }
         Ok(<#ret_ty>::from(result?))

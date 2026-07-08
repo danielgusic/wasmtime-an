@@ -105,36 +105,38 @@ fn validate_an_encoding_constraints(
     // reference-type refusal rides the same signature/global/local layers
     // (plus a table-element check), see `wasm_val_type_ref_name`.
 
-    // 1) Function signatures (params + results).
-    for (def_func_index, func_type) in module.functions.iter() {
+    // 1) Function signatures (params + results). Deliberately iterates the
+    //    *full* `FuncIndex` space — imported functions included — so a
+    //    float/ref signature on an import is refused too.
+    for (func_index, func_type) in module.functions.iter() {
         let sig_idx = func_type.signature.unwrap_module_type_index();
         let wasm_func_ty = types[sig_idx].unwrap_func();
         if let Some(where_) = first_float_in_slice(wasm_func_ty.params()) {
             bail!(
                 "AN-encoding does not support floating-point types. Found `{where_}` \
                  in params of function {}.",
-                def_func_index.as_u32()
+                func_index.as_u32()
             );
         }
         if let Some(where_) = first_float_in_slice(wasm_func_ty.results()) {
             bail!(
                 "AN-encoding does not support floating-point types. Found `{where_}` \
                  in results of function {}.",
-                def_func_index.as_u32()
+                func_index.as_u32()
             );
         }
         if let Some(where_) = first_ref_in_slice(wasm_func_ty.params()) {
             bail!(
                 "AN-encoding does not support reference types as values. Found \
                  `{where_}` in params of function {}.",
-                def_func_index.as_u32()
+                func_index.as_u32()
             );
         }
         if let Some(where_) = first_ref_in_slice(wasm_func_ty.results()) {
             bail!(
                 "AN-encoding does not support reference types as values. Found \
                  `{where_}` in results of function {}.",
-                def_func_index.as_u32()
+                func_index.as_u32()
             );
         }
     }

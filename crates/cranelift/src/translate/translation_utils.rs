@@ -41,6 +41,21 @@ where
     });
 }
 
+/// IR type carrying a wasm integer on the operand stack. Under AN-encoding
+/// integers are widened (`i32` -> `I64`, `i64` -> `I128`) so the encoded value
+/// `A*v` fits losslessly; otherwise the native width is used. Must agree with
+/// `wasm_stack_value_type` (signatures) — locals, block params, and function
+/// signatures all share the widened representation.
+pub fn wasm_int_stack_type(an_encoding: bool, ty: wasmparser::ValType) -> ir::Type {
+    match ty {
+        wasmparser::ValType::I32 if an_encoding => ir::types::I64,
+        wasmparser::ValType::I64 if an_encoding => ir::types::I128,
+        wasmparser::ValType::I32 => ir::types::I32,
+        wasmparser::ValType::I64 => ir::types::I64,
+        _ => panic!("wasm_int_stack_type on non-integer type {ty:?}"),
+    }
+}
+
 /// Create a `Block` with the given Wasm parameters.
 pub fn block_with_params<PE: TargetEnvironment + ?Sized>(
     builder: &mut FunctionBuilder,
@@ -48,18 +63,11 @@ pub fn block_with_params<PE: TargetEnvironment + ?Sized>(
     environ: &PE,
 ) -> WasmResult<ir::Block> {
     let block = builder.create_block();
-    let i32_ir_ty = if environ.tunables().an_encoding {
-        ir::types::I64
-    } else {
-        ir::types::I32
-    };
+    let an_encoding = environ.tunables().an_encoding;
     for ty in params {
         match ty {
-            wasmparser::ValType::I32 => {
-                builder.append_block_param(block, i32_ir_ty);
-            }
-            wasmparser::ValType::I64 => {
-                builder.append_block_param(block, ir::types::I64);
+            wasmparser::ValType::I32 | wasmparser::ValType::I64 => {
+                builder.append_block_param(block, wasm_int_stack_type(an_encoding, ty));
             }
             wasmparser::ValType::F32 => {
                 builder.append_block_param(block, ir::types::F32);

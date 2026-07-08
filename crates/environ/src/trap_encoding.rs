@@ -227,17 +227,20 @@ generate_trap_type! {
         StreamOpTooBig = "stream read/write count too large",
 
         /// AN-encoding cross-check detected a mismatch between a linear
-        /// memory's raw bytes and the encoded shadow at a host-call
-        /// boundary. Either external corruption flipped a bit in one of the
-        /// two copies, or a code path failed to maintain the
+        /// memory's raw bytes and the encoded shadow at a use site (the
+        /// guest's inline per-load check or a host read of the range).
+        /// Either external corruption flipped a bit in one of the two
+        /// copies, or a code path failed to maintain the
         /// `enc_slot == A * u32_le(raw_slot)` invariant.
         AnMemoryMismatch = "AN-encoding memory cross-check mismatch",
 
-        /// AN-encoding boundary codeword validity check failed: an i32
-        /// value crossing a wasm/host trampoline boundary was not a valid
-        /// codeword (i.e. `enc_val % A != 0`). Indicates external
-        /// corruption (cosmic ray, hardware fault) or a bug in the AN
-        /// translation that produced a non-multiple-of-`A` on the operand
+        /// AN-encoding codeword validity check failed: an encoded integer
+        /// (i32 or i64) was not a valid codeword (i.e. `enc_val % A != 0`)
+        /// at a decode site — a wasm/host trampoline boundary, an
+        /// op-internal decode (e.g. `clz`, bitwise LUT, subword store,
+        /// compare/branch operands), or an integer conversion. Indicates
+        /// external corruption (cosmic ray, hardware fault) or a bug in the
+        /// AN translation that produced a non-multiple-of-`A` on the operand
         /// stack.
         AnCodewordInvalid = "AN-encoding codeword validity check failed",
 

@@ -508,11 +508,11 @@ impl wasmtime_environ::Compiler for Compiler {
         let succeeded = builder.func.dfg.inst_results(call)[0];
         self.raise_if_host_trapped(&mut builder, caller_vmctx, succeeded);
 
-        // AN-encoding host-boundary resync. Emitted immediately
-        // after the host call so any raw-memory writes the host performed
-        // wholesale via `Memory::data_mut` (whole-dirty flag) get re-encoded
-        // into the shadow before wasm resumes and reads memory. No-op when
-        // AN-encoding is off on the engine.
+        // AN-encoding host-boundary resync (only emitted when AN-encoding is
+        // on). Runs immediately after the host call so any raw-memory writes
+        // the host performed wholesale via `Memory::data_mut` (whole-dirty
+        // flag) get re-encoded into the shadow before wasm resumes and reads
+        // memory.
         if self.tunables.an_encoding {
             let sigs = BuiltinFunctionSignatures::new(self);
             let resync_idx = BuiltinFunctionIndex::an_resync_host_boundary();

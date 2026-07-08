@@ -547,22 +547,28 @@ impl Instance {
     /// owning memory is found by scanning the recorded identities — a
     /// component has very few runtime memories. No-op when no memory
     /// contains the range or no shadow is allocated (AN-encoding off).
+    /// Mismatch (a partially covered boundary slot's retained bytes disagree
+    /// with the shadow — pre-existing corruption the re-encode would launder)
+    /// → `Trap::AnMemoryMismatch`.
     pub(crate) fn an_resync_transcode_dst(
         &self,
         store: &mut StoreOpaque,
         ptr: usize,
         byte_len: usize,
-    ) {
+    ) -> Result<()> {
         if byte_len == 0 {
-            return;
+            return Ok(());
         }
         let memories: alloc::vec::Vec<crate::Memory> =
             self.id.get(store).an_runtime_memory_identities().collect();
         for memory in memories {
-            if memory.an_resync_if_contains_ptr(store, ptr, byte_len) {
-                return;
+            match memory.an_resync_if_contains_ptr(store, ptr, byte_len) {
+                Some(true) => return Ok(()),
+                Some(false) => return Err(crate::Trap::AnMemoryMismatch.into()),
+                None => continue,
             }
         }
+        Ok(())
     }
 
     /// Verify-at-use read-twin of [`Self::an_resync_transcode_dst`]: the

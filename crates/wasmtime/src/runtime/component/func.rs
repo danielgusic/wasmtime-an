@@ -852,10 +852,13 @@ impl Func {
         // The lifted call runs next: re-encode the AN-encoding shadow for
         // everything the lowering wrote into guest memory (raw host-side
         // writes the JIT store-mirroring cannot see). Run on the error path
-        // too — partial writes may have landed.
-        cx.an_flush_dirty();
+        // too — partial writes may have landed. A lowering error takes
+        // precedence over a flush mismatch.
+        let flush = cx.an_flush_dirty();
         unsafe { flags.set_may_leave(true) };
-        result
+        let result = result?;
+        flush?;
+        Ok(result)
     }
 
     /// Creates a `LiftContext` using the configuration values with this lifted

@@ -438,7 +438,9 @@ impl Memory {
             .and_then(|s| s.get_mut(..buffer.len()))
             .ok_or(MemoryAccessError::oob())?
             .copy_from_slice(buffer);
-        self.an_resync_range(&mut context, offset, buffer.len());
+        if !self.an_resync_range(&mut context, offset, buffer.len()) {
+            return Err(MemoryAccessError::an_mismatch());
+        }
         Ok(())
     }
 
@@ -447,21 +449,30 @@ impl Memory {
     /// 4-byte slots). No-op when no shadow is allocated (AN-encoding off, or
     /// this memory is shared).
     ///
+    /// Returns `false` — leaving the shadow untouched — when the retained
+    /// bytes of a partially covered boundary slot disagree with the shadow
+    /// (pre-existing corruption next to the written range that the re-encode
+    /// would otherwise launder); callers surface that as an AN mismatch.
+    ///
     /// `#[doc(hidden)]`: used by `Memory::write` and by the wiggle-generated
     /// WASI preview1 hostcall wrappers to bring the shadow back in sync
     /// after a tracked host write; embedders should not call this directly.
     #[doc(hidden)]
-    pub fn an_resync_range(&self, mut store: impl AsContextMut, offset: usize, len: usize) {
+    #[must_use]
+    pub fn an_resync_range(&self, mut store: impl AsContextMut, offset: usize, len: usize) -> bool {
         let mut context = store.as_context_mut();
         let a = context.engine().tunables().an_constant;
         self.instance
             .get_mut(&mut context.0)
-            .an_encode_range_from_raw(self.index, offset, len, a);
+            .an_encode_range_from_raw(self.index, offset, len, a)
     }
 
     /// If the host pointer range `[ptr, ptr + len)` lies inside this
     /// memory's current allocation, re-encodes the AN-encoding shadow for
-    /// that range and returns `true`; returns `false` otherwise.
+    /// that range and returns `Some(consistent)`; returns `None` when the
+    /// range is not in this memory (so the caller keeps scanning other
+    /// memories). `Some(false)` means a partially covered boundary slot's
+    /// retained bytes disagreed with the shadow and nothing was re-encoded.
     ///
     /// Used by the component-model transcode libcalls, which receive raw
     /// destination pointers (computed by the fused-adapter trampolines from
@@ -471,18 +482,19 @@ impl Memory {
         store: &mut StoreOpaque,
         ptr: usize,
         len: usize,
-    ) -> bool {
+    ) -> Option<bool> {
         let definition = self.instance.get(store).memory(self.index);
         let base = definition.base.as_ptr() as usize;
         let mem_len = definition.current_length();
         if ptr < base || ptr.saturating_add(len) > base.saturating_add(mem_len) {
-            return false;
+            return None;
         }
         let a = store.engine().tunables().an_constant;
-        self.instance
-            .get_mut(store)
-            .an_encode_range_from_raw(self.index, ptr - base, len, a);
-        true
+        Some(
+            self.instance
+                .get_mut(store)
+                .an_encode_range_from_raw(self.index, ptr - base, len, a),
+        )
     }
 
     /// Verify-at-use read-twin of [`Self::an_resync_if_contains_ptr`]: if the
@@ -727,9 +739,9 @@ impl Memory {
         let (base, len) = store[self.instance].an_shadow_raw_parts_for_test(self.index)?;
         // SAFETY: shadow buffer is owned by the instance and remains valid
         // for the borrow lifetime — `StoreContextMut` keeps the store
-        // borrowed for `'a`, and the shadow is not reallocated except by
-        // `memory.grow`, which can only run via wasm execution that would
-        // require re-borrowing the store.
+        // borrowed for `'a`, and the shadow is only reallocated by a grow
+        // (wasm `memory.grow` or the embedder's `Memory::grow`), both of
+        // which need `&mut` store access and so can't overlap this borrow.
         Some(unsafe { slice::from_raw_parts_mut(base, len) })
     }
 

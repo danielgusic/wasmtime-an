@@ -7,7 +7,8 @@
 use crate::func_environ::FuncEnvironment;
 use crate::translate::TargetEnvironment;
 use crate::translate::code_translator::{bitcast_wasm_returns, translate_operator};
-use crate::translate::translation_utils::get_vmctx_value_label;
+use crate::translate::iconst_i128;
+use crate::translate::translation_utils::{get_vmctx_value_label, wasm_int_stack_type};
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::{self, Block, InstBuilder, ValueLabel};
 use cranelift_codegen::timing;
@@ -175,20 +176,21 @@ fn declare_locals(
     use wasmparser::ValType::*;
     // Under AN-encoding, wasm integer locals use the same widened stack
     // representation as function signatures: i32 -> I64, i64 -> I128.
-    // Initial value 0 stays 0 in the encoded domain (A*0 = 0).
-    let i32_ir_ty = if environ.tunables().an_encoding {
-        ir::types::I64
-    } else {
-        ir::types::I32
+    // Initial value 0 stays 0 in the encoded domain (A*0 = 0). `iconst` only
+    // supports types up to 64 bits, so the I128 zero is built via `iconcat`.
+    let zero_init = |builder: &mut FunctionBuilder, ty: ir::Type| {
+        if ty == ir::types::I128 {
+            iconst_i128(builder, 0)
+        } else {
+            builder.ins().iconst(ty, 0)
+        }
     };
-    let i64_ir_ty = if environ.tunables().an_encoding {
-        ir::types::I128
-    } else {
-        ir::types::I64
-    };
+    let an_encoding = environ.tunables().an_encoding;
     let (ty, init, needs_stack_map) = match wasm_type {
-        I32 => (i32_ir_ty, Some(builder.ins().iconst(i32_ir_ty, 0)), false),
-        I64 => (i64_ir_ty, Some(builder.ins().iconst(i64_ir_ty, 0)), false),
+        I32 | I64 => {
+            let ty = wasm_int_stack_type(an_encoding, wasm_type);
+            (ty, Some(zero_init(builder, ty)), false)
+        }
         F32 => (
             ir::types::F32,
             Some(builder.ins().f32const(ir::immediates::Ieee32::with_bits(0))),

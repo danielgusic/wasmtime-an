@@ -1411,11 +1411,12 @@ impl FuncEnvironment<'_> {
         }
 
         let (gv, offset) = self.get_global_location(func, index);
-        // AN-encoding: an i32 global is normally stored encoded as `A*v`, which
-        // does not fit in 32 bits, so widen its storage type to `I64` (the
-        // `VMGlobalDefinition` slot is 16 bytes, so there is room). This matches
-        // the operand-stack representation, so the loaded value is already a
-        // canonical encoded i32 with no per-access transform.
+        // AN-encoding: integer globals are normally stored encoded as `A*v`,
+        // which does not fit in the native width, so widen the storage type
+        // like the operand stack (i32 -> I64, i64 -> I128; the
+        // `VMGlobalDefinition` slot is 16 bytes, so there is room). This
+        // matches the operand-stack representation, so the loaded value is
+        // already a canonical encoded integer with no per-access transform.
         //
         // Exception: raw host-control globals (component flags, `task_may_block`)
         // keep their native un-widened storage because the runtime reads/writes
