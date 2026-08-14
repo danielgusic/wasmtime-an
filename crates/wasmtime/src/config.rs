@@ -2282,15 +2282,15 @@ impl Config {
     /// # Panics
     ///
     /// Panics if `a == 0` (would break everything)
-    /// or if `a >= 1 << 23` (LUT entries would overflow `i32`).
+    /// or if `a >= 1 << 24` (LUT entries would overflow `u32`).
     pub fn an_constant(&mut self, a: u64) -> &mut Self {
         assert!(
             a >= 1,
             "AN_CONSTANT must be ≥ 1 (A=0 destroys information and is un-decodable)"
         );
         assert!(
-            a < (1u64 << 23),
-            "AN_CONSTANT must be < 2^23 so LUT entries A * 0xFF fit in signed i32"
+            a < (1u64 << 24),
+            "AN_CONSTANT must be < 2^24 so LUT entries A * 0xFF fit in u32"
         );
         self.tunables.an_constant = Some(a);
         self
@@ -2310,25 +2310,6 @@ impl Config {
     #[doc(hidden)]
     pub fn an_inject_codeword_fault(&mut self, offset: u64) -> &mut Self {
         self.tunables.an_inject_codeword_fault = Some(offset);
-        self
-    }
-
-    /// Test-only AN-encoding conversion-site codeword fault injection.
-    ///
-    /// When `offset != 0` AND `an_encoding(true)` is set, every
-    /// cross-type conversion op that decodes an encoded i32
-    /// (`i64.extend_i32_s/u`; float conversions are unreachable under AN)
-    /// adds `offset` to the operand BEFORE the
-    /// modulo-`A` codeword check fires at the conversion boundary. Any
-    /// offset in `(0, A)` guarantees a non-multiple-of-`A`, which raises
-    /// `Trap::AnCodewordInvalid`.
-    ///
-    /// Distinct from [`Self::an_inject_codeword_fault`], which targets the
-    /// wasm/host trampoline boundary. Production code should leave this at
-    /// the default of `0`.
-    #[doc(hidden)]
-    pub fn an_inject_conversion_fault(&mut self, offset: u64) -> &mut Self {
-        self.tunables.an_inject_conversion_fault = Some(offset);
         self
     }
 

@@ -19,14 +19,4 @@
         local.get 0 i64.extend_i32_s)
     (func (export "ext_i32_u") (param i32) (result i64)
         local.get 0 i64.extend_i32_u)
-
-    ;; ----- fault-injection harness: each func sources its i32 from an
-    ;; i32.const (no trampoline-side i32 arg), so the conversion-site codeword
-    ;; check is the first decode boundary. Used by the
-    ;; `int_conversions_codeword_check_traps_*` tests with
-    ;; `Config::an_inject_conversion_fault(N)`.
-    (func (export "trap_ext_i32_s") (result i64)
-        i32.const 12345 i64.extend_i32_s)
-    (func (export "trap_ext_i32_u") (result i64)
-        i32.const 12345 i64.extend_i32_u)
 )

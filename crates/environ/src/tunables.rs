@@ -237,7 +237,7 @@ define_tunables! {
 
         /// AN-encoding constant `A`. Encoded i32 values are stored as `A*v`
         /// in widened i64 IR slots. Defaults to `DEFAULT_AN_CONSTANT`.
-        /// Caller-enforced (via the `Config` setter) to be in `[1, 2^23)`.
+        /// Caller-enforced (via the `Config` setter) to be in `[1, 2^24)`.
         pub an_constant: u64,
 
         /// AN-encoding test-only fault injection at trampoline boundaries.
@@ -251,19 +251,6 @@ define_tunables! {
         /// non-zero value. Default `0` (no injection).
         pub an_inject_codeword_fault: u64,
 
-        /// AN-encoding test-only fault injection at cross-type conversion
-        /// op decode sites (`i64.extend_i32_s/u`; the float conversions are
-        /// unreachable under AN — floats are refused wholesale).
-        ///
-        /// When non-zero AND `an_encoding` is on, each conversion op that
-        /// decodes an encoded i32 adds this offset (as `u64`) to the
-        /// operand BEFORE the modulo-`A` codeword check fires. With any
-        /// offset in `(0, A)` the check is guaranteed to trap with
-        /// `Trap::AnCodewordInvalid`. Used by the conversion integration
-        /// tests to exercise the trap-fires path at the conversion-op
-        /// boundary (distinct from the trampoline-side
-        /// `an_inject_codeword_fault`). Default `0` (no injection).
-        pub an_inject_conversion_fault: u64,
     }
 
     pub struct ConfigTunables {
@@ -351,7 +338,6 @@ impl Tunables {
             an_encoding: false,
             an_constant: DEFAULT_AN_CONSTANT,
             an_inject_codeword_fault: 0,
-            an_inject_conversion_fault: 0,
         }
     }
 

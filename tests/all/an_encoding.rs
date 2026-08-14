@@ -18,9 +18,9 @@ fn an_cfg(an_enabled: bool, a: Option<u64>) -> Config {
 }
 
 // Non-default A values swept by the i64 `*_various_an_constants` tests: 1
-// (degenerate identity encoding), 7 (small odd), 1009 (small prime), 2^23−1
-// (largest legal A under the i32-LUT bound).
-const I64_AN_CONSTANTS: [u64; 4] = [1, 7, 1009, 8_388_607];
+// (degenerate identity encoding), 7 (small odd), 1009 (small prime), 2^24−1
+// (largest legal A under the u32-LUT bound).
+const I64_AN_CONSTANTS: [u64; 4] = [1, 7, 1009, 16_777_215];
 
 // Assert a typed `Result<i64>` trapped with exactly `expected`.
 fn assert_trap_i64(res: wasmtime::Result<i64>, expected: wasmtime::Trap, label: &str) {
@@ -722,7 +722,7 @@ fn mul64_overflow_traps_under_an() -> wasmtime::Result<()> {
     // excluded — see `mul64_no_overflow_with_an_constant_1`).
     let big = 1i64 << 62;
     assert_eq!(run_mul64(false, None, big, big)?, 0);
-    for &a in &[7u64, 1009, 65521, 8_388_607] {
+    for &a in &[7u64, 1009, 65521, 16_777_215] {
         assert_trap_i64(
             run_mul64(true, Some(a), big, big),
             wasmtime::Trap::AnI64WidenOverflow,
@@ -1417,11 +1417,11 @@ fn ops_with_an() -> wasmtime::Result<()> {
 
 // Ops still produce identical results across several non-default values of
 // the AN constant `A`. Picks: 1 (degenerate identity encoding), 7 (small
-// odd), 1009 (small prime), 8_388_607 (= 2^23 − 1, largest legal A under
-// the i32-LUT bound).
+// odd), 1009 (small prime), 16_777_215 (= 2^24 − 1, largest legal A under
+// the u32-LUT bound).
 #[test]
 fn ops_with_an_custom_constants() -> wasmtime::Result<()> {
-    for &a in &[1u64, 7, 1009, 8_388_607] {
+    for &a in &[1u64, 7, 1009, 16_777_215] {
         let mut o = make_ops_with(true, Some(a))?;
         ops_assertions(&mut o)
             .map_err(|e| wasmtime::Error::msg(format!("ops_assertions failed with A={a}: {e}")))?;
@@ -1699,7 +1699,7 @@ fn global_i64_import_with_an() -> wasmtime::Result<()> {
 // `A` from the tunables rather than baking in the default.
 #[test]
 fn global_boundary_various_an_constants() -> wasmtime::Result<()> {
-    for &a in &[1u64, 7, 1009, 8_388_607] {
+    for &a in &[1u64, 7, 1009, 16_777_215] {
         global_boundary_check(true, Some(a))
             .map_err(|e| wasmtime::Error::msg(format!("global_boundary failed with A={a}: {e}")))?;
         global_import_check(true, Some(a))
@@ -2553,7 +2553,7 @@ fn fault_inject_various_an_constants() -> wasmtime::Result<()> {
     // The cross-check is independent of A, but exercise a few values to
     // confirm both the decode (slot / A) and the modular check (slot % A)
     // produce a trap consistently.
-    for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+    for &a in &[1u64, 7, 1009, 65521, 16_777_215] {
         let (mut store, _instance, memory, _f) = fault_injection_setup(a)?;
         tamper_raw_byte(&memory, &mut store, 16, |_| 0x55);
         expect_host_read_mismatch(&memory, &mut store, 16, &format!("raw poke with A={a}"));
@@ -3053,7 +3053,7 @@ fn bulk_memory_grow_keeps_shadow_consistent() -> wasmtime::Result<()> {
 fn bulk_memory_with_various_an_constants() -> wasmtime::Result<()> {
     // Re-run a small bulk-op sequence with several A values to confirm the
     // shadow range encoder reads A from tunables consistently.
-    for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+    for &a in &[1u64, 7, 1009, 65521, 16_777_215] {
         let (mut store, instance) = bulk_setup(a)?;
         let fill = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "fill")?;
         let load_byte = instance.get_typed_func::<i32, i32>(&mut store, "load_byte")?;
@@ -3486,7 +3486,7 @@ fn load_validity_check_traps_unaligned_i32_load() -> wasmtime::Result<()> {
 fn load_validity_check_various_an_constants() -> wasmtime::Result<()> {
     // The shadow encoding parameterized on A, so re-run a single trap test
     // across a few values to confirm the codegen reads A from tunables.
-    for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+    for &a in &[1u64, 7, 1009, 65521, 16_777_215] {
         let (mut store, instance, mem) = load_check_setup(a)?;
         let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
         tamper_raw_byte(&mem, &mut store, 8, |_| 0x55);
@@ -3602,7 +3602,7 @@ mod component_an {
         // hostcall-trampoline libcall reads `A` from the engine's tunables
         // (the resync re-encodes raw → shadow using that A; if it baked
         // the default A the next host call would surface a mismatch).
-        for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+        for &a in &[1u64, 7, 1009, 65521, 16_777_215] {
             let mut config = Config::new();
             config.wasm_component_model(true);
             config.an_encoding(true);
@@ -3674,7 +3674,7 @@ mod component_an {
 
     #[test]
     fn transcode_component_compiles_with_an() -> wasmtime::Result<()> {
-        for &a in &[1u64, 7, 65521, 8_388_607] {
+        for &a in &[1u64, 7, 65521, 16_777_215] {
             let mut config = Config::new();
             config.wasm_component_model(true);
             config.an_encoding(true);
@@ -3801,7 +3801,7 @@ mod component_an {
 
     #[test]
     fn string_lowering_then_host_boundary_various_an_constants() -> wasmtime::Result<()> {
-        for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+        for &a in &[1u64, 7, 1009, 65521, 16_777_215] {
             strlen_boundary_check(true, Some(a))?;
         }
         Ok(())
@@ -4194,7 +4194,7 @@ mod codeword_check {
 
     #[test]
     fn codeword_check_clean_various_an_constants() -> wasmtime::Result<()> {
-        for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+        for &a in &[1u64, 7, 1009, 65521, 16_777_215] {
             let engine = Engine::new(&make_config(true, Some(a), None))?;
             let module = Module::new(&engine, ECHO_WAT)?;
             let mut linker: Linker<()> = Linker::new(&engine);
@@ -4287,7 +4287,7 @@ mod codeword_check {
         // must fire. (A = 1 is a degenerate case where every i64 is a
         // multiple of 1; the check is skipped at A=1 and corruption goes
         // undetected by design.)
-        for &a in &[7u64, 1009, 65521, 8_388_607] {
+        for &a in &[7u64, 1009, 65521, 16_777_215] {
             let engine = Engine::new(&make_config(true, Some(a), Some(1)))?;
             let module = Module::new(&engine, ECHO_WAT)?;
             let mut linker: Linker<()> = Linker::new(&engine);
@@ -4498,7 +4498,7 @@ mod component_codeword {
 
     #[test]
     fn component_i32_various_an_constants() -> wasmtime::Result<()> {
-        for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+        for &a in &[1u64, 7, 1009, 65521, 16_777_215] {
             let engine = Engine::new(&make_config(true, Some(a), None))?;
             let component = Component::new(&engine, ECHO_COMPONENT_WAT)?;
             let mut linker = Linker::new(&engine);
@@ -4515,7 +4515,7 @@ mod component_codeword {
 
     #[test]
     fn component_i64_various_an_constants() -> wasmtime::Result<()> {
-        for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+        for &a in &[1u64, 7, 1009, 65521, 16_777_215] {
             let engine = Engine::new(&make_config(true, Some(a), None))?;
             let component = Component::new(&engine, I64_ECHO_COMPONENT_WAT)?;
             let mut linker = Linker::new(&engine);
@@ -4575,9 +4575,7 @@ mod component_codeword {
 
 // Cross-type conversion operators under AN. The float-containing module is kept
 // as an AN-off oracle and an AN-on refusal test; the integer-only companion below
-// covers the supported i32<->i64 conversions. For every supported op that decodes
-// an encoded i32 at the conversion boundary, the test suite also exercises the
-// boundary-codeword check via `Config::an_inject_conversion_fault`.
+// covers the supported i32<->i64 conversions.
 mod conversions {
     use wasmtime::{Config, Engine, Module, Store};
 
@@ -4588,24 +4586,17 @@ mod conversions {
         instance: wasmtime::Instance,
     }
 
-    fn make_config(an_on: bool, a: Option<u64>, conv_fault: Option<u64>) -> Config {
+    fn make_config(an_on: bool, a: Option<u64>) -> Config {
         let mut config = Config::new();
         config.an_encoding(an_on);
         if let Some(a) = a {
             config.an_constant(a);
         }
-        if let Some(off) = conv_fault {
-            config.an_inject_conversion_fault(off);
-        }
         config
     }
 
-    fn make_inst(
-        an_on: bool,
-        a: Option<u64>,
-        conv_fault: Option<u64>,
-    ) -> wasmtime::Result<ConvInstance> {
-        let engine = Engine::new(&make_config(an_on, a, conv_fault))?;
+    fn make_inst(an_on: bool, a: Option<u64>) -> wasmtime::Result<ConvInstance> {
+        let engine = Engine::new(&make_config(an_on, a))?;
         let module = Module::new(&engine, CONV_WAT)?;
         let mut store = Store::new(&engine, ());
         let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
@@ -4853,7 +4844,7 @@ mod conversions {
 
     #[test]
     fn conversions_without_an() -> wasmtime::Result<()> {
-        let mut c = make_inst(false, None, None)?;
+        let mut c = make_inst(false, None)?;
         correctness_assertions(&mut c)?;
         trap_assertions(&mut c);
         Ok(())
@@ -4866,7 +4857,7 @@ mod conversions {
     // module end-to-end as a baseline.
     #[test]
     fn conversions_refused_under_an() {
-        let err = match make_inst(true, None, None) {
+        let err = match make_inst(true, None) {
             Ok(_) => panic!("expected float refusal under AN, got Ok"),
             Err(e) => e,
         };
@@ -4882,9 +4873,7 @@ mod conversions {
 // `i32.extend8_s/16_s` (stays inside the encoding) and the i32 <-> i64
 // conversions (`i32.wrap_i64`, `i64.extend_i32_s/u`). Unlike `conversions.wat`,
 // this module instantiates and runs end-to-end with AN both on and off, and
-// results must match. The `i64.extend_i32_*` conversion site additionally
-// exercises the conversion boundary-codeword check via the test-only
-// `Config::an_inject_conversion_fault` knob.
+// results must match.
 mod int_conversions {
     use wasmtime::{Config, Engine, Module, Store};
 
@@ -4895,24 +4884,17 @@ mod int_conversions {
         instance: wasmtime::Instance,
     }
 
-    fn make_config(an_on: bool, a: Option<u64>, conv_fault: Option<u64>) -> Config {
+    fn make_config(an_on: bool, a: Option<u64>) -> Config {
         let mut config = Config::new();
         config.an_encoding(an_on);
         if let Some(a) = a {
             config.an_constant(a);
         }
-        if let Some(off) = conv_fault {
-            config.an_inject_conversion_fault(off);
-        }
         config
     }
 
-    fn make_inst(
-        an_on: bool,
-        a: Option<u64>,
-        conv_fault: Option<u64>,
-    ) -> wasmtime::Result<ConvInstance> {
-        let engine = Engine::new(&make_config(an_on, a, conv_fault))?;
+    fn make_inst(an_on: bool, a: Option<u64>) -> wasmtime::Result<ConvInstance> {
+        let engine = Engine::new(&make_config(an_on, a))?;
         let module = Module::new(&engine, CONV_WAT)?;
         let mut store = Store::new(&engine, ());
         let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
@@ -4980,67 +4962,21 @@ mod int_conversions {
 
     #[test]
     fn int_conversions_without_an() -> wasmtime::Result<()> {
-        let mut c = make_inst(false, None, None)?;
+        let mut c = make_inst(false, None)?;
         correctness_assertions(&mut c)
     }
 
     #[test]
     fn int_conversions_with_an() -> wasmtime::Result<()> {
-        let mut c = make_inst(true, None, None)?;
+        let mut c = make_inst(true, None)?;
         correctness_assertions(&mut c)
     }
 
     #[test]
     fn int_conversions_with_various_an_constants() -> wasmtime::Result<()> {
-        for a in [1u64, 7, 1009, 65521, 8_388_607] {
-            let mut c = make_inst(true, Some(a), None)?;
+        for a in [1u64, 7, 1009, 65521, 16_777_215] {
+            let mut c = make_inst(true, Some(a))?;
             correctness_assertions(&mut c)?;
-        }
-        Ok(())
-    }
-
-    /// Negative coverage for the conversion boundary-codeword check.
-    /// `an_inject_conversion_fault(1)` bumps the encoded i32 by 1 at the
-    /// `i64.extend_i32_*` conversion site before widening, so `enc % A != 0` for
-    /// any A > 1 and the call must trap with `AnCodewordInvalid`. The harness
-    /// funcs source their i32 from `i32.const`, so no trampoline-side check
-    /// intercepts first.
-    #[test]
-    fn int_conversions_codeword_check_traps_with_injection() -> wasmtime::Result<()> {
-        for name in ["trap_ext_i32_s", "trap_ext_i32_u"] {
-            let mut c = make_inst(true, None, Some(1))?;
-            let f = c.instance.get_typed_func::<(), i64>(&mut c.store, name)?;
-            let err = f.call(&mut c.store, ()).expect_err("expected trap");
-            let trap = err.downcast::<wasmtime::Trap>().expect("expected a Trap");
-            assert_eq!(trap, wasmtime::Trap::AnCodewordInvalid, "func {name}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn int_conversions_codeword_check_traps_various_an_constants() -> wasmtime::Result<()> {
-        // A=1 skipped: every i64 is a multiple of 1, so the check never fires.
-        for a in [7u64, 1009, 65521, 8_388_607] {
-            for name in ["trap_ext_i32_s", "trap_ext_i32_u"] {
-                let mut c = make_inst(true, Some(a), Some(1))?;
-                let f = c.instance.get_typed_func::<(), i64>(&mut c.store, name)?;
-                let err = f.call(&mut c.store, ()).expect_err("expected trap");
-                let trap = err.downcast::<wasmtime::Trap>().expect("expected a Trap");
-                assert_eq!(trap, wasmtime::Trap::AnCodewordInvalid, "A={a} func {name}");
-            }
-        }
-        Ok(())
-    }
-
-    /// Without injection the codeword check must not false-positive at any A.
-    #[test]
-    fn int_conversions_no_codeword_trap_without_injection() -> wasmtime::Result<()> {
-        for a in [1u64, 7, 1009, 65521, 8_388_607] {
-            let mut c = make_inst(true, Some(a), None)?;
-            let f = c
-                .instance
-                .get_typed_func::<(), i64>(&mut c.store, "trap_ext_i32_s")?;
-            assert_eq!(f.call(&mut c.store, ())?, 12345, "A={a}");
         }
         Ok(())
     }
@@ -5284,7 +5220,7 @@ mod dirty_resync {
     /// The dirty-driven behaviours hold for every legal shape of `A`.
     #[test]
     fn dirty_resync_various_an_constants() -> wasmtime::Result<()> {
-        for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+        for &a in &[1u64, 7, 1009, 65521, 16_777_215] {
             // Heal-window: shadow tamper mid-hostcall traps at next boundary.
             let (mut store, instance) = setup(a, TWO_CALLS_WAT, false, |caller| {
                 let m = get_mem(caller, "m");
@@ -5653,7 +5589,7 @@ fn imported_memory_grow_through_importer() -> wasmtime::Result<()> {
 
 #[test]
 fn imported_memory_various_an_constants() -> wasmtime::Result<()> {
-    for &a in &[1u64, 7, 1009, 65521, 8_388_607] {
+    for &a in &[1u64, 7, 1009, 65521, 16_777_215] {
         let (mut store, memory, instance) = imported_memory_setup(a)?;
         let poke = instance.get_typed_func::<(i32, i32), ()>(&mut store, "poke")?;
         let peek = instance.get_typed_func::<i32, i32>(&mut store, "peek")?;

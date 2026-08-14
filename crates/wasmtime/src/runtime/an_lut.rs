@@ -1,15 +1,15 @@
 //! AN-encoding bitwise lookup tables, generated in-process per engine.
 //!
 //! For each binary bitwise op supported under AN-encoding (`AND`, `OR`,
-//! `XOR`), one 256×256 `i32` table is built whose entries hold the encoded
+//! `XOR`), one 256×256 `u32` table is built whose entries hold the encoded
 //! result of operating on functional 8-bit chunks:
 //!
 //! ```text
 //!   tab[(c1 << 8) | c2] = A * (c1 OP c2)        with c1, c2 ∈ [0, 255]
 //! ```
 //!
-//! `A` is constrained to `1 ≤ A < 2^23` so that the largest entry
-//! `A * 255 < 2^31` fits in a signed `i32`. This halves table memory
+//! `A` is constrained to `1 ≤ A < 2^24` so that the largest entry
+//! `A * 255 < 2^32` fits in a `u32`. This halves table memory
 //! (256 KiB per op instead of 512 KiB) at the cost of one `uextend.i64`
 //! per lookup in JIT'd code.
 //!
@@ -26,19 +26,19 @@ use core::fmt;
 pub(crate) const TABLE_LEN: usize = 256 * 256;
 
 /// Upper bound (exclusive) for the AN constant `A`. Chosen so that
-/// `A * 255 < 2^31` and table entries fit in a signed `i32`.
-pub(crate) const A_MAX_EXCLUSIVE: u64 = 1u64 << 23;
+/// `A * 255 < 2^32` and table entries fit in a `u32`.
+pub(crate) const A_MAX_EXCLUSIVE: u64 = 1u64 << 24;
 
 /// Owning handle for one populated table. Boxed so the address is stable and
 /// the buffer can be referenced by JIT-emitted code via the per-instance
 /// `VMContext` slot without further indirection.
-pub(crate) type Table = Box<[i32; TABLE_LEN]>;
+pub(crate) type Table = Box<[u32; TABLE_LEN]>;
 
 /// Errors raised while validating `A` or generating tables. Surfaced from
 /// `Engine::new` as a normal `wasmtime::Error`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AnLutError {
-    /// `A` outside the supported range `1 ≤ A < 2^23`.
+    /// `A` outside the supported range `1 ≤ A < 2^24`.
     InvalidA(u64),
 }
 
@@ -46,7 +46,7 @@ impl fmt::Display for AnLutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AnLutError::InvalidA(a) => {
-                write!(f, "invalid AN constant {a}: require 1 <= A < 2^23")
+                write!(f, "invalid AN constant {a}: require 1 <= A < 2^24")
             }
         }
     }
@@ -55,7 +55,7 @@ impl fmt::Display for AnLutError {
 impl core::error::Error for AnLutError {}
 
 /// Validate `A` against the same bound the wasmtime config enforces:
-/// `1 ≤ A < 2^23`.
+/// `1 ≤ A < 2^24`.
 pub(crate) fn validate_a(a: u64) -> Result<(), AnLutError> {
     if a == 0 || a >= A_MAX_EXCLUSIVE {
         return Err(AnLutError::InvalidA(a));
@@ -89,16 +89,16 @@ pub(crate) struct AnLuts {
 }
 
 fn build_table(a: u64, op: BinOp) -> Table {
-    // `validate_a` guarantees `a < 2^23`, so `a` fits in `i32`.
-    let a_signed = a as i32;
-    let mut buf: Box<[i32]> = vec![0i32; TABLE_LEN].into_boxed_slice();
+    // `validate_a` guarantees `a < 2^24`, so `a` fits in `u32`.
+    let a = a as u32;
+    let mut buf: Box<[u32]> = vec![0u32; TABLE_LEN].into_boxed_slice();
     for c1 in 0u32..256 {
         let row = (c1 as usize) << 8;
         for c2 in 0u32..256 {
-            // `op.apply(c1, c2) <= 255`, so `r` fits in `i32` and
-            // `a_signed * r <= (2^23 - 1) * 255 < 2^31`, never overflows.
-            let r = op.apply(c1, c2) as i32;
-            buf[row | c2 as usize] = a_signed.wrapping_mul(r);
+            // `op.apply(c1, c2) <= 255`, so
+            // `a * r <= (2^24 - 1) * 255 < 2^32`, never overflows.
+            let r = op.apply(c1, c2);
+            buf[row | c2 as usize] = a * r;
         }
     }
     buf.try_into()
@@ -120,7 +120,7 @@ pub(crate) fn generate(a: u64) -> Result<AnLuts, AnLutError> {
 mod tests {
     use super::*;
 
-    fn entry(tab: &Table, c1: u32, c2: u32) -> i32 {
+    fn entry(tab: &Table, c1: u32, c2: u32) -> u32 {
         tab[((c1 as usize) << 8) | c2 as usize]
     }
 
@@ -140,11 +140,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_24_bit_max() {
+        assert_eq!(validate_a((1u64 << 24) - 1), Ok(()));
+    }
+
+    #[test]
     fn and_entries_match_formula() {
         let a: u64 = 65521;
         let luts = generate(a).unwrap();
         for &(c1, c2) in &[(0u32, 0u32), (0xAB, 0xCD), (0xFF, 0xFF), (0x12, 0x80)] {
-            assert_eq!(entry(&luts.and, c1, c2), (a as i32) * ((c1 & c2) as i32));
+            assert_eq!(entry(&luts.and, c1, c2), (a as u32) * (c1 & c2));
         }
     }
 
@@ -153,22 +158,22 @@ mod tests {
         let a: u64 = 1009;
         let luts = generate(a).unwrap();
         for &(c1, c2) in &[(0u32, 0u32), (0xAB, 0xCD), (0xFF, 0x00), (0x12, 0x80)] {
-            assert_eq!(entry(&luts.or, c1, c2), (a as i32) * ((c1 | c2) as i32));
+            assert_eq!(entry(&luts.or, c1, c2), (a as u32) * (c1 | c2));
         }
     }
 
     #[test]
     fn xor_entries_match_formula() {
-        // Largest legal A: (2^23 - 1). Stresses the i32 bound — entry
-        // A * 0xFF = 2,139,094,785 still < i32::MAX.
+        // Largest legal A: (2^24 - 1). Stresses the u32 bound — entry
+        // A * 0xFF exceeds i32::MAX but remains below u32::MAX.
         let a: u64 = A_MAX_EXCLUSIVE - 1;
         let luts = generate(a).unwrap();
         for &(c1, c2) in &[(0u32, 0u32), (0xAB, 0xCD), (0xFF, 0xFF), (0x12, 0x80)] {
-            assert_eq!(
-                entry(&luts.xor, c1, c2),
-                (a as i32).wrapping_mul((c1 ^ c2) as i32)
-            );
+            assert_eq!(entry(&luts.xor, c1, c2), (a as u32) * (c1 ^ c2));
         }
+        let max_entry = entry(&luts.or, 0xff, 0);
+        assert_eq!(max_entry, (a as u32) * 0xff);
+        assert!(max_entry > i32::MAX as u32);
     }
 
     #[test]
@@ -177,9 +182,9 @@ mod tests {
         let luts = generate(a).unwrap();
         for c1 in 0u32..256 {
             for c2 in 0u32..256 {
-                assert_eq!(entry(&luts.and, c1, c2) / (a as i32), (c1 & c2) as i32);
-                assert_eq!(entry(&luts.or, c1, c2) / (a as i32), (c1 | c2) as i32);
-                assert_eq!(entry(&luts.xor, c1, c2) / (a as i32), (c1 ^ c2) as i32);
+                assert_eq!(entry(&luts.and, c1, c2) / (a as u32), c1 & c2);
+                assert_eq!(entry(&luts.or, c1, c2) / (a as u32), c1 | c2);
+                assert_eq!(entry(&luts.xor, c1, c2) / (a as u32), c1 ^ c2);
             }
         }
     }
@@ -189,9 +194,9 @@ mod tests {
         let luts = generate(1).unwrap();
         for c1 in 0u32..256 {
             for c2 in 0u32..256 {
-                assert_eq!(entry(&luts.and, c1, c2), (c1 & c2) as i32);
-                assert_eq!(entry(&luts.or, c1, c2), (c1 | c2) as i32);
-                assert_eq!(entry(&luts.xor, c1, c2), (c1 ^ c2) as i32);
+                assert_eq!(entry(&luts.and, c1, c2), c1 & c2);
+                assert_eq!(entry(&luts.or, c1, c2), c1 | c2);
+                assert_eq!(entry(&luts.xor, c1, c2), c1 ^ c2);
             }
         }
     }

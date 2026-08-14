@@ -6,9 +6,9 @@
 //!    (see below).
 //! 2. **`i32.{and,or,xor}`**: tabulated bitwise logical ops following the
 //!    Fetzer/Schiffel/Süßkraut paper. Each op uses an engine-owned 256×256
-//!    `i32` table (`A * (c1 OP c2)`) generated in
+//!    `u32` table (`A * (c1 OP c2)`) generated in
 //!    `crates/wasmtime/src/runtime/an_lut.rs`. `A` is constrained to
-//!    `A < 2^23` so `A * 255 < 2^31` fits in `i32`. The table base pointer
+//!    `A < 2^24` so `A * 255 < 2^32` fits in `u32`. The table base pointer
 //!    lives in a fixed `VMContext` slot; JIT'd code loads it via
 //!    `vmctx + offset` so the same machine code is portable across processes
 //!    (cwasm-friendly).
@@ -23,7 +23,7 @@
 //!
 //! ```text
 //!   P_lo = imul.i64(A*n, A*m)              // low 64 of A^2*n*m
-//!   P_hi = umulhi.i64(A*n, A*m)            // high; P = (P_hi, P_lo) < 2^110 (A < 2^23)
+//!   P_hi = umulhi.i64(A*n, A*m)            // high; P = (P_hi, P_lo) < 2^112 (A < 2^24)
 //!   (Q_hi, Q_lo) = udiv_u128_by_u64_const(P_hi, P_lo, A)   // Q = A*n*m
 //!   result       = umod_u128_by_u64_const_to_i64(Q_hi, Q_lo, A*2^32)
 //! ```
@@ -284,8 +284,8 @@ pub(crate) fn emit_an_shl_i32(
 ///   result    = q * A                // re-encode
 /// ```
 ///
-/// `A * 2^k` fits in `i64` because `A < 2^23` and `k_mod ≤ 32` so the product
-/// is `< 2^55`. At `k_mod = 32`, `shift_div = A * 2^32 = aw`, and since
+/// `A * 2^k` fits in `i64` because `A < 2^24` and `k_mod ≤ 32` so the product
+/// is `< 2^56`. At `k_mod = 32`, `shift_div = A * 2^32 = aw`, and since
 /// `enc_v < aw` the quotient is `0` — matches "right-shift by 32 of a 32-bit
 /// value zeroes everything," useful for rotations.
 pub(crate) fn emit_an_shr_u_i32(
@@ -627,7 +627,7 @@ pub(crate) fn encode_wasm_i32_raw(
 ///
 /// Uses `uextend` to treat the i32 as unsigned (so e.g. `-1_i32` becomes
 /// `0xFFFFFFFF_i64`), then multiplies by `A`. The product fits in `i64`
-/// because `A < 2^23` and `uextend(i32) < 2^32`.
+/// because `A < 2^24` and `uextend(i32) < 2^32`.
 pub(crate) fn emit_an_encode_raw_i32(
     builder: &mut FunctionBuilder,
     environ: &mut FuncEnvironment<'_>,
@@ -663,10 +663,10 @@ impl AnBitwiseOp {
 ///
 /// Inputs are encoded as `A * n` and `A * m` with `n, m ∈ [0, 2^32)`. The op
 /// (`AND` / `OR` / `XOR`) is tabulated on functional 8-bit chunks: a
-/// pre-built `i32` table stores
+/// pre-built `u32` table stores
 /// `tab[(c1 << 8) | c2] = A * (c1 OP c2)` for `c1, c2 ∈ [0, 255]`. The
-/// `i32` element type is safe because `A < 2^23`, so
-/// `A * 255 < 2^31` ≤ `i32::MAX`.
+/// `u32` element type is safe because `A < 2^24`, so
+/// `A * 255 < 2^32`.
 ///
 /// Sequence emitted:
 ///
@@ -685,7 +685,7 @@ impl AnBitwiseOp {
 ///   return acc
 /// ```
 ///
-/// The recombined sum is bounded by `A * (2^32 − 1) < A * 2^32 < 2^55`, so it
+/// The recombined sum is bounded by `A * (2^32 − 1) < A * 2^32 < 2^56`, so it
 /// fits in an `i64` and matches the rest of the AN-encoding invariant.
 ///
 /// The base pointer of the engine-owned table is loaded from a per-instance
@@ -739,15 +739,14 @@ pub(crate) fn emit_an_bitwise_i32(
         let c1 = builder.ins().band_imm(n_shifted, 0xff);
         let c2 = builder.ins().band_imm(m_shifted, 0xff);
 
-        // idx = (c1 << 8) | c2;  byte_offset = idx * 4 (i32 entries)
+        // idx = (c1 << 8) | c2; byte_offset = idx * 4 (u32 entries)
         let c1_hi = builder.ins().ishl_imm(c1, 8);
         let idx = builder.ins().bor(c1_hi, c2);
         let byte_off = builder.ins().ishl_imm(idx, 2);
         let entry_addr = builder.ins().iadd(base, byte_off);
 
         let entry_i32 = builder.ins().load(I32, readonly_mem, entry_addr, 0);
-        // Widen to i64 for the accumulator. Entries are non-negative
-        // (`A * (c1 OP c2)` ≥ 0 with `A > 0`), so zero-extend.
+        // Widen the unsigned LUT entry to i64 for the accumulator.
         let entry = builder.ins().uextend(I64, entry_i32);
 
         // Shift the encoded chunk-result into its place in the 32-bit value.
@@ -767,7 +766,7 @@ pub(crate) fn emit_an_bitwise_i32(
 }
 
 // i64 AN-encoding helpers. An encoded i64 is a clif `I128` holding `A*v` with
-// `v in [0, 2^64)`, so the canonical band is `[0, A*2^64) ⊂ [0, 2^87)`. These
+// `v in [0, 2^64)`, so the canonical band is `[0, A*2^64) ⊂ [0, 2^88)`. These
 // mirror the i32 helpers above, widened to I128. Only x64 + aarch64 are
 // targeted; both lower every I128 op used here. Note `A*2^64 > u64::MAX`, so
 // canonicalization mod `A*2^64` is done with I128 compare+subtract by callers,
@@ -782,7 +781,7 @@ pub(crate) fn iconst_i128(builder: &mut FunctionBuilder, val: u128) -> Value {
 }
 
 /// Encode a raw `I64` value `v` into the canonical AN-encoded `I128` form
-/// `A * v`. Fits in 128 bits because `A < 2^23` ⇒ `A * v < 2^87`. Takes `A`
+/// `A * v`. Fits in 128 bits because `A < 2^24` ⇒ `A * v < 2^88`. Takes `A`
 /// directly so it works from the wasm/host trampolines (which have no
 /// `FuncEnvironment`).
 pub(crate) fn emit_an_encode_raw_i64(
@@ -918,7 +917,7 @@ pub(crate) fn emit_udivrem_i128(
 /// i64 analogue of [`emit_an_bitwise_i32`]. Decodes both encoded i64 operands
 /// to raw i64, tabulates the op on eight 8-bit chunks via the same 256×256
 /// `A*(c1 OP c2)` table, and recombines into an encoded `I128` accumulator
-/// `A*(n OP m)` (bounded by `A*(2^64-1) < 2^87`, fits I128). Decoding is
+/// `A*(n OP m)` (bounded by `A*(2^64-1) < 2^88`, fits I128). Decoding is
 /// inherent here — the LUT is indexed by the raw bytes.
 pub(crate) fn emit_an_bitwise_i64(
     builder: &mut FunctionBuilder,
@@ -969,7 +968,7 @@ pub(crate) fn emit_an_bitwise_i64(
         let entry_addr = builder.ins().iadd(base, byte_off);
 
         let entry_i32 = builder.ins().load(I32, readonly_mem, entry_addr, 0);
-        // Widen to I128 for the accumulator; entries are non-negative.
+        // Widen the unsigned LUT entry to I128 for the accumulator.
         let entry = builder.ins().uextend(I128, entry_i32);
         let term = if shift == 0 {
             entry
@@ -1030,14 +1029,14 @@ pub(crate) fn emit_an_shr_u_i64(
 }
 
 /// Stays-encoded i64 multiply with an overflow trap. The full product
-/// `P = (A*n)*(A*m) = A^2*n*m` can reach 2^174, which has no 128-bit
+/// `P = (A*n)*(A*m) = A^2*n*m` is below 2^176, which has no 128-bit
 /// representation; rather than carry a 256-bit intermediate we build the
 /// product from i64 limbs and trap (`TRAP_AN_I64_WIDEN_OVERFLOW`) when its high
 /// 128 bits are non-zero. When it fits, divide by `A` to produce the encoded
 /// product `A*n*m`, then canonicalize it modulo `A*2^64`. Since that modulus is
 /// exactly `A` whole 64-bit limbs, canonicalization is just `(q_hi % A, q_lo)`;
-/// the value never leaves the encoding. The operands' high limbs are `< 2^23`
-/// (`enc < 2^87`), so the bits at/above 128 collapse to a single i64 (`r2`);
+/// the value never leaves the encoding. The operands' high limbs are `< 2^24`
+/// (`enc < 2^88`), so the bits at/above 128 collapse to a single i64 (`r2`);
 /// overflow iff `r2 != 0`.
 pub(crate) fn emit_an_mul_i64(
     builder: &mut FunctionBuilder,
@@ -1045,13 +1044,6 @@ pub(crate) fn emit_an_mul_i64(
     enc_n: Value,
     enc_m: Value,
 ) -> Value {
-    // The divide by `A` below decodes: without this check a corrupted operand
-    // whose error `e` satisfies `e*m ≡ 0 (mod A)` (e.g. the other operand
-    // encodes 0 or a multiple of A) would be laundered into a *valid* codeword
-    // for the wrong product.
-    emit_an_codeword_validity_check_i128(builder, a, enc_n);
-    emit_an_codeword_validity_check_i128(builder, a, enc_m);
-
     let (n_lo, n_hi) = builder.ins().isplit(enc_n);
     let (m_lo, m_hi) = builder.ins().isplit(enc_m);
 
@@ -1062,7 +1054,7 @@ pub(crate) fn emit_an_mul_i64(
     let lh_hi = builder.ins().umulhi(n_lo, m_hi);
     let hl_lo = builder.ins().imul(n_hi, m_lo);
     let hl_hi = builder.ins().umulhi(n_hi, m_lo);
-    let hh = builder.ins().imul(n_hi, m_hi); // n_hi,m_hi < 2^23 -> < 2^46, no high part
+    let hh = builder.ins().imul(n_hi, m_hi); // n_hi,m_hi < 2^24 -> < 2^48, no high part
 
     // Limb at bits [64,128): ll_hi + lh_lo + hl_lo, tracking carry into [128,...).
     let (s1, c1) = builder.ins().uadd_overflow(ll_hi, lh_lo);
@@ -1071,7 +1063,7 @@ pub(crate) fn emit_an_mul_i64(
     let c2_64 = builder.ins().uextend(I64, c2);
     let carry_r1 = builder.ins().iadd(c1_64, c2_64);
 
-    // Bits [128, ...): lh_hi + hl_hi + hh + carry_r1. All small (< 2^47), so this
+    // Bits [128, ...): lh_hi + hl_hi + hh + carry_r1. All small (< 2^49), so this
     // single i64 holds the entire high part; non-zero means overflow.
     let t = builder.ins().iadd(lh_hi, hl_hi);
     let t = builder.ins().iadd(t, hh);

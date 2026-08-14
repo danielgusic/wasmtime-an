@@ -583,21 +583,21 @@ impl Instance {
 
     /// Return a mutable reference to the AN-encoding `i32.and` LUT base
     /// pointer slot in this instance's `VMContext`.
-    pub fn an_and_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<i32>> {
+    pub fn an_and_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<u32>> {
         let offset = self.offsets().ptr.vmctx_an_and_table();
         unsafe { self.vmctx_plus_offset_mut(offset) }
     }
 
     /// Return a mutable reference to the AN-encoding `i32.or` LUT base
     /// pointer slot in this instance's `VMContext`.
-    pub fn an_or_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<i32>> {
+    pub fn an_or_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<u32>> {
         let offset = self.offsets().ptr.vmctx_an_or_table();
         unsafe { self.vmctx_plus_offset_mut(offset) }
     }
 
     /// Return a mutable reference to the AN-encoding `i32.xor` LUT base
     /// pointer slot in this instance's `VMContext`.
-    pub fn an_xor_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<i32>> {
+    pub fn an_xor_table(self: Pin<&mut Self>) -> &mut Option<VmPtr<u32>> {
         let offset = self.offsets().ptr.vmctx_an_xor_table();
         unsafe { self.vmctx_plus_offset_mut(offset) }
     }
@@ -649,7 +649,7 @@ impl Instance {
         let to_vmptr = |op| {
             engine
                 .an_lut_addr(op)
-                .map(|p| VmPtr::from(NonNull::new(p as *mut i32).expect("LUT address non-null")))
+                .map(|p| VmPtr::from(NonNull::new(p as *mut u32).expect("LUT address non-null")))
         };
         *self.as_mut().an_and_table() = to_vmptr(AnLutBinOp::And);
         *self.as_mut().an_or_table() = to_vmptr(AnLutBinOp::Or);
@@ -1037,11 +1037,11 @@ impl Instance {
         // `a == 0` is rejected by the config setter; the surrounding plumbing
         // guarantees a non-zero `a` here.
         debug_assert!(a != 0, "AN constant A=0 reached an_cross_check_memory");
-        // The setter also enforces `a < 2^23`; the mul+compare relies on it
-        // (`a * raw < 2^55` cannot wrap a u64).
+        // The setter also enforces `a < 2^24`; the mul+compare relies on it
+        // (`a * raw < 2^56` cannot wrap a u64).
         debug_assert!(
-            a < (1 << 23),
-            "AN constant A >= 2^23 reached an_cross_check_memory"
+            a < (1 << 24),
+            "AN constant A >= 2^24 reached an_cross_check_memory"
         );
         self.an_cross_check_range(memory_index, 0, usize::MAX, a)
     }
@@ -1052,8 +1052,8 @@ impl Instance {
     /// Asserts `enc_slot == A * u32_le(raw_slot)` for exactly the slots a host
     /// is about to read (verify-at-use), instead of sweeping the whole memory.
     /// `enc_slot == A * raw` is exactly equivalent to
-    /// `enc_slot % A == 0 && enc_slot / A == raw` because `A < 2^23` keeps the
-    /// product below `2^55` (no u64 wrap). Returns `true` when consistent, when
+    /// `enc_slot % A == 0 && enc_slot / A == raw` because `A < 2^24` keeps the
+    /// product below `2^56` (no u64 wrap). Returns `true` when consistent, when
     /// the memory has no shadow (AN off / shared), or when the range
     /// is empty / entirely past the end.
     ///

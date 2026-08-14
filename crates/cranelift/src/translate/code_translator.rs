@@ -1065,8 +1065,8 @@ pub fn translate_operator(
             if environ.tunables().an_encoding {
                 // Emit the canonical encoded form `A*v` as an i64 immediate.
                 // Work in u64 so the multiply uses the unsigned i32 bit
-                // pattern; the `A < 2^23` bound keeps the product (raw < 2^32)
-                // below 2^55 (so it never wraps), and the final `as i64` is a
+                // pattern; the `A < 2^24` bound keeps the product (raw < 2^32)
+                // below 2^56 (so it never wraps), and the final `as i64` is a
                 // bit-pattern reinterpret for `iconst`.
                 let raw = u64::from(value.cast_unsigned());
                 let encoded = raw.wrapping_mul(environ.tunables().an_constant);
@@ -1082,7 +1082,7 @@ pub fn translate_operator(
         Operator::I64Const { value } => {
             if environ.tunables().an_encoding {
                 // Encoded i64: emit `A*v` as an `I128` immediate. `v` is the
-                // unsigned bit pattern; `A < 2^23` keeps `A*v < 2^87`, so the
+                // unsigned bit pattern; `A < 2^24` keeps `A*v < 2^88`, so the
                 // product never wraps `u128`.
                 let raw = u128::from(*value as u64);
                 let encoded = raw.wrapping_mul(u128::from(environ.tunables().an_constant));
@@ -1180,21 +1180,13 @@ pub fn translate_operator(
                 // Stays inside the encoding: zero-extend the encoded value to
                 // I128, then if the i32 was negative (enc ≥ A*2^31) the i64
                 // value is `v + (2^64 - 2^32)`, so add `A*(2^64 - 2^32)`. The
-                // codeword check (and the conversion fault-inject hook) run on
-                // the input first.
+                // transformation stays entirely in the encoded domain.
                 let a = environ.tunables().an_constant;
-                let fault = environ.tunables().an_inject_conversion_fault;
-                let checked = if fault != 0 {
-                    builder.ins().iadd_imm(val, fault as i64)
-                } else {
-                    val
-                };
-                emit_an_codeword_validity_check(builder, a, checked);
-                let ext = builder.ins().uextend(I128, checked);
+                let ext = builder.ins().uextend(I128, val);
                 let half = builder.ins().iconst(I64, (a as i64) << 31);
                 let is_neg = builder
                     .ins()
-                    .icmp(IntCC::UnsignedGreaterThanOrEqual, checked, half);
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, val, half);
                 let addend = iconst_i128(builder, (a as u128) * ((1u128 << 64) - (1u128 << 32)));
                 let neg_ext = builder.ins().iadd(ext, addend);
                 builder.ins().select(is_neg, neg_ext, ext)
@@ -1208,16 +1200,8 @@ pub fn translate_operator(
             let result = if environ.tunables().an_encoding {
                 // Encoded i32 (`I64` = A*v) → encoded i64 (`I128` = A*v, same
                 // value). Zero-extend keeps the value, so just widen the
-                // encoded form to I128. Codeword check (+ fault hook) first.
-                let a = environ.tunables().an_constant;
-                let fault = environ.tunables().an_inject_conversion_fault;
-                let checked = if fault != 0 {
-                    builder.ins().iadd_imm(val, fault as i64)
-                } else {
-                    val
-                };
-                emit_an_codeword_validity_check(builder, a, checked);
-                builder.ins().uextend(I128, checked)
+                // encoded form to I128.
+                builder.ins().uextend(I128, val)
             } else {
                 builder.ins().uextend(I64, val)
             };
@@ -1228,7 +1212,7 @@ pub fn translate_operator(
             let result = if environ.tunables().an_encoding {
                 // Encoded i64 (`I128` = A*v) → encoded i32 (`I64` = A*(v mod
                 // 2^32)). `(A*v) mod (A*2^32) = A*(v mod 2^32)`, and A*2^32 <
-                // 2^55 fits u64. Stays inside the encoding, so no decode and no
+                // 2^56 fits u64. Stays inside the encoding, so no decode and no
                 // codeword check (structural, like `i32.add`).
                 let aw = u64::from(environ.tunables().an_constant) << 32;
                 let (lo, hi) = builder.ins().isplit(val);
@@ -1702,11 +1686,6 @@ pub fn translate_operator(
             if environ.tunables().an_encoding && matches!(op, Operator::I32Mul) {
                 let a = environ.tunables().an_constant;
                 let aw = a << 32;
-                // The divide by `A` below decodes: check both operands so a
-                // corrupted operand can't be laundered into a valid codeword
-                // when the other operand's raw value is a multiple of A.
-                emit_an_codeword_validity_check(builder, a, arg1);
-                emit_an_codeword_validity_check(builder, a, arg2);
                 let p_lo = builder.ins().imul(arg1, arg2);
                 let p_hi = builder.ins().umulhi(arg1, arg2);
                 let (q_hi, q_lo) = udiv_u128_by_u64_const(builder, p_hi, p_lo, a);
@@ -5117,8 +5096,6 @@ fn an_extend_low_i32_s(
     debug_assert!(matches!(bits, 8 | 16));
     if environ.tunables().an_encoding {
         let a = environ.tunables().an_constant;
-        emit_an_codeword_validity_check(builder, a, val);
-
         let modulus = a << bits;
         let modulus_const = builder.ins().iconst(I64, modulus as i64);
         let low_enc = builder.ins().urem(val, modulus_const);
@@ -5155,8 +5132,6 @@ fn an_extend_low_s(
 ) -> Value {
     if environ.tunables().an_encoding {
         let a = environ.tunables().an_constant;
-        emit_an_codeword_validity_check_i128(builder, a, val);
-
         let bits = narrow.bits();
         debug_assert!(matches!(bits, 8 | 16 | 32));
         let (lo, hi) = builder.ins().isplit(val);

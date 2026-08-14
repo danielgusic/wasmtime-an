@@ -341,7 +341,6 @@ impl Metadata<'_> {
             an_encoding,
             an_constant,
             an_inject_codeword_fault,
-            an_inject_conversion_fault,
         } = self.tunables;
 
         Self::check_collector(collector, other.collector)?;
@@ -436,12 +435,6 @@ impl Metadata<'_> {
             other.an_inject_codeword_fault,
             "AN-encoding codeword fault injection offset",
         )?;
-        Self::check_int(
-            an_inject_conversion_fault,
-            other.an_inject_conversion_fault,
-            "AN-encoding conversion fault injection offset",
-        )?;
-
         Ok(())
     }
 

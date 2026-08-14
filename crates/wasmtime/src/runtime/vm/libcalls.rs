@@ -592,16 +592,14 @@ fn memory_copy(
         let dst_usize = usize::try_from(dst).unwrap();
         let len_usize = usize::try_from(len).unwrap();
         let consistent = match def_dst {
-            Some(def_idx) => {
-                store
-                    .instance_mut(instance)
-                    .an_encode_range_from_raw(def_idx, dst_usize, len_usize, a)
-            }
+            Some(def_idx) => store
+                .instance_mut(instance)
+                .an_encode_range_from_raw(def_idx, dst_usize, len_usize, a),
             // Imported destination: re-encode the owning instance's shadow
             // through the `VMMemoryImport` enc-base indirection.
-            None => store.instance(instance).an_encode_imported_range_from_raw(
-                dst_index, dst_usize, len_usize, a,
-            ),
+            None => store
+                .instance(instance)
+                .an_encode_imported_range_from_raw(dst_index, dst_usize, len_usize, a),
         };
         // Boundary-slot mismatch: pre-existing corruption next to the
         // written range that the re-encode would otherwise launder.
@@ -670,11 +668,9 @@ fn memory_init(
         let dst_usize = usize::try_from(dst).unwrap();
         let len_usize = usize::try_from(len).unwrap();
         let consistent = match def_dst {
-            Some(def_idx) => {
-                store
-                    .instance_mut(instance)
-                    .an_encode_range_from_raw(def_idx, dst_usize, len_usize, a)
-            }
+            Some(def_idx) => store
+                .instance_mut(instance)
+                .an_encode_range_from_raw(def_idx, dst_usize, len_usize, a),
             // Imported destination: re-encode the owning instance's shadow
             // through the `VMMemoryImport` enc-base indirection.
             None => store.instance(instance).an_encode_imported_range_from_raw(
