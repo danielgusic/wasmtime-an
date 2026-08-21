@@ -1,7 +1,7 @@
 use crate::TRAP_INTERNAL_ASSERT;
 use crate::debug::DwarfSectionRelocTarget;
 use crate::func_environ::FuncEnvironment;
-use crate::translate::FuncTranslator;
+use crate::translate::{AnCodewordCheck, FuncTranslator};
 use crate::{BuiltinFunctionSignatures, builder::LinkOptions, wasm_call_signature};
 use crate::{CompiledFunction, ModuleTextBuilder, array_call_signature};
 use cranelift_codegen::binemit::CodeOffset;
@@ -78,6 +78,7 @@ impl Default for CompilerContext {
 /// the Wasm to Compiler IR, optimizing it and then translating to assembly.
 pub struct Compiler {
     tunables: Tunables,
+    an_codeword_check: AnCodewordCheck,
     contexts: Mutex<Vec<CompilerContext>>,
     isa: OwnedTargetIsa,
     emit_debug_checks: bool,
@@ -127,9 +128,11 @@ impl Compiler {
         wmemcheck: bool,
     ) -> Compiler {
         let _ = wmemcheck;
+        let an_codeword_check = AnCodewordCheck::new(tunables.an_constant);
         Compiler {
             contexts: Default::default(),
             tunables,
+            an_codeword_check,
             isa,
             emit_debug_checks,
             linkopts,
@@ -1355,6 +1358,10 @@ impl Compiler {
 
     pub fn tunables(&self) -> &Tunables {
         &self.tunables
+    }
+
+    pub(crate) fn an_codeword_check(&self) -> AnCodewordCheck {
+        self.an_codeword_check
     }
 
     fn debug_assert_enough_capacity_for_length(

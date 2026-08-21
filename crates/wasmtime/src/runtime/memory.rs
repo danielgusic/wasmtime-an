@@ -460,11 +460,21 @@ impl Memory {
     #[doc(hidden)]
     #[must_use]
     pub fn an_resync_range(&self, mut store: impl AsContextMut, offset: usize, len: usize) -> bool {
+        let range = offset..offset.saturating_add(len);
+        self.an_resync_ranges_internal(&mut store, core::slice::from_ref(&range))
+    }
+
+    #[must_use]
+    pub(crate) fn an_resync_ranges_internal(
+        &self,
+        mut store: impl AsContextMut,
+        ranges: &[core::ops::Range<usize>],
+    ) -> bool {
         let mut context = store.as_context_mut();
         let a = context.engine().tunables().an_constant;
         self.instance
             .get_mut(&mut context.0)
-            .an_encode_range_from_raw(self.index, offset, len, a)
+            .an_encode_ranges_from_raw(self.index, ranges, a)
     }
 
     /// If the host pointer range `[ptr, ptr + len)` lies inside this

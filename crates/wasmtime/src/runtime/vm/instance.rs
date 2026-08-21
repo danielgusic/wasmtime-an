@@ -678,10 +678,26 @@ impl Instance {
     /// legitimately stale, raw is the source of truth).
     #[must_use]
     pub(crate) fn an_encode_range_from_raw(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         memory_index: DefinedMemoryIndex,
         start: usize,
         len: usize,
+        a: u64,
+    ) -> bool {
+        let range = start..start.saturating_add(len);
+        self.an_encode_ranges_from_raw(memory_index, core::slice::from_ref(&range), a)
+    }
+
+    /// Re-encode multiple host-written byte ranges as one operation. Retained
+    /// bytes are validated against the union of all ranges before any touched
+    /// slot is rebuilt, so separate writes into one 4-byte slot do not treat
+    /// each other as corruption while genuinely untouched bytes are still
+    /// checked.
+    #[must_use]
+    pub(crate) fn an_encode_ranges_from_raw(
+        mut self: Pin<&mut Self>,
+        memory_index: DefinedMemoryIndex,
+        ranges: &[Range<usize>],
         a: u64,
     ) -> bool {
         let mem_def = self.memories[memory_index].1.vmmemory();
@@ -694,11 +710,20 @@ impl Instance {
             None => return true,
         };
         if !whole_dirty
-            && !Self::an_boundary_slots_consistent_parts(shadow, raw_base, raw_len, start, len, a)
+            && !Self::an_dirty_ranges_consistent_parts(shadow, raw_base, raw_len, ranges, a)
         {
             return false;
         }
-        Self::an_encode_range_parts(shadow, raw_base, raw_len, start, len, a);
+        for range in ranges {
+            Self::an_encode_range_parts(
+                shadow,
+                raw_base,
+                raw_len,
+                range.start,
+                range.end.saturating_sub(range.start),
+                a,
+            );
+        }
         true
     }
 
@@ -723,14 +748,50 @@ impl Instance {
         len: usize,
         a: u64,
     ) -> bool {
-        if len == 0 || start >= raw_len {
-            return true;
+        let range = start..start.saturating_add(len);
+        Self::an_dirty_ranges_consistent_parts(
+            shadow,
+            raw_base,
+            raw_len,
+            core::slice::from_ref(&range),
+            a,
+        )
+    }
+
+    /// Validate bytes not written by any of `ranges` in every partially dirty
+    /// 4-byte slot. All validation happens before the caller re-encodes any
+    /// slot, preserving the original shadow if a retained byte disagrees.
+    fn an_dirty_ranges_consistent_parts(
+        shadow: &[u8],
+        raw_base: *const u8,
+        raw_len: usize,
+        ranges: &[Range<usize>],
+        a: u64,
+    ) -> bool {
+        let mut boundary_slots = Vec::with_capacity(ranges.len().saturating_mul(2));
+        for range in ranges {
+            let start = range.start;
+            let end = range.end.min(raw_len);
+            if start >= end {
+                continue;
+            }
+            boundary_slots.push(start / 4);
+            boundary_slots.push((end - 1) / 4);
         }
-        let end = start.saturating_add(len).min(raw_len);
+        boundary_slots.sort_unstable();
+        boundary_slots.dedup();
 
         let slot_retained_consistent = |slot: usize| -> bool {
             let raw_off = slot * 4;
             let slot_len = (raw_len - raw_off).min(4);
+            let is_dirty = |pos: usize| {
+                ranges
+                    .iter()
+                    .any(|range| range.start <= pos && pos < range.end)
+            };
+            if (0..slot_len).all(|i| is_dirty(raw_off + i)) {
+                return true;
+            }
             let enc_off = slot * 8;
             let Some(enc_bytes) = shadow.get(enc_off..enc_off + 8) else {
                 return false;
@@ -746,7 +807,7 @@ impl Instance {
             let word_bytes = (word as u32).to_le_bytes();
             for i in 0..slot_len {
                 let pos = raw_off + i;
-                if pos >= start && pos < end {
+                if is_dirty(pos) {
                     // Being overwritten: raw is the new truth here.
                     continue;
                 }
@@ -759,21 +820,7 @@ impl Instance {
             true
         };
 
-        let first_slot = start / 4;
-        let last_slot = (end - 1) / 4;
-        // Front-partial first slot; back-partial last slot (nothing retained
-        // at the back when the range runs to the end of memory). A single
-        // slot partial on both sides is checked once — the closure skips only
-        // `[start, end)`, so it covers both retained pieces.
-        if start % 4 != 0 && !slot_retained_consistent(first_slot) {
-            return false;
-        }
-        if end % 4 != 0 && end < raw_len && (last_slot != first_slot || start % 4 == 0) {
-            if !slot_retained_consistent(last_slot) {
-                return false;
-            }
-        }
-        true
+        boundary_slots.into_iter().all(slot_retained_consistent)
     }
 
     /// Slot-encode core shared by [`Self::an_encode_range_from_raw`], the

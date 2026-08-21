@@ -152,15 +152,20 @@ fn generate_func(
         // Bring the AN-encoding shadow back in sync for exactly the ranges
         // the host wrote. This must run on the error path too: writes may
         // have landed before the error. No-op when tracking is off.
-        let an_dirty = mem.an_take_dirty();
+        let an_dirty = mem
+            .an_take_dirty()
+            .into_iter()
+            .map(|r| r.start as usize..r.end as usize)
+            .collect::<Vec<_>>();
         if let Some(m) = an_memory {
-            for r in an_dirty {
-                // `false`: a partially covered boundary slot's retained bytes
-                // disagree with the shadow — pre-existing corruption the
-                // re-encode would otherwise launder.
-                if !m.an_resync_range(&mut caller, r.start as usize, (r.end - r.start) as usize) {
-                    wiggle::error::bail!("AN-encoding memory mismatch at hostcall write resync");
-                }
+            // Validate the union before re-encoding: generated record writes
+            // may produce disjoint byte ranges in one 4-byte AN slot.
+            if !wiggle::wasmtime_crate::_internal::an_resync_ranges(
+                &m,
+                &mut caller,
+                &an_dirty,
+            ) {
+                wiggle::error::bail!("AN-encoding memory mismatch at hostcall write resync");
             }
         }
         Ok(<#ret_ty>::from(result?))

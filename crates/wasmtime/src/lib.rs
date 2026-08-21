@@ -552,4 +552,15 @@ fn _assertions_lib() {
 pub mod _internal {
     // Exported just for the CLI.
     pub use crate::runtime::vm::MmapVec;
+
+    /// Internal bridge used by generated hostcall wrappers to atomically
+    /// resynchronize multiple AN-encoding dirty ranges.
+    #[doc(hidden)]
+    pub fn an_resync_ranges(
+        memory: &crate::Memory,
+        mut store: impl crate::AsContextMut,
+        ranges: &[core::ops::Range<usize>],
+    ) -> bool {
+        memory.an_resync_ranges_internal(&mut store, ranges)
+    }
 }

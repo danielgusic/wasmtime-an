@@ -469,14 +469,37 @@ pub(crate) fn emit_an_enc_offset_from_effective_addr(
     builder.ins().ishl_imm(i64_addr, 1)
 }
 
-/// Emit an inline AN-encoding load-side validity check covering every shadow
-/// slot touched by an i32 load family op.
+/// Load a naturally-aligned `i32` directly from its AN shadow slot.
+///
+/// The caller must first prove that the four-byte raw-memory access is in
+/// bounds. Unlike the raw linear-memory allocation, the shadow has no guard
+/// pages on which this trusted load can rely.
+///
+/// A naturally-aligned raw address maps one-to-one to an eight-byte shadow
+/// slot. The loaded value is already the canonical operand-stack `I64`
+/// codeword, so after checking `enc % A == 0` it can be returned without a raw
+/// load or an encoding multiply.
+pub(crate) fn emit_an_aligned_i32_load_from_shadow(
+    builder: &mut FunctionBuilder,
+    environ: &mut FuncEnvironment<'_>,
+    enc_base: Value,
+    effective_addr_i64: Value,
+) -> Value {
+    let enc_off = emit_an_enc_offset_from_effective_addr(builder, effective_addr_i64);
+    let enc_addr = builder.ins().iadd(enc_base, enc_off);
+    let enc = builder.ins().load(I64, MemFlags::trusted(), enc_addr, 0);
+    emit_an_standalone_codeword_validity_check(builder, environ.an_codeword_check(), enc);
+    enc
+}
+
+/// Emit the raw/shadow equality check used by subword and unaligned integer
+/// loads, covering every shadow slot they touch.
 ///
 /// For each touched slot the check asserts:
 /// `enc_slot == A * u32_le(raw_slot)`. Any mismatch raises
 /// [`crate::TRAP_AN_MEMORY_MISMATCH`] immediately, at the load site. This is
-/// the guest-read half of verify-at-use and is mandatory under AN — it is the
-/// sole guard on guest reads, with no host-boundary cross-check behind it.
+/// the guest-read half of verify-at-use for loads that cannot consume one
+/// encoded shadow slot directly.
 ///
 /// `raw_base_addr_i64` is the address `prepare_addr` produced for the load
 /// (raw heap base + effective wasm byte address, with `memarg.offset`
@@ -549,6 +572,89 @@ fn check_one_slot_validity(
     builder
         .ins()
         .trapnz(mismatch, crate::TRAP_AN_MEMORY_MISMATCH);
+}
+
+/// Precomputed constants for a standalone `I64` AN codeword validity check.
+///
+/// These are derived once when the Cranelift compiler is constructed. For an
+/// arbitrary positive `A`, write `A = 2^shift * odd`. Divisibility by the
+/// power-of-two part is checked from the low bits; divisibility by `odd` uses
+/// its inverse modulo `2^64`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AnCodewordCheck {
+    shift: u32,
+    odd: u64,
+    odd_inverse: u64,
+    odd_max_quotient: u64,
+}
+
+impl AnCodewordCheck {
+    pub(crate) fn new(a: u64) -> Self {
+        assert!(a > 0, "AN constant must be positive");
+        let shift = a.trailing_zeros();
+        let odd = a >> shift;
+
+        // Newton iteration in Z/(2^64). Starting at 1 gives one correct low
+        // bit for every odd number; each iteration doubles the number of
+        // correct bits, so six iterations cover all 64 bits.
+        let mut odd_inverse = 1u64;
+        for _ in 0..6 {
+            odd_inverse =
+                odd_inverse.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(odd_inverse)));
+        }
+        debug_assert_eq!(odd.wrapping_mul(odd_inverse), 1);
+
+        Self {
+            shift,
+            odd,
+            odd_inverse,
+            odd_max_quotient: u64::MAX / odd,
+        }
+    }
+}
+
+/// Emit a standalone AN codeword validity check without constructing a
+/// remainder.
+///
+/// For odd `d`, `x` is divisible by `d` exactly when
+/// `x * d^-1 (mod 2^64) <= floor((2^64 - 1) / d)`. Even `A` values are first
+/// split into their power-of-two and odd factors, so custom constants retain
+/// exact behavior too.
+fn emit_an_standalone_codeword_validity_check(
+    builder: &mut FunctionBuilder,
+    check: AnCodewordCheck,
+    val_i64: Value,
+) {
+    if check.shift == 0 && check.odd == 1 {
+        return;
+    }
+
+    let mut invalid = None;
+    let reduced = if check.shift == 0 {
+        val_i64
+    } else {
+        let low_mask = (1u64 << check.shift) - 1;
+        let low_bits = builder.ins().band_imm(val_i64, low_mask as i64);
+        invalid = Some(builder.ins().icmp_imm(IntCC::NotEqual, low_bits, 0));
+        builder.ins().ushr_imm(val_i64, i64::from(check.shift))
+    };
+
+    if check.odd != 1 {
+        let inverse = builder.ins().iconst(I64, check.odd_inverse as i64);
+        let mapped = builder.ins().imul(reduced, inverse);
+        let max_quotient = builder.ins().iconst(I64, check.odd_max_quotient as i64);
+        let odd_invalid = builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, mapped, max_quotient);
+        invalid = Some(match invalid {
+            Some(power_of_two_invalid) => builder.ins().bor(power_of_two_invalid, odd_invalid),
+            None => odd_invalid,
+        });
+    }
+
+    builder
+        .ins()
+        .trapnz(invalid.unwrap(), crate::TRAP_AN_CODEWORD_INVALID);
 }
 
 /// Emit a boundary-side AN codeword validity check.
@@ -1084,4 +1190,51 @@ pub(crate) fn emit_an_mul_i64(
         builder.ins().urem(q_hi, a_const)
     };
     builder.ins().iconcat(q_lo, r_hi)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AnCodewordCheck;
+
+    fn accepts(check: AnCodewordCheck, value: u64) -> bool {
+        if check.shift != 0 && value & ((1u64 << check.shift) - 1) != 0 {
+            return false;
+        }
+        if check.odd == 1 {
+            return true;
+        }
+        let reduced = value >> check.shift;
+        reduced.wrapping_mul(check.odd_inverse) <= check.odd_max_quotient
+    }
+
+    #[test]
+    fn standalone_codeword_constants_match_remainder() {
+        let mut sample = 0x0123_4567_89ab_cdefu64;
+        for a in 1..4096u64 {
+            let check = AnCodewordCheck::new(a);
+            assert_eq!(check.odd & 1, 1);
+            assert_eq!(a, check.odd << check.shift);
+
+            for multiplier in [0, 1, 2, u64::from(u32::MAX), u64::MAX / a] {
+                let value = a * multiplier;
+                assert!(accepts(check, value), "A={a}, value={value}");
+            }
+
+            for _ in 0..16 {
+                sample = sample
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                assert_eq!(accepts(check, sample), sample % a == 0, "A={a}");
+            }
+        }
+    }
+
+    #[test]
+    fn default_codeword_constants_are_stable() {
+        let check = AnCodewordCheck::new(65_521);
+        assert_eq!(check.shift, 0);
+        assert_eq!(check.odd, 65_521);
+        assert_eq!(check.odd_inverse, 0x5886_2fdc_cdf0_1111);
+        assert_eq!(check.odd_max_quotient, 0x0001_000f_00e1_0d2f);
+    }
 }

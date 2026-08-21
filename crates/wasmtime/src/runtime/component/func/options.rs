@@ -261,10 +261,8 @@ impl<'a, T: 'static> LowerContext<'a, T> {
             Some(m) => m,
             None => return Ok(()),
         };
-        for r in ranges {
-            if !memory.an_resync_range(&mut self.store, r.start, r.end - r.start) {
-                return Err(crate::Trap::AnMemoryMismatch.into());
-            }
+        if !memory.an_resync_ranges_internal(&mut self.store, &ranges) {
+            return Err(crate::Trap::AnMemoryMismatch.into());
         }
         Ok(())
     }
