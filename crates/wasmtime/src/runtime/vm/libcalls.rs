@@ -1421,19 +1421,6 @@ unsafe impl HostResultHasUnwindSentinel for NextEpoch {
     }
 }
 
-// Temporary runtime hook for classifying dynamically executed AN-encoded
-// integer loads. The effective address is already decoded and includes the
-// Wasm memarg offset.
-fn track_an_integer_load(
-    store: &mut dyn VMStore,
-    _instance: InstanceId,
-    result_bits: u32,
-    num_bytes: u32,
-    effective_addr: u64,
-) {
-    store.record_an_integer_load(result_bits, num_bytes, effective_addr);
-}
-
 // Hook for validating malloc using wmemcheck_state.
 #[cfg(feature = "wmemcheck")]
 fn check_malloc(store: &mut dyn VMStore, instance: InstanceId, addr: u32, len: u32) -> Result<()> {

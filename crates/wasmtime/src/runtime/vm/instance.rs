@@ -121,14 +121,15 @@ pub struct Instance {
     ///
     /// Each entry is either `None` (no shadow allocated for this memory; this
     /// is the case when AN-encoding is disabled, when the memory is shared,
-    /// or before [`Self::set_an_enc_shadows`] has run) or a `Box<[u8]>` of
-    /// size `ENC_MEM_GROWTH_FACTOR * raw_byte_size`. JIT code reads the base
-    /// pointer of each shadow from the corresponding `VMContext` slot at
-    /// `VMOffsets::vmctx_an_enc_memory_base(idx)`; this map is the Rust-side
-    /// owner that keeps those buffers alive for the lifetime of the
-    /// instance. See `wasmtime_environ::ENC_MEM_GROWTH_FACTOR` for the layout
-    /// invariant.
-    an_enc_shadows: TryPrimaryMap<DefinedMemoryIndex, Option<Box<[u8]>>>,
+    /// or before [`Self::set_an_enc_shadows`] has run) or a `Vec<u8>` whose
+    /// logical length is `ENC_MEM_GROWTH_FACTOR * raw_byte_size`. Spare vector
+    /// capacity grows geometrically and is not part of the accessible shadow.
+    /// JIT code reads the base pointer of each shadow from the corresponding
+    /// `VMContext` slot at `VMOffsets::vmctx_an_enc_memory_base(idx)`; this map
+    /// is the Rust-side owner that keeps those buffers alive for the lifetime
+    /// of the instance. See `wasmtime_environ::ENC_MEM_GROWTH_FACTOR` for the
+    /// layout invariant.
+    an_enc_shadows: TryPrimaryMap<DefinedMemoryIndex, Option<Vec<u8>>>,
 
     /// AN-encoding "whole memory dirty" flags, parallel to
     /// [`Self::an_enc_shadows`].
@@ -874,49 +875,41 @@ impl Instance {
         }
     }
 
-    /// Re-allocate the AN-encoding shadow for a defined memory whose raw
-    /// buffer has grown via `memory.grow`. Allocates a fresh
-    /// `2 * new_raw_size` `Box<[u8]>`, copies the previous shadow's
-    /// already-encoded bytes into it, swaps it in, and updates the
-    /// `vmctx_an_enc_memory_base` slot.
+    /// Resize the AN-encoding shadow for a defined memory whose raw buffer has
+    /// grown via `memory.grow`. The vector retains geometrically grown spare
+    /// capacity so small successive grows usually extend the existing
+    /// allocation. Updates the `vmctx_an_enc_memory_base` slot after every
+    /// resize because reserving more capacity can still relocate the vector.
     ///
     /// No-op when the memory has no shadow allocated (AN off or shared;
     /// a defined index of this instance is never imported).
     pub(crate) fn an_grow_shadow(mut self: Pin<&mut Self>, memory_index: DefinedMemoryIndex) {
-        if self.an_enc_shadows[memory_index].is_none() {
-            return;
-        }
         let raw_len = self.memories[memory_index].1.byte_size();
         let new_size = raw_len
             .checked_mul(usize::try_from(wasmtime_environ::ENC_MEM_GROWTH_FACTOR).unwrap())
             .expect("AN shadow size overflowed usize on memory.grow");
-        let mut new_shadow: Box<[u8]> = vec![0u8; new_size].into_boxed_slice();
 
         // `memory.grow` only appends fresh zero pages; every pre-existing raw
-        // byte keeps its offset, so the old shadow is still a valid encoding of
-        // those bytes. Copy them verbatim into the new buffer and leave the
-        // rest zero: the grown raw pages are zero and `A * 0 == 0`, so their
-        // shadow slots are correctly zero straight from the fresh allocation.
+        // byte keeps its offset, so Vec growth preserves the already-encoded
+        // prefix. Zero-initialize the newly visible tail: the grown raw pages
+        // are zero and `A * 0 == 0`, so those shadow slots are correct.
         //
         // This deliberately avoids re-encoding the whole memory from raw on
         // every grow. That re-encode was O(raw_len): for a multi-GiB memory it
         // read every raw byte and wrote every shadow byte, committing both
         // buffers and turning an otherwise lazy / VM-based `memory.grow` into a
         // multi-second, multi-GiB spin (e.g. the `big-strings` component test).
-        // Copying only touches the old shadow (the bytes already resident),
-        // leaving the freshly mapped tail untouched and lazily zero-backed.
-        //
         // It also keeps the encoded shadow as the source of truth: re-encoding
         // from raw would silently "heal" any raw corruption that verify-at-use
         // (the guest load check / host read verify) is supposed to detect.
-        if let Some(old_shadow) = self.an_enc_shadows[memory_index].as_deref() {
-            let n = old_shadow.len().min(new_shadow.len());
-            new_shadow[..n].copy_from_slice(&old_shadow[..n]);
-        }
-
-        let base_ptr = NonNull::new(new_shadow.as_ptr() as *mut u8)
-            .expect("AN shadow grow allocation produced a null pointer");
-        self.as_mut().an_enc_shadows_mut()[memory_index] = Some(new_shadow);
+        let base_ptr = {
+            let Some(shadow) = self.as_mut().an_enc_shadows_mut()[memory_index].as_mut() else {
+                return;
+            };
+            resize_an_shadow(shadow, new_size);
+            NonNull::new(shadow.as_mut_ptr())
+                .expect("AN shadow grow allocation produced a null pointer")
+        };
 
         // Update the `VMContext` slot so JIT-emitted stores see the new
         // base pointer.
@@ -1223,7 +1216,7 @@ impl Instance {
     /// write the base pointers into the matching `VMContext` slots.
     ///
     /// Each shadow is sized at `ENC_MEM_GROWTH_FACTOR * raw_byte_size` and
-    /// owns its storage as a `Box<[u8]>` held in `self.an_enc_shadows`. The
+    /// owns its storage as a `Vec<u8>` held in `self.an_enc_shadows`. The
     /// raw pointer to that storage is mirrored into
     /// `vmctx_an_enc_memory_base(idx)` so JIT-emitted load/store paths can
     /// read it via a single `load.i64` from the vmctx.
@@ -1255,7 +1248,7 @@ impl Instance {
             // Allocate zero-filled. Zero decodes to zero under the AN encoding
             // (`A * 0 == 0`), so a freshly created memory's shadow is already
             // consistent with the raw side without any extra work.
-            let shadow: Box<[u8]> = vec![0u8; shadow_bytes].into_boxed_slice();
+            let shadow = vec![0u8; shadow_bytes];
             let base_ptr = NonNull::new(shadow.as_ptr() as *mut u8)
                 .expect("shadow allocation produced a null pointer");
             self.as_mut().an_enc_shadows_mut()[defined_memory_index] = Some(shadow);
@@ -1490,8 +1483,8 @@ impl Instance {
             self.as_mut().set_memory(idx, vmmemory);
         }
 
-        // AN-encoding: re-allocate the shadow to match the new raw size and
-        // update the `VMContext` base-pointer slot. Hooked here (not in the
+        // AN-encoding: resize the shadow to match the new raw size and update
+        // the `VMContext` base-pointer slot. Hooked here (not in the
         // `memory_grow` libcall) so every grow path is covered: the wasm
         // `memory.grow` libcall, the embedder-facing `Memory::grow`, and
         // grows on imported memories routed to the owning instance. No-op
@@ -2349,7 +2342,7 @@ impl Instance {
 
     fn an_enc_shadows_mut(
         self: Pin<&mut Self>,
-    ) -> &mut TryPrimaryMap<DefinedMemoryIndex, Option<Box<[u8]>>> {
+    ) -> &mut TryPrimaryMap<DefinedMemoryIndex, Option<Vec<u8>>> {
         // SAFETY: see `store_mut` above.
         unsafe { &mut self.get_unchecked_mut().an_enc_shadows }
     }
@@ -2365,6 +2358,50 @@ impl Instance {
     pub(super) fn wmemcheck_state_mut(self: Pin<&mut Self>) -> &mut Option<Wmemcheck> {
         // SAFETY: see `store_mut` above.
         unsafe { &mut self.get_unchecked_mut().wmemcheck_state }
+    }
+}
+
+/// Grow an AN shadow's logical length while amortizing backing-buffer
+/// reallocations. Capacity doubles only when `new_size` no longer fits; the
+/// vector's length remains the exact accessible shadow size.
+fn resize_an_shadow(shadow: &mut Vec<u8>, new_size: usize) {
+    debug_assert!(new_size >= shadow.len());
+    if new_size > shadow.capacity() {
+        let new_capacity = shadow
+            .capacity()
+            .checked_mul(2)
+            .unwrap_or(new_size)
+            .max(new_size);
+        shadow.reserve_exact(new_capacity - shadow.len());
+    }
+    shadow.resize(new_size, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resize_an_shadow;
+
+    #[test]
+    fn an_shadow_resize_grows_capacity_geometrically() {
+        let mut shadow = vec![1u8; 16];
+        let old_capacity = shadow.capacity();
+        let first_new_size = old_capacity + 1;
+
+        resize_an_shadow(&mut shadow, first_new_size);
+
+        assert_eq!(shadow.len(), first_new_size);
+        assert!(shadow.capacity() >= old_capacity * 2);
+        assert!(shadow[..16].iter().all(|byte| *byte == 1));
+        assert!(shadow[16..].iter().all(|byte| *byte == 0));
+
+        // Extending the logical shadow within retained capacity must not move
+        // its base, which is the common path for small successive grows.
+        let base = shadow.as_ptr();
+        let retained_capacity = shadow.capacity();
+        resize_an_shadow(&mut shadow, retained_capacity);
+        assert_eq!(shadow.as_ptr(), base);
+        assert_eq!(shadow.len(), retained_capacity);
+        assert!(shadow[16..].iter().all(|byte| *byte == 0));
     }
 }
 

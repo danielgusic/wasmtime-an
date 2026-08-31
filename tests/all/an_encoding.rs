@@ -8,83 +8,6 @@ fn make_config(an_enabled: bool) -> Config {
     config
 }
 
-#[test]
-fn runtime_integer_load_tracker_classifies_dynamic_accesses() -> wasmtime::Result<()> {
-    let engine = Engine::new(&make_config(true))?;
-    let module = Module::new(
-        &engine,
-        r#"
-            (module
-              (memory 1)
-              (func (export "run") (param $n i32)
-                (block $done
-                  (loop $again
-                    local.get $n
-                    i32.eqz
-                    br_if $done
-
-                    i32.const 0
-                    i32.load
-                    drop
-
-                    i32.const 1
-                    i32.load
-                    drop
-
-                    i32.const 2
-                    i32.load8_u
-                    drop
-
-                    i32.const 3
-                    i32.load16_u
-                    drop
-
-                    i32.const 4
-                    i64.load
-                    drop
-
-                    i32.const 5
-                    i64.load
-                    drop
-
-                    i32.const 6
-                    i64.load8_u
-                    drop
-
-                    i32.const 7
-                    i64.load16_u
-                    drop
-
-                    i32.const 8
-                    i64.load32_u
-                    drop
-
-                    i32.const 9
-                    i64.load32_u
-                    drop
-
-                    local.get $n
-                    i32.const 1
-                    i32.sub
-                    local.tee $n
-                    br_if $again))))
-        "#,
-    )?;
-    let mut store = Store::new(&engine, ());
-    let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
-    let run = instance.get_typed_func::<i32, ()>(&mut store, "run")?;
-
-    run.call(&mut store, 10_000)?;
-
-    let expected = if wasmtime_environ::AN_INTEGER_LOAD_TRACKING_ENABLED {
-        [10_000; 10]
-    } else {
-        [0; 10]
-    };
-    assert_eq!(store.an_integer_load_stats_for_test(), expected);
-    Ok(())
-}
-
 // AN config pinned to an explicit constant when `a` is `Some`, else the default.
 fn an_cfg(an_enabled: bool, a: Option<u64>) -> Config {
     let mut config = make_config(an_enabled);
@@ -2370,18 +2293,6 @@ fn expect_an_mismatch_trap(res: wasmtime::Result<i32>, label: &str) {
     );
 }
 
-fn expect_an_codeword_invalid_trap(res: wasmtime::Result<i32>, label: &str) {
-    let err = res.expect_err(&format!("{label}: expected AnCodewordInvalid trap, got Ok"));
-    let trap = err
-        .downcast_ref::<wasmtime::Trap>()
-        .unwrap_or_else(|| panic!("{label}: not a Trap: {err:?}"));
-    assert_eq!(
-        *trap,
-        wasmtime::Trap::AnCodewordInvalid,
-        "{label}: wrong trap code"
-    );
-}
-
 /// Assert that a host `Memory::read` of the 4-byte slot at `offset` fails its
 /// verify-at-use cross-check (returns `Err`).
 ///
@@ -2741,21 +2652,20 @@ fn grow_setup(
     Ok((store, memory, grow, st, ld, f))
 }
 
-// Sharp guard: a raw/shadow divergence introduced *before* a grow must survive
-// it. If `memory.grow` re-encoded the shadow from raw it would absorb the
-// corruption and the host-side cross-check would (wrongly) pass.
+// Sharp guard: a raw/shadow divergence introduced *before* a grow must still
+// be detected *after* it. If `memory.grow` re-encoded the shadow from raw it
+// would absorb the corruption and the cross-check would (wrongly) pass.
 #[test]
 fn grow_does_not_resync_shadow_from_raw() -> wasmtime::Result<()> {
-    let (mut store, memory, grow, _st, _ld, _f) = grow_setup(65521)?;
+    let (mut store, memory, grow, _st, ld, _f) = grow_setup(65521)?;
     // raw[0..4] == 0 and shadow[0..8] == A*0 == 0 after instantiation. Flip a
     // raw bit (untracked, modeling a fault) so raw and shadow disagree.
     tamper_raw_byte(&memory, &mut store, 3, |b| b ^ 0x80);
     // Grow a page. The divergence must survive (shadow copied forward, not
-    // re-encoded from the corrupted raw). Aligned guest i32 loads intentionally
-    // use shadow as their sole source of truth, so verify the raw side through
-    // the host read path.
+    // re-encoded from the corrupted raw). Verify-at-use: a guest `i32.load` of
+    // slot 0 surfaces it via the mandatory load-side check.
     grow.call(&mut store, 1)?;
-    expect_host_read_mismatch(&memory, &mut store, 0, "raw corruption survives grow");
+    expect_an_mismatch_trap(ld.call(&mut store, 0), "raw corruption survives grow");
     Ok(())
 }
 
@@ -3464,10 +3374,12 @@ fn multi_memory_tamper_mem1_traps() -> wasmtime::Result<()> {
     Ok(())
 }
 
-// AN load validation. Naturally-aligned full-width i32 loads use the shadow as
-// their sole source of truth, check `slot % A == 0`, and return that codeword
-// directly. Unaligned and subword loads retain the raw/shadow equality check
-// over every slot they touch.
+// Mandatory per-load shadow-validity check. Under `an_encoding(true)` every
+// i32 load emits an inline assertion that the encoded shadow slot(s) it
+// touches still satisfy `slot % A == 0 && slot / A == u32_le(raw_slot)`. This
+// is the guest-read half of verify-at-use; there is no whole-memory
+// host-boundary cross-check behind it, so the load is where guest-side
+// corruption surfaces.
 //
 // Genuine corruption is injected with `tamper_raw_byte` (an UNTRACKED
 // `data_ptr` write): `Memory::data_mut` is unsuitable because it marks the
@@ -3479,8 +3391,6 @@ const LOAD_CHECK_WAT: &str = r#"
     (module
         (import "env" "noop" (func $noop))
         (memory (export "m") 1)
-        (func (export "store_i32") (param $a i32) (param $v i32)
-            local.get $a local.get $v i32.store)
         (func (export "load_i32") (param $a i32) (result i32)
             local.get $a i32.load)
         (func (export "load_i32_8u") (param $a i32) (result i32)
@@ -3511,13 +3421,15 @@ fn load_check_setup(a: u64) -> wasmtime::Result<(Store<()>, wasmtime::Instance, 
 fn data_mut_between_calls_resynced_before_guest_load() -> wasmtime::Result<()> {
     // A *legitimate* host write via `Memory::data_mut` performed BETWEEN
     // top-level calls (outside any host call) marks the memory whole-dirty.
-    // The aligned load reads the shadow as its source of truth, so the
-    // whole-dirty memory MUST be re-encoded from raw before any guest code
-    // runs — otherwise the guest would observe the stale shadow value.
+    // Under mandatory verify-at-use the guest's inline load-check reads the
+    // shadow as source-of-truth, so the whole-dirty memory MUST be re-encoded
+    // from raw before any guest code runs — otherwise the first `i32.load` of
+    // the written region sees a stale shadow and false-traps with
+    // AnMemoryMismatch.
     //
     // The heal happens at the host->wasm entry (`an_heal_whole_dirty` in
-    // `invoke_wasm_and_catch_traps`). With it the guest observes the written
-    // value rather than the stale shadow value.
+    // `invoke_wasm_and_catch_traps`). Without that heal this test traps;
+    // with it the guest observes the written value.
     let (mut store, instance, mem) = load_check_setup(65521)?;
     let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
     // Non-zero address so a missing address decode can't pass on `A*0 == 0`.
@@ -3554,52 +3466,16 @@ fn load_validity_check_clean_run_passes() -> wasmtime::Result<()> {
 }
 
 #[test]
-fn aligned_i32_load_uses_shadow_as_source_of_truth() -> wasmtime::Result<()> {
-    // An aligned full-width load intentionally ignores a raw-only corruption
-    // and returns the still-valid shadow codeword. A later consumer of the raw
-    // memory remains responsible for detecting the divergence.
+fn load_validity_check_traps_on_raw_tamper() -> wasmtime::Result<()> {
+    // Raw tamper between host call and the next i32 load: with the validity
+    // check on the load must raise AnMemoryMismatch immediately, no host
+    // call in between needed.
     let (mut store, instance, mem) = load_check_setup(65521)?;
     let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
+    // Non-zero load address so a missing address decode can't pass on `A*0 == 0`.
     tamper_raw_byte(&mem, &mut store, 11, |_| 0x80);
-    if wasmtime_environ::AN_ALIGNED_I32_LOAD_FROM_SHADOW {
-        assert_eq!(load.call(&mut store, 8)?, 0);
-    } else {
-        expect_an_mismatch_trap(load.call(&mut store, 8), "raw tamper + baseline i32.load");
-    }
-    expect_host_read_mismatch(&mem, &mut store, 8, "raw tamper after aligned i32.load");
-    Ok(())
-}
-
-#[test]
-fn aligned_i32_load_traps_on_invalid_shadow_codeword() -> wasmtime::Result<()> {
-    let (mut store, instance, mem) = load_check_setup(65521)?;
-    let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
-    let shadow = mem
-        .an_shadow_data_mut_for_test(&mut store)
-        .expect("shadow allocated under AN");
-    // Raw address 8 maps to shadow byte offset 16. The all-zero slot is a
-    // valid codeword; flipping its low bit makes the residue non-zero.
-    shadow[16] ^= 1;
-    if wasmtime_environ::AN_ALIGNED_I32_LOAD_FROM_SHADOW {
-        expect_an_codeword_invalid_trap(load.call(&mut store, 8), "aligned shadow residue");
-    } else {
-        expect_an_mismatch_trap(load.call(&mut store, 8), "baseline shadow mismatch");
-    }
-    Ok(())
-}
-
-#[test]
-fn aligned_i32_load_checks_exact_bounds_before_shadow() -> wasmtime::Result<()> {
-    let (mut store, instance, _mem) = load_check_setup(65521)?;
-    let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
-    assert_eq!(load.call(&mut store, 65_532)?, 0);
-    let err = load
-        .call(&mut store, 65_536)
-        .expect_err("aligned load just past one page must trap");
-    let trap = err
-        .downcast_ref::<wasmtime::Trap>()
-        .unwrap_or_else(|| panic!("aligned out-of-bounds load was not a Trap: {err:?}"));
-    assert_eq!(*trap, wasmtime::Trap::MemoryOutOfBounds);
+    let res = load.call(&mut store, 8);
+    expect_an_mismatch_trap(res, "raw tamper + i32.load");
     Ok(())
 }
 
@@ -3645,25 +3521,15 @@ fn load_validity_check_traps_unaligned_i32_load() -> wasmtime::Result<()> {
 }
 
 #[test]
-fn aligned_shadow_load_various_an_constants() -> wasmtime::Result<()> {
-    for &a in &[1u64, 2, 6, 7, 1000, 1009, 65521, 16_777_215] {
-        let (mut store, instance, _mem) = load_check_setup(a)?;
-        let store_i32 = instance.get_typed_func::<(i32, i32), ()>(&mut store, "store_i32")?;
-        let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
-        store_i32.call(&mut store, (8, 0x1234_5678))?;
-        assert_eq!(load.call(&mut store, 8)?, 0x1234_5678, "A={a}");
-    }
-    Ok(())
-}
-
-#[test]
-fn aligned_shadow_load_rejects_invalid_even_an_constants() -> wasmtime::Result<()> {
-    for &a in &[2u64, 6, 1000] {
+fn load_validity_check_various_an_constants() -> wasmtime::Result<()> {
+    // The shadow encoding parameterized on A, so re-run a single trap test
+    // across a few values to confirm the codegen reads A from tunables.
+    for &a in &[1u64, 7, 1009, 65521, 16_777_215] {
         let (mut store, instance, mem) = load_check_setup(a)?;
         let load = instance.get_typed_func::<i32, i32>(&mut store, "load_i32")?;
-        mem.an_shadow_data_mut_for_test(&mut store)
-            .expect("shadow allocated under AN")[16] ^= 1;
-        expect_an_codeword_invalid_trap(load.call(&mut store, 8), &format!("A={a}"));
+        tamper_raw_byte(&mem, &mut store, 8, |_| 0x55);
+        let res = load.call(&mut store, 8);
+        expect_an_mismatch_trap(res, &format!("validity check with A={a}"));
     }
     Ok(())
 }
@@ -5585,7 +5451,7 @@ const GROW_STORE_LOOP_WAT: &str = r#"
 
 // Regression guard: the JIT load of the shadow base pointer used to be
 // flagged `readonly`, which falsely asserts the slot never changes —
-// `an_grow_shadow` re-allocates the shadow buffer and rewrites the slot on
+// `an_grow_shadow` can reallocate the shadow buffer and rewrites the slot on
 // every successful `memory.grow`. In the current cranelift this was latent
 // (load GVN/LICM additionally requires the `can_move` flag, which was never
 // set), but any future optimizer change honoring `readonly` alone would have

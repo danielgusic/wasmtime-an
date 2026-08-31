@@ -116,9 +116,7 @@ use core::pin::Pin;
 use core::ptr::NonNull;
 #[cfg(any(feature = "async", feature = "gc"))]
 use core::task::Poll;
-use wasmtime_environ::{
-    AN_INTEGER_LOAD_TRACKING_ENABLED, DefinedGlobalIndex, DefinedTableIndex, EntityRef, TripleExt,
-};
+use wasmtime_environ::{DefinedGlobalIndex, DefinedTableIndex, EntityRef, TripleExt};
 
 mod context;
 pub use self::context::*;
@@ -474,10 +472,6 @@ pub struct StoreOpaque {
     engine: Engine,
     vm_store_context: VMStoreContext,
 
-    // Temporary profiling data for deciding whether direct shadow loads are
-    // worthwhile for slot-aligned integer loads.
-    an_integer_load_stats: AnIntegerLoadStats,
-
     // Contains all continuations ever allocated throughout the lifetime of this
     // store.
     #[cfg(feature = "stack-switching")]
@@ -579,104 +573,6 @@ pub struct StoreOpaque {
     /// enabled, so the key-space is unique for each store.)
     #[cfg(feature = "debug")]
     frame_data_cache: FrameDataCache,
-}
-
-#[derive(Default)]
-struct AnIntegerLoadStats {
-    i32_aligned_full: u64,
-    i32_unaligned_full: u64,
-    i32_subword8: u64,
-    i32_subword16: u64,
-    i64_aligned_full: u64,
-    i64_unaligned_full: u64,
-    i64_aligned_subword32: u64,
-    i64_unaligned_subword32: u64,
-    i64_subword8: u64,
-    i64_subword16: u64,
-}
-
-impl AnIntegerLoadStats {
-    fn record(&mut self, result_bits: u32, num_bytes: u32, effective_addr: u64) {
-        let slot_aligned = effective_addr & 3 == 0;
-        match (result_bits, num_bytes, slot_aligned) {
-            (32, 4, true) => self.i32_aligned_full += 1,
-            (32, 4, false) => self.i32_unaligned_full += 1,
-            (32, 1, _) => self.i32_subword8 += 1,
-            (32, 2, _) => self.i32_subword16 += 1,
-            (64, 8, true) => self.i64_aligned_full += 1,
-            (64, 8, false) => self.i64_unaligned_full += 1,
-            (64, 4, true) => self.i64_aligned_subword32 += 1,
-            (64, 4, false) => self.i64_unaligned_subword32 += 1,
-            (64, 1, _) => self.i64_subword8 += 1,
-            (64, 2, _) => self.i64_subword16 += 1,
-            (bits, bytes, _) => {
-                unreachable!("unexpected integer load shape: i{bits} result, {bytes} bytes")
-            }
-        }
-    }
-
-    fn counts(&self) -> [u64; 10] {
-        [
-            self.i32_aligned_full,
-            self.i32_unaligned_full,
-            self.i32_subword8,
-            self.i32_subword16,
-            self.i64_aligned_full,
-            self.i64_unaligned_full,
-            self.i64_aligned_subword32,
-            self.i64_unaligned_subword32,
-            self.i64_subword8,
-            self.i64_subword16,
-        ]
-    }
-
-    #[cfg(feature = "std")]
-    fn report(&self) {
-        let i32_total = self
-            .i32_aligned_full
-            .saturating_add(self.i32_unaligned_full)
-            .saturating_add(self.i32_subword8)
-            .saturating_add(self.i32_subword16);
-        let i64_total = self
-            .i64_aligned_full
-            .saturating_add(self.i64_unaligned_full)
-            .saturating_add(self.i64_aligned_subword32)
-            .saturating_add(self.i64_unaligned_subword32)
-            .saturating_add(self.i64_subword8)
-            .saturating_add(self.i64_subword16);
-        let total = i32_total.saturating_add(i64_total);
-        if total == 0 {
-            return;
-        }
-        let i32_eligible_basis_points = if i32_total == 0 {
-            0
-        } else {
-            (u128::from(self.i32_aligned_full) * 10_000 / u128::from(i32_total)) as u64
-        };
-        eprintln!(
-            "[an-integer-loads:i32] total={i32_total} aligned-full={} ({}.{:02}% eligible) \
-             unaligned-full={} subword-8={} subword-16={}",
-            self.i32_aligned_full,
-            i32_eligible_basis_points / 100,
-            i32_eligible_basis_points % 100,
-            self.i32_unaligned_full,
-            self.i32_subword8,
-            self.i32_subword16,
-        );
-        eprintln!(
-            "[an-integer-loads:i64] total={i64_total} aligned-full={} unaligned-full={} \
-             aligned-subword-32={} unaligned-subword-32={} subword-8={} subword-16={}",
-            self.i64_aligned_full,
-            self.i64_unaligned_full,
-            self.i64_aligned_subword32,
-            self.i64_unaligned_subword32,
-            self.i64_subword8,
-            self.i64_subword16,
-        );
-    }
-
-    #[cfg(not(feature = "std"))]
-    fn report(&self) {}
 }
 
 /// Self-pointer to `StoreInner<T>` from within a `StoreOpaque` which is chiefly
@@ -856,7 +752,6 @@ impl<T> Store<T> {
             _marker: marker::PhantomPinned,
             engine: engine.clone(),
             vm_store_context: Default::default(),
-            an_integer_load_stats: Default::default(),
             #[cfg(feature = "stack-switching")]
             continuations: Vec::new(),
             instances: TryPrimaryMap::new(),
@@ -1120,16 +1015,6 @@ impl<T> Store<T> {
     /// Returns the [`Engine`] that this store is associated with.
     pub fn engine(&self) -> &Engine {
         self.inner.engine()
-    }
-
-    /// Returns temporary AN integer-load tracker counters for integration tests.
-    ///
-    /// The order is i32 aligned full, i32 unaligned full, i32 8-bit, i32
-    /// 16-bit, i64 aligned full, i64 unaligned full, i64 aligned 32-bit, i64
-    /// unaligned 32-bit, i64 8-bit, and i64 16-bit loads.
-    #[doc(hidden)]
-    pub fn an_integer_load_stats_for_test(&self) -> [u64; 10] {
-        self.inner.an_integer_load_stats.counts()
     }
 
     /// Perform garbage collection.
@@ -1804,18 +1689,6 @@ fn set_fuel(
 
 #[doc(hidden)]
 impl StoreOpaque {
-    pub(crate) fn record_an_integer_load(
-        &mut self,
-        result_bits: u32,
-        num_bytes: u32,
-        effective_addr: u64,
-    ) {
-        if AN_INTEGER_LOAD_TRACKING_ENABLED {
-            self.an_integer_load_stats
-                .record(result_bits, num_bytes, effective_addr);
-        }
-    }
-
     pub fn id(&self) -> StoreId {
         self.store_data.id()
     }
@@ -3215,10 +3088,6 @@ impl Drop for StoreOpaque {
     fn drop(&mut self) {
         // NB it's important that this destructor does not access `self.data`.
         // That is deallocated by `Drop for Store<T>` above.
-
-        if AN_INTEGER_LOAD_TRACKING_ENABLED {
-            self.an_integer_load_stats.report();
-        }
 
         unsafe {
             let allocator = self.engine.allocator();

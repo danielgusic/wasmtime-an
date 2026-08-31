@@ -76,13 +76,12 @@ use crate::bounds_checks::{BoundsCheck, bounds_check_and_compute_addr};
 use crate::func_environ::{Extension, FuncEnvironment};
 use crate::translate::TargetEnvironment;
 use crate::translate::an_helpers::{
-    AnBitwiseOp, emit_an_aligned_i32_load_from_shadow, emit_an_bitwise_i32, emit_an_bitwise_i64,
-    emit_an_codeword_validity_check, emit_an_codeword_validity_check_i128, emit_an_decode_i64,
-    emit_an_enc_base_pointer, emit_an_enc_offset_from_effective_addr, emit_an_encode_raw_i64,
-    emit_an_load_validity_check, emit_an_mul_i64, emit_an_multi_byte_decomposed_store,
-    emit_an_shl_i32, emit_an_shl_i64, emit_an_shr_u_i32, emit_an_shr_u_i64, emit_udivrem_i128,
-    encode_wasm_i32_bool, encode_wasm_i32_raw, iconst_i128, udiv_u128_by_u64_const,
-    umod_u128_by_u64_const_to_i64,
+    AnBitwiseOp, emit_an_bitwise_i32, emit_an_bitwise_i64, emit_an_codeword_validity_check,
+    emit_an_codeword_validity_check_i128, emit_an_decode_i64, emit_an_enc_base_pointer,
+    emit_an_enc_offset_from_effective_addr, emit_an_encode_raw_i64, emit_an_load_validity_check,
+    emit_an_mul_i64, emit_an_multi_byte_decomposed_store, emit_an_shl_i32, emit_an_shl_i64,
+    emit_an_shr_u_i32, emit_an_shr_u_i64, emit_udivrem_i128, encode_wasm_i32_bool,
+    encode_wasm_i32_raw, iconst_i128, udiv_u128_by_u64_const, umod_u128_by_u64_const_to_i64,
 };
 use crate::translate::environ::StructFieldsVec;
 use crate::translate::stack::{ControlStackFrame, ElseData};
@@ -104,9 +103,8 @@ use std::collections::{HashMap, hash_map};
 use std::vec::Vec;
 use wasmparser::{FuncValidator, MemArg, Operator, WasmModuleResources};
 use wasmtime_environ::{
-    AN_ALIGNED_I32_LOAD_FROM_SHADOW, AN_INTEGER_LOAD_TRACKING_ENABLED, DataIndex, ElemIndex,
-    FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TagIndex, TypeConvert, TypeIndex,
-    WasmHeapType, WasmRefType, WasmResult, WasmValType, wasm_unsupported,
+    DataIndex, ElemIndex, FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TagIndex, TypeConvert,
+    TypeIndex, WasmHeapType, WasmRefType, WasmResult, WasmValType, wasm_unsupported,
 };
 
 /// Given a `Reachability<T>`, unwrap the inner `T` or, when unreachable, set
@@ -4465,90 +4463,16 @@ fn translate_load(
 
     environ.before_load(builder, mem_op_size, wasm_index, memarg.offset);
 
-    // A naturally-aligned full-width i32 load maps exactly to one encoded
-    // shadow slot. In that case the shadow is the source of truth: validate
-    // the codeword and return it directly, avoiding both the raw-memory load
-    // and the result-encoding multiply. Wasm's alignment immediate is only a
-    // hint, so alignment is selected from the actual effective address at
-    // runtime. Every other load retains the existing raw/shadow cross-check.
-    if AN_ALIGNED_I32_LOAD_FROM_SHADOW
-        && environ.tunables().an_encoding
-        && opcode == ir::Opcode::Load
-        && result_ty == I32
-    {
-        let addr_ty = builder.func.dfg.value_type(wasm_index);
-        let wasm_index_i64 = if addr_ty == I64 {
-            wasm_index
-        } else {
-            builder.ins().uextend(I64, wasm_index)
-        };
-        let effective_addr_i64 = if memarg.offset == 0 {
-            wasm_index_i64
-        } else {
-            builder.ins().iadd_imm(wasm_index_i64, memarg.offset as i64)
-        };
-        let byte_pos = builder.ins().band_imm(effective_addr_i64, 3);
-        let aligned_block = builder.create_block();
-        let unaligned_block = builder.create_block();
-        let merge_block = builder.create_block();
-        builder.append_block_param(merge_block, I64);
-        builder
-            .ins()
-            .brif(byte_pos, unaligned_block, &[][..], aligned_block, &[][..]);
-
-        builder.switch_to_block(aligned_block);
-        builder.seal_block(aligned_block);
-        let checked_addr = emit_an_precise_shadow_load_bounds_check(
-            builder,
-            environ,
-            MemoryIndex::from_u32(memarg.memory),
-            effective_addr_i64,
-        );
-        if AN_INTEGER_LOAD_TRACKING_ENABLED {
-            environ.track_an_integer_load(builder, 32, 4, checked_addr);
-        }
-        let enc_base =
-            emit_an_enc_base_pointer(builder, environ, MemoryIndex::from_u32(memarg.memory))
-                .expect("AN-encoded memory must have a shadow");
-        let encoded =
-            emit_an_aligned_i32_load_from_shadow(builder, environ, enc_base, checked_addr);
-        builder.ins().jump(merge_block, &[BlockArg::Value(encoded)]);
-
-        builder.switch_to_block(unaligned_block);
-        builder.seal_block(unaligned_block);
-        let (load, dfg) = builder
-            .ins()
-            .Load(opcode, result_ty, flags, Offset32::new(0), base);
-        let raw = dfg.first_result(load);
-        if AN_INTEGER_LOAD_TRACKING_ENABLED {
-            environ.track_an_integer_load(builder, 32, 4, effective_addr_i64);
-        }
-        let enc_base =
-            emit_an_enc_base_pointer(builder, environ, MemoryIndex::from_u32(memarg.memory))
-                .expect("AN-encoded memory must have a shadow");
-        emit_an_load_validity_check(builder, environ, enc_base, base, effective_addr_i64, 4);
-        let zext = builder.ins().uextend(I64, raw);
-        let an = builder
-            .ins()
-            .iconst(I64, environ.tunables().an_constant as i64);
-        let encoded = builder.ins().imul(zext, an);
-        builder.ins().jump(merge_block, &[BlockArg::Value(encoded)]);
-
-        builder.switch_to_block(merge_block);
-        builder.seal_block(merge_block);
-        environ.stacks.push1(builder.block_params(merge_block)[0]);
-        return Ok(Reachability::Reachable(()));
-    }
-
     let (load, dfg) = builder
         .ins()
         .Load(opcode, result_ty, flags, Offset32::new(0), base);
     let raw = dfg.first_result(load);
 
-    // AN-encoding fallback load-side validity check: assert the encoded shadow
-    // slot(s) match the raw bytes, so a divergence surfaces here as
-    // `Trap::AnMemoryMismatch`. Naturally-aligned full-width i32 loads have
-    // already returned through the direct-shadow path above.
+    // AN-encoding load-side validity check (always on under `an_encoding`):
+    // assert the encoded shadow slot(s) match the raw bytes, so a divergence
+    // surfaces here as `Trap::AnMemoryMismatch` at the load. This is the
+    // guest-read half of verify-at-use — there is no longer a whole-memory
+    // host-boundary cross-check behind it, so the check is mandatory.
     //
     // Emitted AFTER the raw load on purpose: the raw load carries the
     // memory's bounds enforcement (explicit check or guard-page fault), so
@@ -4560,29 +4484,20 @@ fn translate_load(
     // i32 and i64 result loads are verified (both are encoded types). Non-i32/i64
     // stores are still mirrored into the shadow — see `translate_non_i32_store_an`.
     if environ.tunables().an_encoding && (result_ty == I32 || result_ty == I64) {
-        let addr_ty = builder.func.dfg.value_type(wasm_index);
-        let wasm_index_i64 = if addr_ty == I64 {
-            wasm_index
-        } else {
-            builder.ins().uextend(I64, wasm_index)
-        };
-        let effective_addr_i64 = if memarg.offset == 0 {
-            wasm_index_i64
-        } else {
-            builder.ins().iadd_imm(wasm_index_i64, memarg.offset as i64)
-        };
-
-        if AN_INTEGER_LOAD_TRACKING_ENABLED {
-            // Temporary profiling instrumentation. The runtime classifies the
-            // actual effective address, so a load in a loop is counted once per
-            // execution rather than once per translated operator.
-            let result_bits = if result_ty == I32 { 32 } else { 64 };
-            environ.track_an_integer_load(builder, result_bits, mem_op_size, effective_addr_i64);
-        }
-
         if let Some(enc_base) =
             emit_an_enc_base_pointer(builder, environ, MemoryIndex::from_u32(memarg.memory))
         {
+            let addr_ty = builder.func.dfg.value_type(wasm_index);
+            let wasm_index_i64 = if addr_ty == I64 {
+                wasm_index
+            } else {
+                builder.ins().uextend(I64, wasm_index)
+            };
+            let effective_addr_i64 = if memarg.offset == 0 {
+                wasm_index_i64
+            } else {
+                builder.ins().iadd_imm(wasm_index_i64, memarg.offset as i64)
+            };
             if mem_op_size <= 4 {
                 emit_an_load_validity_check(
                     builder,
@@ -4611,9 +4526,9 @@ fn translate_load(
         }
     }
 
-    // AN-encoding fallback: raw i32/i64 loads must be encoded for the operand
-    // stack (`A*v`, in I64 for i32 / I128 for i64). f32 / f64 / v128 loads are
-    // unaffected.
+    // AN-encoding: i32/i64 loads return a raw value from raw linear memory; the
+    // operand stack expects the encoded form (`A*v`, in I64 for i32 / I128 for
+    // i64). f32 / f64 / v128 loads are unaffected.
     if environ.tunables().an_encoding && result_ty == I32 {
         let zext = builder.ins().uextend(I64, raw);
         let an = builder
@@ -4627,62 +4542,6 @@ fn translate_load(
         environ.stacks.push1(raw);
     }
     Ok(Reachability::Reachable(()))
-}
-
-/// Precisely bounds-check an aligned four-byte access before using an AN
-/// shadow address.
-///
-/// Normal wasm loads may use the raw memory's reservation and guard pages to
-/// finish bounds enforcement. The separately allocated AN shadow has neither,
-/// so a direct shadow load must compare against the raw memory's exact current
-/// length. For normal Wasm pages (and any page size of at least four bytes),
-/// both the address and bound are four-byte aligned, so `addr < bound` proves
-/// the complete access is in bounds. One-byte custom pages retain the general
-/// `addr + 4 <= bound` check. When Spectre mitigation is enabled, an
-/// out-of-bounds address is additionally masked to shadow offset zero before
-/// the explicit trap.
-fn emit_an_precise_shadow_load_bounds_check(
-    builder: &mut FunctionBuilder,
-    environ: &mut FuncEnvironment<'_>,
-    memory_index: MemoryIndex,
-    effective_addr_i64: Value,
-) -> Value {
-    let heap_index = environ.get_or_create_heap(builder.func, memory_index);
-    let heap = environ.heaps()[heap_index].clone();
-    let bound = match heap.memory.static_heap_size() {
-        Some(size) => builder.ins().iconst(I64, size as i64),
-        None => {
-            let pointer_ty = environ.pointer_type();
-            let bound = builder.ins().global_value(pointer_ty, heap.bound);
-            if pointer_ty == I64 {
-                bound
-            } else {
-                builder.ins().uextend(I64, bound)
-            }
-        }
-    };
-
-    let out_of_bounds = if heap.memory.page_size_log2 >= 2 {
-        builder
-            .ins()
-            .icmp(IntCC::UnsignedGreaterThanOrEqual, effective_addr_i64, bound)
-    } else {
-        let four = builder.ins().iconst(I64, 4);
-        let (end, overflow) = builder.ins().uadd_overflow(effective_addr_i64, four);
-        let past_end = builder.ins().icmp(IntCC::UnsignedGreaterThan, end, bound);
-        builder.ins().bor(overflow, past_end)
-    };
-
-    let checked_addr = if environ.heap_access_spectre_mitigation() {
-        let zero = builder.ins().iconst(I64, 0);
-        builder
-            .ins()
-            .select_spectre_guard(out_of_bounds, zero, effective_addr_i64)
-    } else {
-        effective_addr_i64
-    };
-    environ.trapnz(builder, out_of_bounds, ir::TrapCode::HEAP_OUT_OF_BOUNDS);
-    checked_addr
 }
 
 /// Translate a store instruction.

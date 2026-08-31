@@ -49,9 +49,10 @@ pub const DEFAULT_AN_CONSTANT: u64 = 65521;
 /// This applies only to AN-encoding's defined, non-shared memories (an
 /// *imported* memory's shadow lives on its owning instance).
 ///
-/// Despite the name this is the raw-to-shadow *size ratio*, not a
-/// reallocation growth factor: on `memory.grow` the shadow is reallocated to
-/// exactly `ratio * new_raw_size`.
+/// Despite the name this is the raw-to-shadow *size ratio*, not a backing
+/// allocation growth factor: after `memory.grow` the shadow's logical length
+/// is exactly `ratio * new_raw_size`, while its backing allocation may retain
+/// geometrically grown spare capacity.
 pub const ENC_MEM_GROWTH_FACTOR: u64 = 2;
 
 macro_rules! define_tunables {

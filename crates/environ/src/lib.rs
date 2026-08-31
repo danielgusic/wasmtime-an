@@ -98,14 +98,3 @@ pub use anyhow;
 
 /// Version number of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Compile-time switch for temporary AN integer-load instrumentation.
-///
-/// Keep this `false` for performance measurements. Setting it to `true`
-/// causes Cranelift to emit a runtime tracker call for each scalar integer
-/// linear-memory load executed with AN encoding enabled.
-pub const AN_INTEGER_LOAD_TRACKING_ENABLED: bool = false;
-
-/// Compile-time switch for benchmarking naturally-aligned `i32` loads from
-/// the AN shadow instead of raw linear memory.
-pub const AN_ALIGNED_I32_LOAD_FROM_SHADOW: bool = true;

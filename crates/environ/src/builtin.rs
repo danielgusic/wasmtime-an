@@ -42,9 +42,6 @@ macro_rules! foreach_builtin_function {
             // Invoked when we reach a new epoch.
             #[cfg(target_has_atomic = "64")]
             new_epoch(vmctx: vmctx) -> u64;
-            // Temporary AN-encoding instrumentation for classifying dynamically
-            // executed integer linear-memory loads by access width and slot alignment.
-            track_an_integer_load(vmctx: vmctx, result_bits: u32, num_bytes: u32, effective_addr: u64);
             // Invoked before malloc returns.
             #[cfg(feature = "wmemcheck")]
             check_malloc(vmctx: vmctx, addr: u32, len: u32) -> bool;

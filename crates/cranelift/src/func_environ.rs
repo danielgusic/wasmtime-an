@@ -298,10 +298,6 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         self.isa.pointer_type()
     }
 
-    pub(crate) fn an_codeword_check(&self) -> crate::translate::AnCodewordCheck {
-        self.compiler.an_codeword_check()
-    }
-
     pub(crate) fn vmctx(&mut self, func: &mut Function) -> ir::GlobalValue {
         self.vmctx.unwrap_or_else(|| {
             let vmctx = func.create_global_value(ir::GlobalValueData::VMContext);
@@ -3941,23 +3937,6 @@ impl FuncEnvironment<'_> {
         }
         #[cfg(not(feature = "wmemcheck"))]
         let _ = (builder, val_size, addr, offset);
-    }
-
-    /// Emit the temporary runtime tracker call for an AN-encoded integer load.
-    pub fn track_an_integer_load(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        result_bits: u32,
-        num_bytes: u8,
-        effective_addr: ir::Value,
-    ) {
-        let tracker = self.builtin_functions.track_an_integer_load(builder.func);
-        let vmctx = self.vmctx_val(&mut builder.cursor());
-        let result_bits = builder.ins().iconst(I32, i64::from(result_bits));
-        let num_bytes = builder.ins().iconst(I32, i64::from(num_bytes));
-        builder
-            .ins()
-            .call(tracker, &[vmctx, result_bits, num_bytes, effective_addr]);
     }
 
     pub fn before_store(
